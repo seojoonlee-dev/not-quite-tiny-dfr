@@ -1,0 +1,35 @@
+[Unit]
+Description=not-quite-tiny-dfr customizable Touch Bar daemon (Apple T2 and Silicon Macs)
+# Order after logind so seat0 user detection works; no device-unit deps -- the
+# daemon scans /dev/dri itself and Restart=always covers the device not being
+# ready yet. The udev rule also SYSTEMD_WANTS this on Touch Bar hotplug.
+After=systemd-logind.service systemd-user-sessions.service
+
+[Service]
+# If the daemon starts before anyone logs in (so logind has no seat0 session
+# yet), set the target user explicitly so ~/.config is found, e.g.:
+# Environment=NOT_QUITE_TINY_DFR_USER=alice
+ExecStart=/usr/bin/not-quite-tiny-dfr
+Restart=always
+RestartSec=2
+
+NoNewPrivileges=true
+ProtectSystem=strict
+# read-only (not true) so the daemon can read the per-user config in
+# ~/.config/not-quite-tiny-dfr after dropping to the logged-in user.
+ProtectHome=read-only
+PrivateTmp=true
+PrivateIPC=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=strict
+# AF_INET/AF_INET6 are allowed so command widgets can reach the network
+# (e.g. a weather-API script). Widgets run arbitrary commands as your user --
+# only use scripts you trust. Home stays read-only; /tmp is private+writable.
+RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=graphical.target

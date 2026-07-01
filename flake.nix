@@ -11,7 +11,7 @@
         let pkgs = pkgsFor.${system};
         in {
           default = pkgs.rustPlatform.buildRustPackage {
-            pname = "tiny-dfr";
+            pname = "not-quite-tiny-dfr";
             version = "0.3.5";
             src = ./.;
             cargoLock = { lockFile = ./Cargo.lock; };
@@ -29,7 +29,7 @@
             ];
 
             postConfigure = ''
-              substituteInPlace etc/systemd/system/tiny-dfr.service \
+              substituteInPlace etc/systemd/system/not-quite-tiny-dfr.service \
                   --replace-fail /usr/bin $out/bin
               substituteInPlace src/*.rs --replace-quiet /usr/share $out/share
             '';
