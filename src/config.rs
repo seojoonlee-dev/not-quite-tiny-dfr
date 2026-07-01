@@ -14,6 +14,7 @@ use serde::{
     Deserialize, Deserializer,
 };
 use std::{
+    ffi::OsString,
     fmt,
     fs::{read_to_string, File},
     io::ErrorKind,
@@ -460,12 +461,40 @@ fn load_config(
     (cfg, layers, widgets)
 }
 
-/// A config file we live-reload on. `wd` is `None` when the file does not exist
-/// yet (e.g. before the user creates ~/.config/not-quite-tiny-dfr/config.toml); it is
-/// re-armed on later polls so newly created files start being watched.
+/// A config file we live-reload on. We watch the file's parent *directory*
+/// rather than the file itself: editors (and our own tooling) save atomically
+/// by writing a temp file and renaming it into place, which replaces the
+/// file's inode. A watch on the file would follow the old, now-unlinked inode
+/// and go stale after the first save; a directory watch instead sees the new
+/// file arrive (IN_MOVED_TO/IN_CREATE) and stays valid across saves.
+///
+/// `wd` is `None` when the directory does not exist yet (e.g. before the user
+/// creates ~/.config/not-quite-tiny-dfr/); it is re-armed on later polls so a
+/// config dropped in later starts being watched.
 struct Watch {
-    path: PathBuf,
+    /// The directory we arm the inotify watch on (a config file's parent).
+    dir: PathBuf,
+    /// The config file's base name, matched against inotify event names so
+    /// unrelated files changing in the same directory don't trigger a reload.
+    name: OsString,
     wd: Option<WatchDescriptor>,
+}
+
+impl Watch {
+    fn new(inotify_fd: &Inotify, path: &Path) -> Watch {
+        // Real config paths always have both a parent and a file name; the
+        // fallbacks just keep this total rather than panicking.
+        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
+        let name = path
+            .file_name()
+            .unwrap_or_else(|| path.as_os_str())
+            .to_os_string();
+        Watch {
+            wd: arm_inotify(inotify_fd, &dir),
+            dir,
+            name,
+        }
+    }
 }
 
 pub struct ConfigManager {
@@ -476,9 +505,14 @@ pub struct ConfigManager {
     height: u16,
 }
 
-fn arm_inotify(inotify_fd: &Inotify, path: &Path) -> Option<WatchDescriptor> {
-    let flags = AddWatchFlags::IN_MOVED_TO | AddWatchFlags::IN_CLOSE | AddWatchFlags::IN_ONESHOT;
-    match inotify_fd.add_watch(path, flags) {
+fn arm_inotify(inotify_fd: &Inotify, dir: &Path) -> Option<WatchDescriptor> {
+    // IN_CLOSE_WRITE catches in-place saves; IN_MOVED_TO/IN_CREATE catch the
+    // atomic-rename saves (temp file + rename) that a file-level watch misses.
+    // The watch is persistent (no IN_ONESHOT) so it survives an unrelated file
+    // changing in the same directory.
+    let flags =
+        AddWatchFlags::IN_MOVED_TO | AddWatchFlags::IN_CREATE | AddWatchFlags::IN_CLOSE_WRITE;
+    match inotify_fd.add_watch(dir, flags) {
         Ok(wd) => Some(wd),
         Err(Errno::ENOENT) => None,
         e => Some(e.unwrap()),
@@ -493,10 +527,7 @@ impl ConfigManager {
         let inotify_fd = Inotify::init(InitFlags::IN_NONBLOCK).unwrap();
         let watches = cfg_paths
             .iter()
-            .map(|path| Watch {
-                wd: arm_inotify(&inotify_fd, path),
-                path: path.clone(),
-            })
+            .map(|path| Watch::new(&inotify_fd, path))
             .collect();
         ConfigManager {
             inotify_fd,
@@ -516,12 +547,12 @@ impl ConfigManager {
         cfg: &mut Config,
         layers: &mut [FunctionLayer; 2],
     ) -> Option<Vec<WidgetSpec>> {
-        // Pick up files that did not exist when we last tried to watch them
-        // (e.g. the user just created ~/.config/not-quite-tiny-dfr/config.toml).
+        // Pick up directories that did not exist when we last tried to watch
+        // them (e.g. the user just created ~/.config/not-quite-tiny-dfr/).
         let mut newly_armed = false;
         for watch in &mut self.watches {
             if watch.wd.is_none() {
-                watch.wd = arm_inotify(&self.inotify_fd, &watch.path);
+                watch.wd = arm_inotify(&self.inotify_fd, &watch.dir);
                 newly_armed |= watch.wd.is_some();
             }
         }
@@ -548,19 +579,31 @@ impl ConfigManager {
             Ok(evts) => evts,
             Err(_) => return None,
         };
-        let reload = evts
-            .iter()
-            .any(|evt| self.watches.iter().any(|w| w.wd == Some(evt.wd)));
+        // If a watched directory is removed, the kernel drops the watch and
+        // sends IN_IGNORED; forget the wd so update_config re-arms it once the
+        // directory reappears.
+        for evt in &evts {
+            if evt.mask.contains(AddWatchFlags::IN_IGNORED) {
+                for watch in &mut self.watches {
+                    if watch.wd == Some(evt.wd) {
+                        watch.wd = None;
+                    }
+                }
+            }
+        }
+        // Reload only when an event names one of our config files in the
+        // directory it lives in.
+        let reload = evts.iter().any(|evt| {
+            self.watches.iter().any(|w| {
+                w.wd == Some(evt.wd) && evt.name.as_deref() == Some(w.name.as_os_str())
+            })
+        });
         if !reload {
             return None;
         }
         let parts = load_config(&self.cfg_paths, self.width, self.height);
         *cfg = parts.0;
         *layers = parts.1;
-        // IN_ONESHOT watches are consumed after firing; re-arm them all.
-        for watch in &mut self.watches {
-            watch.wd = arm_inotify(&self.inotify_fd, &watch.path);
-        }
         Some(parts.2)
     }
     pub fn fd(&self) -> &impl AsFd {
