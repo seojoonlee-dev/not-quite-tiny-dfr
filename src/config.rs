@@ -1,4 +1,5 @@
 use crate::fonts::{FontConfig, Pattern};
+use crate::style::{Color, Style, StyleProxy};
 use crate::FunctionLayer;
 use anyhow::Error;
 use cairo::FontFace;
@@ -23,6 +24,7 @@ pub struct Config {
     pub adaptive_brightness: bool,
     pub active_brightness: u32,
     pub double_press_switch_layers: u32,
+    pub style: Style,
 }
 
 #[derive(Deserialize)]
@@ -35,6 +37,7 @@ struct ConfigProxy {
     adaptive_brightness: Option<bool>,
     active_brightness: Option<u32>,
     double_press_switch_layers: Option<u32>,
+    style: Option<StyleProxy>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
 }
@@ -81,6 +84,11 @@ pub struct ButtonConfig {
     pub stretch: Option<usize>,
     pub icon_width: Option<i32>,
     pub icon_height: Option<i32>,
+    // Per-button style overrides. When unset, the corresponding value from the
+    // global [Style] table is used.
+    pub color: Option<Color>,
+    pub color_active: Option<Color>,
+    pub text_color: Option<Color>,
 }
 
 fn load_font(name: &str) -> FontFace {
@@ -115,7 +123,13 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         base.primary_layer_keys = user.primary_layer_keys.or(base.primary_layer_keys);
         base.active_brightness = user.active_brightness.or(base.active_brightness);
         base.double_press_switch_layers = user.double_press_switch_layers.or(base.double_press_switch_layers);
+        match (&mut base.style, user.style) {
+            (Some(base_style), Some(user_style)) => base_style.merge(user_style),
+            (base_style @ None, user_style) => *base_style = user_style,
+            (Some(_), None) => {}
+        }
     };
+    let style = base.style.unwrap_or_default().resolve();
     let mut media_layer_keys = base.media_layer_keys.unwrap();
     let mut primary_layer_keys = base.primary_layer_keys.unwrap();
     if width >= 2170 {
@@ -133,6 +147,9 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
                     battery: None,
                     icon_width: None,
                     icon_height: None,
+                    color: None,
+                    color_active: None,
+                    text_color: None,
                 },
             );
         }
@@ -151,6 +168,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         font_face: load_font(&base.font_template.unwrap()),
         active_brightness: base.active_brightness.unwrap(),
         double_press_switch_layers: base.double_press_switch_layers.unwrap(),
+        style,
     };
     (cfg, layers)
 }
@@ -213,5 +231,22 @@ impl ConfigManager {
     }
     pub fn fd(&self) -> &impl AsFd {
         &self.inotify_fd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shipped_template_parses() {
+        // The template that ships to /usr/share must always deserialize cleanly,
+        // including the [Style] table and per-button override fields.
+        let text = read_to_string("share/tiny-dfr/config.toml")
+            .expect("template config should exist at share/tiny-dfr/config.toml");
+        let cfg: ConfigProxy = toml::from_str(&text).expect("template config should parse");
+        let style = cfg.style.expect("template should define [Style]").resolve();
+        assert_eq!(style.button_spacing, 16.0);
+        assert_eq!(style.background, Color::rgb(0.0, 0.0, 0.0));
     }
 }

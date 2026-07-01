@@ -40,6 +40,32 @@ ActiveBrightness = 128
 # A sensible value to try is around 200.
 DoublePressSwitchLayers = 0
 
+# Visual styling for the whole bar. Every key is optional; anything you leave
+# out keeps its default (the values shown below reproduce the original look).
+# Colors are hex strings: "#rrggbb" or "#rrggbbaa" (alpha), and the short forms
+# "#rgb" / "#rgba" are also accepted.
+[Style]
+# Bar background, painted behind all buttons.
+Background = "#000000"
+# Button fill when idle (only drawn if ShowButtonOutlines is true).
+ButtonColor = "#333333"
+# Button fill while pressed.
+ButtonColorActive = "#666666"
+# Color of text labels (does not affect SVG icons, which keep their own colors).
+TextColor = "#ffffff"
+# Gap between buttons, in pixels. Set to 0 for edge-to-edge buttons.
+ButtonSpacing = 16
+# Corner radius of the button rectangles, in pixels. 0 gives square corners.
+CornerRadius = 8
+# Font size for text labels.
+FontSize = 32
+# Button height as a percentage (0-100) of the bar height.
+HeightPercent = 70
+# Fill color for a battery button while charging.
+BatteryChargingColor = "#00b300"
+# Fill color for a battery button when the charge is low.
+BatteryLowColor = "#b30000"
+
 # This key defines the contents of the primary layer
 # (the one with F{number} keys)
 # You can change the individual buttons, add, or remove them
@@ -65,6 +91,11 @@ PrimaryLayerKeys = [
     # Do not include the extension in the file name.
     # The default icon size is 48x48, it can be overridden using IconWidth and IconHeight
     # For best results with pngs, the image size should match the icon size (48x48 by default)
+    # Per-button style overrides (all optional, same hex color format as [Style]):
+    #   Color       - idle button fill, overrides Style.ButtonColor
+    #   ColorActive - pressed button fill, overrides Style.ButtonColorActive
+    #   TextColor   - label color, overrides Style.TextColor
+    # Example: { Text = "F1", Action = "F1", Color = "#8833cc", TextColor = "#ffffff" }
     # Time can be either 24hr, or 12hr. Locale is optional and will default to POSIX.
     # Only one of Text, Icon or Time is allowed,
     # if more than one is present, the behavior is undefined.

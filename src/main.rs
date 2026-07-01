@@ -46,16 +46,15 @@ mod config;
 mod display;
 mod fonts;
 mod pixel_shift;
+mod style;
 
 use crate::config::ConfigManager;
 use backlight::BacklightManager;
 use config::{ButtonConfig, Config};
 use display::DrmBackend;
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
+use style::Color;
 
-const BUTTON_SPACING_PX: i32 = 16;
-const BUTTON_COLOR_INACTIVE: f64 = 0.200;
-const BUTTON_COLOR_ACTIVE: f64 = 0.400;
 const DEFAULT_ICON_SIZE: i32 = 48;
 const TIMEOUT_MS: i32 = 10 * 1000;
 
@@ -104,6 +103,10 @@ struct Button {
     action: Vec<Key>,
     icon_width: f64,
     icon_height: f64,
+    // Per-button style overrides; fall back to the global Style when None.
+    bg_color: Option<Color>,
+    bg_color_active: Option<Color>,
+    text_color: Option<Color>,
 }
 
 fn try_load_svg(path: &str) -> Result<ButtonImage> {
@@ -253,7 +256,8 @@ fn get_battery_state(battery: &str) -> (u32, BatteryState) {
 
 impl Button {
     fn with_config(cfg: ButtonConfig) -> Button {
-        if let Some(text) = cfg.text {
+        let (bg_color, bg_color_active, text_color) = (cfg.color, cfg.color_active, cfg.text_color);
+        let mut button = if let Some(text) = cfg.text {
             Button::new_text(text, cfg.action)
         } else if let Some(icon) = cfg.icon {
             Button::new_icon(
@@ -273,7 +277,11 @@ impl Button {
             }
         } else {
             Button::new_spacer()
-        }
+        };
+        button.bg_color = bg_color;
+        button.bg_color_active = bg_color_active;
+        button.text_color = text_color;
+        button
     }
     fn new_spacer() -> Button {
         Button {
@@ -283,6 +291,9 @@ impl Button {
             image: ButtonImage::Spacer,
             icon_width: 0.0,
             icon_height: 0.0,
+            bg_color: None,
+            bg_color_active: None,
+            text_color: None,
         }
     }
     fn new_text(text: String, action: Vec<Key>) -> Button {
@@ -293,6 +304,9 @@ impl Button {
             image: ButtonImage::Text(text),
             icon_width: 0.0,
             icon_height: 0.0,
+            bg_color: None,
+            bg_color_active: None,
+            text_color: None,
         }
     }
     fn new_icon(
@@ -311,6 +325,9 @@ impl Button {
             icon_height: icon_height as f64,
             active: false,
             changed: false,
+            bg_color: None,
+            bg_color_active: None,
+            text_color: None,
         }
     }
     fn load_battery_image(icon: &str, theme: Option<impl AsRef<str>>) -> Handle {
@@ -364,6 +381,9 @@ impl Button {
             ),
             icon_width: 0.0,
             icon_height: 0.0,
+            bg_color: None,
+            bg_color_active: None,
+            text_color: None,
         }
     }
 
@@ -391,6 +411,9 @@ impl Button {
             image: ButtonImage::Time(format_items, locale),
             icon_width: 0.0,
             icon_height: 0.0,
+            bg_color: None,
+            bg_color_active: None,
+            text_color: None,
         }
     }
     fn needs_faster_refresh(&self) -> bool {
@@ -526,16 +549,24 @@ impl Button {
             toggle_keys(uinput, &self.action, active as i32);
         }
     }
-    fn set_background_color(&self, c: &Context, color: f64) {
+    /// Resolve the fill color for this button's rounded rectangle, or `None`
+    /// if it should not be drawn (outlines disabled and button is inactive).
+    /// Battery buttons signal charge state via color and are always drawn.
+    fn fill_color(&self, style: &style::Style, show_outlines: bool) -> Option<Color> {
         if let ButtonImage::Battery(battery, _, _) = &self.image {
             let (_, state) = get_battery_state(battery);
             match state {
-                BatteryState::NotCharging => c.set_source_rgb(color, color, color),
-                BatteryState::Charging => c.set_source_rgb(0.0, color, 0.0),
-                BatteryState::Low => c.set_source_rgb(color, 0.0, 0.0),
+                BatteryState::Charging => return Some(style.battery_charging_color),
+                BatteryState::Low => return Some(style.battery_low_color),
+                BatteryState::NotCharging => {}
             }
+        }
+        if self.active {
+            Some(self.bg_color_active.unwrap_or(style.button_color_active))
+        } else if show_outlines {
+            Some(self.bg_color.unwrap_or(style.button_color))
         } else {
-            c.set_source_rgb(color, color, color);
+            None
         }
     }
 }
@@ -602,21 +633,23 @@ impl FunctionLayer {
         } else {
             0
         };
-        let virtual_button_width = ((width - pixel_shift_width as i32)
-            - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32))
-            as f64
+        let style = &config.style;
+        let spacing = style.button_spacing;
+        let virtual_button_width = ((width - pixel_shift_width as i32) as f64
+            - spacing * (self.virtual_button_count - 1) as f64)
             / self.virtual_button_count as f64;
-        let radius = 8.0f64;
-        let bot = (height as f64) * 0.15;
-        let top = (height as f64) * 0.85;
+        let radius = style.corner_radius;
+        let margin = (1.0 - style.height_percent / 100.0) / 2.0;
+        let bot = (height as f64) * margin;
+        let top = (height as f64) * (1.0 - margin);
         let (pixel_shift_x, pixel_shift_y) = pixel_shift;
 
         if complete_redraw {
-            c.set_source_rgb(0.0, 0.0, 0.0);
+            style.background.set_source(&c);
             c.paint().unwrap();
         }
         c.set_font_face(&config.font_face);
-        c.set_font_size(32.0);
+        c.set_font_size(style.font_size);
 
         for i in 0..self.buttons.len() {
             let end = if i + 1 < self.buttons.len() {
@@ -631,24 +664,16 @@ impl FunctionLayer {
                 continue;
             };
 
-            let left_edge = (start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
+            let left_edge = (start as f64 * (virtual_button_width + spacing))
                 .floor()
                 + pixel_shift_x
                 + (pixel_shift_width / 2) as f64;
 
             let button_width = virtual_button_width
-                + ((end - start - 1) as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
-                    .floor();
+                + ((end - start - 1) as f64 * (virtual_button_width + spacing)).floor();
 
-            let color = if button.active {
-                BUTTON_COLOR_ACTIVE
-            } else if config.show_button_outlines {
-                BUTTON_COLOR_INACTIVE
-            } else {
-                0.0
-            };
             if !complete_redraw {
-                c.set_source_rgb(0.0, 0.0, 0.0);
+                style.background.set_source(&c);
                 c.rectangle(
                     left_edge,
                     bot - radius,
@@ -657,8 +682,13 @@ impl FunctionLayer {
                 );
                 c.fill().unwrap();
             }
-            if !matches!(button.image, ButtonImage::Spacer) {
-                button.set_background_color(&c, color);
+            let fill = if matches!(button.image, ButtonImage::Spacer) {
+                None
+            } else {
+                button.fill_color(style, config.show_button_outlines)
+            };
+            if let Some(fill) = fill {
+                fill.set_source(&c);
                 // draw box with rounded corners
                 c.new_sub_path();
                 let left = left_edge + radius;
@@ -694,7 +724,10 @@ impl FunctionLayer {
                 c.close_path();
                 c.fill().unwrap();
             }
-            c.set_source_rgb(1.0, 1.0, 1.0);
+            button
+                .text_color
+                .unwrap_or(style.text_color)
+                .set_source(&c);
             button.render(
                 &c,
                 height,
@@ -718,10 +751,10 @@ impl FunctionLayer {
         modified_regions
     }
 
-    fn hit(&self, width: u16, height: u16, x: f64, y: f64, i: Option<usize>) -> Option<usize> {
-        let virtual_button_width =
-            (width as i32 - (BUTTON_SPACING_PX * (self.virtual_button_count - 1) as i32)) as f64
-                / self.virtual_button_count as f64;
+    fn hit(&self, spacing: f64, width: u16, height: u16, x: f64, y: f64, i: Option<usize>) -> Option<usize> {
+        let virtual_button_width = (width as f64
+            - spacing * (self.virtual_button_count - 1) as f64)
+            / self.virtual_button_count as f64;
 
         let i = i.unwrap_or_else(|| {
             let virtual_i = (x / (width as f64 / self.virtual_button_count as f64)) as usize;
@@ -742,11 +775,10 @@ impl FunctionLayer {
             self.virtual_button_count
         };
 
-        let left_edge = (start as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64)).floor();
+        let left_edge = (start as f64 * (virtual_button_width + spacing)).floor();
 
         let button_width = virtual_button_width
-            + ((end - start - 1) as f64 * (virtual_button_width + BUTTON_SPACING_PX as f64))
-                .floor();
+            + ((end - start - 1) as f64 * (virtual_button_width + spacing)).floor();
 
         if x < left_edge
             || x > (left_edge + button_width)
@@ -1019,7 +1051,7 @@ fn real_main(drm: &mut DrmBackend) {
                         TouchEvent::Down(dn) => {
                             let x = dn.x_transformed(width as u32);
                             let y = dn.y_transformed(height as u32);
-                            if let Some(btn) = layers[active_layer].hit(width, height, x, y, None) {
+                            if let Some(btn) = layers[active_layer].hit(cfg.style.button_spacing, width, height, x, y, None) {
                                 touches.insert(dn.seat_slot(), (active_layer, btn));
                                 layers[active_layer].buttons[btn]
                                     .1
@@ -1035,7 +1067,7 @@ fn real_main(drm: &mut DrmBackend) {
                             let y = mtn.y_transformed(height as u32);
                             let (layer, btn) = *touches.get(&mtn.seat_slot()).unwrap();
                             let hit = layers[active_layer]
-                                .hit(width, height, x, y, Some(btn))
+                                .hit(cfg.style.button_spacing, width, height, x, y, Some(btn))
                                 .is_some();
                             layers[layer].buttons[btn].1.set_active(&mut uinput, hit);
                         }
