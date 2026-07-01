@@ -1,5 +1,4 @@
 use crate::config::Config;
-use crate::TIMEOUT_MS;
 use anyhow::{anyhow, Result};
 use input::event::{
     switch::{Switch, SwitchEvent, SwitchState},
@@ -15,8 +14,6 @@ use std::{
 
 const MAX_DISPLAY_BRIGHTNESS: u32 = 509;
 const MAX_TOUCH_BAR_BRIGHTNESS: u32 = 255;
-const BRIGHTNESS_DIM_TIMEOUT: i32 = TIMEOUT_MS * 3; // should be a multiple of TIMEOUT_MS
-const BRIGHTNESS_OFF_TIMEOUT: i32 = TIMEOUT_MS * 6; // should be a multiple of TIMEOUT_MS
 const DIMMED_BRIGHTNESS: u32 = 1;
 
 fn read_attr(path: &Path, attr: &str) -> u32 {
@@ -117,28 +114,28 @@ impl BacklightManager {
         }
     }
     pub fn update_backlight(&mut self, cfg: &Config) {
-        let since_last_active = (Instant::now() - self.last_active).as_millis() as u64;
-        let new_bl = min(
-            self.max_bl,
-            if self.lid_state == SwitchState::On {
-                0
-            } else if since_last_active < BRIGHTNESS_DIM_TIMEOUT as u64 {
-                if cfg.adaptive_brightness {
-                    let brightness = if let Some(path) = &self.display_bl_path {
-                        read_attr(path, "brightness")
-                    } else {
-                        self.max_bl / 2
-                    };
-                    BacklightManager::display_to_touchbar(brightness, cfg.active_brightness)
-                } else {
-                    cfg.active_brightness
-                }
-            } else if since_last_active < BRIGHTNESS_OFF_TIMEOUT as u64 {
-                DIMMED_BRIGHTNESS
+        let idle_ms = (Instant::now() - self.last_active).as_millis() as u64;
+        // Timeouts are in seconds; 0 disables that transition entirely.
+        let dim_ms = cfg.dim_timeout as u64 * 1000;
+        let off_ms = cfg.off_timeout as u64 * 1000;
+
+        let target = if self.lid_state == SwitchState::On {
+            0
+        } else if off_ms > 0 && idle_ms >= off_ms {
+            0
+        } else if dim_ms > 0 && idle_ms >= dim_ms {
+            DIMMED_BRIGHTNESS
+        } else if cfg.adaptive_brightness {
+            let brightness = if let Some(path) = &self.display_bl_path {
+                read_attr(path, "brightness")
             } else {
-                0
-            },
-        );
+                self.max_bl / 2
+            };
+            BacklightManager::display_to_touchbar(brightness, cfg.active_brightness)
+        } else {
+            cfg.active_brightness
+        };
+        let new_bl = min(self.max_bl, target);
         if self.current_bl != new_bl {
             self.current_bl = new_bl;
             set_backlight(&self.bl_file, self.current_bl);

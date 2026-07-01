@@ -37,6 +37,7 @@ use std::{
     },
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use udev::MonitorBuilder;
@@ -47,6 +48,8 @@ mod display;
 mod fonts;
 mod pixel_shift;
 mod style;
+mod user;
+mod widget;
 
 use crate::config::ConfigManager;
 use backlight::BacklightManager;
@@ -54,8 +57,14 @@ use config::{ButtonConfig, Config};
 use display::DrmBackend;
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_WIDTH_PX};
 use style::Color;
+use widget::{WidgetRuntime, WidgetSpec};
 
 const DEFAULT_ICON_SIZE: i32 = 48;
+
+/// The user's `~/.config/not-quite-tiny-dfr` directory, if a target user was resolved.
+/// Icons named in the config are looked up here first. Set once at startup,
+/// before privileges are dropped and before any config is loaded.
+static USER_ICON_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 const TIMEOUT_MS: i32 = 10 * 1000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,6 +102,12 @@ enum ButtonImage {
     Bitmap(ImageSurface),
     Time(Vec<ChronoItem<'static>>, Locale),
     Battery(String, BatteryIconMode, BatteryImages),
+    /// A command widget: `text`/`color` are updated from its script's output.
+    Command {
+        id: usize,
+        text: String,
+        color: Option<Color>,
+    },
     Spacer,
 }
 
@@ -107,6 +122,38 @@ struct Button {
     bg_color: Option<Color>,
     bg_color_active: Option<Color>,
     text_color: Option<Color>,
+}
+
+/// Copy the latest widget outputs into their buttons, marking changed ones for
+/// redraw. Cheap enough to call every loop iteration (the results map is small).
+fn apply_widget_results(layers: &mut [FunctionLayer; 2], rt: &WidgetRuntime) {
+    let map = rt.results();
+    for layer in layers.iter_mut() {
+        for (_, button) in layer.buttons.iter_mut() {
+            if let ButtonImage::Command { id, text, color } = &mut button.image {
+                match map.get(id) {
+                    Some(out) if *text != out.text || *color != out.color => {
+                        *text = out.text.clone();
+                        *color = out.color;
+                    }
+                    _ => continue,
+                }
+            } else {
+                continue;
+            }
+            button.changed = true;
+        }
+    }
+}
+
+/// Set the cairo source to the background image (positioned to fill the bar) if
+/// one is configured, otherwise the solid background color.
+fn set_background_source(c: &Context, style: &style::Style) {
+    if let Some(img) = &style.background_image {
+        c.set_source_surface(img, 0.0, 0.0).unwrap();
+    } else {
+        style.background.set_source(c);
+    }
 }
 
 fn try_load_svg(path: &str) -> Result<ButtonImage> {
@@ -163,13 +210,18 @@ fn try_load_image(
         // .flatten() removes `None` and unwraps `Some` values
         locations = candidates.into_iter().flatten().collect();
     } else {
-        // Standard file icons
-        locations = vec![
-            PathBuf::from(format!("/etc/tiny-dfr/{name}.svg")),
-            PathBuf::from(format!("/etc/tiny-dfr/{name}.png")),
-            PathBuf::from(format!("/usr/share/tiny-dfr/{name}.svg")),
-            PathBuf::from(format!("/usr/share/tiny-dfr/{name}.png")),
-        ];
+        // Standard file icons, searched most-specific first: the user's
+        // ~/.config/not-quite-tiny-dfr, then the system /etc, then the shipped /usr/share.
+        let mut candidates = Vec::new();
+        if let Some(Some(dir)) = USER_ICON_DIR.get() {
+            candidates.push(dir.join(format!("{name}.svg")));
+            candidates.push(dir.join(format!("{name}.png")));
+        }
+        candidates.push(PathBuf::from(format!("/etc/not-quite-tiny-dfr/{name}.svg")));
+        candidates.push(PathBuf::from(format!("/etc/not-quite-tiny-dfr/{name}.png")));
+        candidates.push(PathBuf::from(format!("/usr/share/not-quite-tiny-dfr/{name}.svg")));
+        candidates.push(PathBuf::from(format!("/usr/share/not-quite-tiny-dfr/{name}.png")));
+        locations = candidates;
     };
 
     // Try to load each candidate
@@ -255,7 +307,7 @@ fn get_battery_state(battery: &str) -> (u32, BatteryState) {
 }
 
 impl Button {
-    fn with_config(cfg: ButtonConfig) -> Button {
+    fn with_config(cfg: ButtonConfig, default_icon_size: i32) -> Button {
         let (bg_color, bg_color_active, text_color) = (cfg.color, cfg.color_active, cfg.text_color);
         let mut button = if let Some(text) = cfg.text {
             Button::new_text(text, cfg.action)
@@ -264,8 +316,8 @@ impl Button {
                 &icon,
                 cfg.theme,
                 cfg.action,
-                cfg.icon_width.unwrap_or(DEFAULT_ICON_SIZE),
-                cfg.icon_height.unwrap_or(DEFAULT_ICON_SIZE),
+                cfg.icon_width.unwrap_or(default_icon_size),
+                cfg.icon_height.unwrap_or(default_icon_size),
             )
         } else if let Some(time) = cfg.time {
             Button::new_time(cfg.action, &time, cfg.locale.as_deref())
@@ -302,6 +354,23 @@ impl Button {
             active: false,
             changed: false,
             image: ButtonImage::Text(text),
+            icon_width: 0.0,
+            icon_height: 0.0,
+            bg_color: None,
+            bg_color_active: None,
+            text_color: None,
+        }
+    }
+    fn new_command(id: usize, action: Vec<Key>) -> Button {
+        Button {
+            action,
+            active: false,
+            changed: true, // draw the placeholder until the first result arrives
+            image: ButtonImage::Command {
+                id,
+                text: "\u{2026}".to_string(),
+                color: None,
+            },
             icon_width: 0.0,
             icon_height: 0.0,
             bg_color: None,
@@ -535,8 +604,27 @@ impl Button {
                     c.show_text(&percent_str).unwrap();
                 }
             }
+            ButtonImage::Command { text, .. } => {
+                let extents = c.text_extents(text).unwrap();
+                c.move_to(
+                    button_left_edge + (button_width as f64 / 2.0 - extents.width() / 2.0).round(),
+                    y_shift + (height as f64 / 2.0 + extents.height() / 2.0).round(),
+                );
+                c.show_text(text).unwrap();
+            }
             ButtonImage::Spacer => (),
         }
+    }
+    /// The color to draw this button's text in, letting a command widget's own
+    /// JSON `color` override the configured/default text color.
+    fn effective_text_color(&self, style: &style::Style) -> Color {
+        if let ButtonImage::Command {
+            color: Some(color), ..
+        } = &self.image
+        {
+            return *color;
+        }
+        self.text_color.unwrap_or(style.text_color)
     }
     fn set_active<F>(&mut self, uinput: &mut UInputHandle<F>, active: bool)
     where
@@ -563,7 +651,10 @@ impl Button {
         }
         if self.active {
             Some(self.bg_color_active.unwrap_or(style.button_color_active))
-        } else if show_outlines {
+        } else if show_outlines || style.button_color_set || self.bg_color.is_some() {
+            // Draw the idle fill when outlines are on, or when the user set an
+            // explicit ButtonColor (globally or per-button) -- so a tint over a
+            // background image works even with ShowButtonOutlines = false.
             Some(self.bg_color.unwrap_or(style.button_color))
         } else {
             None
@@ -581,7 +672,12 @@ pub struct FunctionLayer {
 }
 
 impl FunctionLayer {
-    fn with_config(cfg: Vec<ButtonConfig>) -> FunctionLayer {
+    fn with_config(
+        cfg: Vec<ButtonConfig>,
+        widgets: &mut Vec<WidgetSpec>,
+        next_id: &mut usize,
+        default_icon_size: i32,
+    ) -> FunctionLayer {
         if cfg.is_empty() {
             panic!("Invalid configuration, layer has 0 buttons");
         }
@@ -591,7 +687,7 @@ impl FunctionLayer {
         let displays_battery = cfg.iter().any(|cfg| cfg.battery.is_some());
         let buttons = cfg
             .into_iter()
-            .scan(&mut virtual_button_count, |state, cfg| {
+            .scan(&mut virtual_button_count, |state, mut cfg| {
                 let i = **state;
                 let mut stretch = cfg.stretch.unwrap_or(1);
                 if stretch < 1 {
@@ -599,7 +695,19 @@ impl FunctionLayer {
                     stretch = 1;
                 }
                 **state += stretch;
-                Some((i, Button::with_config(cfg)))
+                let button = if let Some(command) = cfg.command.take() {
+                    let id = *next_id;
+                    *next_id += 1;
+                    widgets.push(WidgetSpec {
+                        id,
+                        command,
+                        interval: WidgetSpec::interval_from_secs(cfg.interval),
+                    });
+                    Button::new_command(id, std::mem::take(&mut cfg.action))
+                } else {
+                    Button::with_config(cfg, default_icon_size)
+                };
+                Some((i, button))
             })
             .collect::<Vec<_>>();
         let faster_refresh = buttons.iter().any(|(_, b)| b.needs_faster_refresh());
@@ -635,17 +743,21 @@ impl FunctionLayer {
         };
         let style = &config.style;
         let spacing = style.button_spacing;
+        let edge = style.edge_padding;
         let virtual_button_width = ((width - pixel_shift_width as i32) as f64
+            - 2.0 * edge
             - spacing * (self.virtual_button_count - 1) as f64)
             / self.virtual_button_count as f64;
-        let radius = style.corner_radius;
         let margin = (1.0 - style.height_percent / 100.0) / 2.0;
         let bot = (height as f64) * margin;
         let top = (height as f64) * (1.0 - margin);
+        // Cap the radius at half the button height, otherwise the rounded-corner
+        // arcs overlap into a degenerate shape that stops responding to changes.
+        let radius = style.corner_radius.clamp(0.0, (top - bot) / 2.0);
         let (pixel_shift_x, pixel_shift_y) = pixel_shift;
 
         if complete_redraw {
-            style.background.set_source(&c);
+            set_background_source(&c, style);
             c.paint().unwrap();
         }
         c.set_font_face(&config.font_face);
@@ -666,14 +778,17 @@ impl FunctionLayer {
 
             let left_edge = (start as f64 * (virtual_button_width + spacing))
                 .floor()
+                + edge
                 + pixel_shift_x
                 + (pixel_shift_width / 2) as f64;
 
             let button_width = virtual_button_width
                 + ((end - start - 1) as f64 * (virtual_button_width + spacing)).floor();
+            // Also cap against the button width so narrow buttons stay valid.
+            let radius = radius.min(button_width / 2.0);
 
             if !complete_redraw {
-                style.background.set_source(&c);
+                set_background_source(&c, style);
                 c.rectangle(
                     left_edge,
                     bot - radius,
@@ -693,30 +808,36 @@ impl FunctionLayer {
                 c.new_sub_path();
                 let left = left_edge + radius;
                 let right = (left_edge + button_width.ceil()) - radius;
+                // Inset the corner centers by the radius so the rounding stays
+                // inside the button band [bot, top]. Centering them on bot/top
+                // makes the corners overhang past the band -- off the top/bottom
+                // of the short panel -- leaving only the straight edges visible.
+                let cy_top = bot + radius;
+                let cy_bot = top - radius;
                 c.arc(
                     right,
-                    bot,
+                    cy_top,
                     radius,
                     (-90.0f64).to_radians(),
                     (0.0f64).to_radians(),
                 );
                 c.arc(
                     right,
-                    top,
+                    cy_bot,
                     radius,
                     (0.0f64).to_radians(),
                     (90.0f64).to_radians(),
                 );
                 c.arc(
                     left,
-                    top,
+                    cy_bot,
                     radius,
                     (90.0f64).to_radians(),
                     (180.0f64).to_radians(),
                 );
                 c.arc(
                     left,
-                    bot,
+                    cy_top,
                     radius,
                     (180.0f64).to_radians(),
                     (270.0f64).to_radians(),
@@ -724,10 +845,7 @@ impl FunctionLayer {
                 c.close_path();
                 c.fill().unwrap();
             }
-            button
-                .text_color
-                .unwrap_or(style.text_color)
-                .set_source(&c);
+            button.effective_text_color(style).set_source(&c);
             button.render(
                 &c,
                 height,
@@ -739,11 +857,17 @@ impl FunctionLayer {
             button.changed = false;
 
             if !complete_redraw {
+                // Clamp to the framebuffer bounds: a large CornerRadius or
+                // HeightPercent can otherwise push these past 0/height and, via
+                // the u16 casts, wrap into an invalid rect that makes the
+                // drm.dirty() call below fail and panic the daemon.
+                let h = height as f64;
+                let w = width as f64;
                 modified_regions.push(ClipRect::new(
-                    height as u16 - top as u16 - radius as u16,
-                    left_edge as u16,
-                    height as u16 - bot as u16 + radius as u16,
-                    left_edge as u16 + button_width as u16,
+                    (h - top - radius).clamp(0.0, h) as u16,
+                    left_edge.clamp(0.0, w) as u16,
+                    (h - bot + radius).clamp(0.0, h) as u16,
+                    (left_edge + button_width).clamp(0.0, w) as u16,
                 ));
             }
         }
@@ -751,13 +875,14 @@ impl FunctionLayer {
         modified_regions
     }
 
-    fn hit(&self, spacing: f64, width: u16, height: u16, x: f64, y: f64, i: Option<usize>) -> Option<usize> {
-        let virtual_button_width = (width as f64
-            - spacing * (self.virtual_button_count - 1) as f64)
-            / self.virtual_button_count as f64;
+    fn hit(&self, spacing: f64, edge: f64, width: u16, height: u16, x: f64, y: f64, i: Option<usize>) -> Option<usize> {
+        let usable = width as f64 - 2.0 * edge;
+        let virtual_button_width =
+            (usable - spacing * (self.virtual_button_count - 1) as f64) / self.virtual_button_count as f64;
 
         let i = i.unwrap_or_else(|| {
-            let virtual_i = (x / (width as f64 / self.virtual_button_count as f64)) as usize;
+            let virtual_i =
+                ((x - edge).max(0.0) / (usable / self.virtual_button_count as f64)) as usize;
             self.buttons
                 .iter()
                 .position(|(start, _)| *start > virtual_i)
@@ -775,7 +900,7 @@ impl FunctionLayer {
             self.virtual_button_count
         };
 
-        let left_edge = (start as f64 * (virtual_button_width + spacing)).floor();
+        let left_edge = (start as f64 * (virtual_button_width + spacing)).floor() + edge;
 
         let button_width = virtual_button_width
             + ((end - start - 1) as f64 * (virtual_button_width + spacing)).floor();
@@ -877,19 +1002,53 @@ fn real_main(drm: &mut DrmBackend) {
     let (db_width, db_height) = drm.fb_info().unwrap().size();
     let mut uinput = UInputHandle::new(OpenOptions::new().write(true).open("/dev/uinput").unwrap());
     let mut backlight = BacklightManager::new();
-    let mut cfg_mgr = ConfigManager::new();
-    let (mut cfg, mut layers) = cfg_mgr.load_config(width);
+
+    // Work out whose config we serve (and, below, whose privileges we drop to)
+    // while we are still root. When no user is found we keep the historical
+    // behaviour: run as `nobody` with system-wide config only.
+    let target_user = user::resolve_target_user();
+    let user_cfg_dir = target_user.as_ref().map(|u| u.home.join(".config/not-quite-tiny-dfr"));
+    match &target_user {
+        Some(u) => println!(
+            "not-quite-tiny-dfr: serving user {:?}, config dir {}",
+            u.name,
+            user_cfg_dir.as_ref().unwrap().display()
+        ),
+        None => println!("not-quite-tiny-dfr: no logged-in user found; using system config, running as nobody"),
+    }
+    // Icons named in the config are looked up in the user's config dir first.
+    let _ = USER_ICON_DIR.set(user_cfg_dir.clone());
+
+    // Config override layers, lowest precedence first: system /etc, then the
+    // per-user ~/.config. Both are merged on load and watched for live-reload.
+    let mut cfg_paths = vec![PathBuf::from("/etc/not-quite-tiny-dfr/config.toml")];
+    if let Some(dir) = &user_cfg_dir {
+        cfg_paths.push(dir.join("config.toml"));
+    }
+    let mut cfg_mgr = ConfigManager::new(cfg_paths, width, height);
+    let (mut cfg, mut layers, initial_widgets) = cfg_mgr.load_config();
     let mut pixel_shift = PixelShiftManager::new();
     let mut last = Instant::now();
 
-    // drop privileges to input and video group
+    // Drop to the resolved user (falling back to `nobody`), keeping the input
+    // and video supplementary groups needed for device access.
     let groups = ["input", "video"];
-
+    let drop_user = target_user
+        .as_ref()
+        .map(|u| u.name.as_str())
+        .unwrap_or("nobody");
     PrivDrop::default()
-        .user("nobody")
+        .user(drop_user)
         .group_list(&groups)
         .apply()
         .unwrap_or_else(|e| panic!("Failed to drop privileges: {}", e));
+
+    // Widget worker threads (spawned AFTER the privilege drop, so scripts run as
+    // the user, not root) plus a wake pipe whose read end is polled below.
+    let (wake_read, wake_write) = nix::unistd::pipe().unwrap();
+    widget::set_nonblocking(wake_read.as_raw_fd());
+    let wake_write = Arc::new(wake_write);
+    let mut widget_rt = WidgetRuntime::new(initial_widgets, wake_write.clone());
 
     let mut surface =
         ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
@@ -918,6 +1077,9 @@ fn real_main(drm: &mut DrmBackend) {
         .unwrap();
     epoll
         .add(&udev_monitor, EpollEvent::new(EpollFlags::EPOLLIN, 3))
+        .unwrap();
+    epoll
+        .add(&wake_read, EpollEvent::new(EpollFlags::EPOLLIN, 4))
         .unwrap();
     uinput.set_evbit(EventKind::Key).unwrap();
     for k in Key::iter() {
@@ -950,10 +1112,15 @@ fn real_main(drm: &mut DrmBackend) {
         Local::now().minute()
     };
     loop {
-        if cfg_mgr.update_config(&mut cfg, &mut layers, width) {
+        if let Some(new_widgets) = cfg_mgr.update_config(&mut cfg, &mut layers) {
             active_layer = 0;
             needs_complete_redraw = true;
+            // Replacing the runtime drops the old one, stopping its threads.
+            widget_rt = WidgetRuntime::new(new_widgets, wake_write.clone());
         }
+        // Pull in any widget script output and clear the wake pipe.
+        widget::drain(wake_read.as_raw_fd());
+        apply_widget_results(&mut layers, &widget_rt);
 
         let now = Local::now();
         let ms_left = ((60 - now.second()) * 1000) as i32;
@@ -1051,7 +1218,7 @@ fn real_main(drm: &mut DrmBackend) {
                         TouchEvent::Down(dn) => {
                             let x = dn.x_transformed(width as u32);
                             let y = dn.y_transformed(height as u32);
-                            if let Some(btn) = layers[active_layer].hit(cfg.style.button_spacing, width, height, x, y, None) {
+                            if let Some(btn) = layers[active_layer].hit(cfg.style.button_spacing, cfg.style.edge_padding, width, height, x, y, None) {
                                 touches.insert(dn.seat_slot(), (active_layer, btn));
                                 layers[active_layer].buttons[btn]
                                     .1
@@ -1067,7 +1234,7 @@ fn real_main(drm: &mut DrmBackend) {
                             let y = mtn.y_transformed(height as u32);
                             let (layer, btn) = *touches.get(&mtn.seat_slot()).unwrap();
                             let hit = layers[active_layer]
-                                .hit(cfg.style.button_spacing, width, height, x, y, Some(btn))
+                                .hit(cfg.style.button_spacing, cfg.style.edge_padding, width, height, x, y, Some(btn))
                                 .is_some();
                             layers[layer].buttons[btn].1.set_active(&mut uinput, hit);
                         }
