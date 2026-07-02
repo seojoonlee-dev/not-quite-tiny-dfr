@@ -62,10 +62,16 @@ use widget::{WidgetRuntime, WidgetSpec};
 const DEFAULT_ICON_SIZE: i32 = 48;
 
 /// The user's `~/.config/not-quite-tiny-dfr` directory, if a target user was resolved.
-/// Icons named in the config are looked up here first. Set once at startup,
-/// before privileges are dropped and before any config is loaded.
+/// Icons named in the config are looked up here first. Set once — either at
+/// startup if a user is already logged in, or later (from the main loop) the
+/// moment one logs in, when the daemon came up before anyone was logged in.
 static USER_ICON_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
 const TIMEOUT_MS: i32 = 10 * 1000;
+
+/// While no user is logged in yet, how often to re-check logind for a login (and
+/// how tightly to cap the event loop's idle wait) so a login is picked up
+/// promptly rather than after the full idle timeout.
+const USER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BatteryState {
@@ -971,6 +977,17 @@ where
     );
 }
 
+/// Drop root down to `user`, keeping the supplementary `groups` (input/video)
+/// needed for device access. Privilege dropping is one-way, so this is only
+/// called once we actually know which user to serve.
+fn drop_privileges(user: &str, groups: &[&str]) {
+    PrivDrop::default()
+        .user(user)
+        .group_list(groups)
+        .apply()
+        .unwrap_or_else(|e| panic!("Failed to drop privileges: {}", e));
+}
+
 fn main() {
     let mut drm = DrmBackend::open_card().unwrap();
     let (height, width) = drm.mode().size();
@@ -1003,52 +1020,54 @@ fn real_main(drm: &mut DrmBackend) {
     let mut uinput = UInputHandle::new(OpenOptions::new().write(true).open("/dev/uinput").unwrap());
     let mut backlight = BacklightManager::new();
 
-    // Work out whose config we serve (and, below, whose privileges we drop to)
-    // while we are still root. When no user is found we keep the historical
-    // behaviour: run as `nobody` with system-wide config only.
+    // Work out whose config we serve (and whose privileges we drop to). We do
+    // NOT block waiting for a login and never fall back to `nobody`: if no one
+    // is logged in yet (e.g. the daemon started at boot, before the greeter) we
+    // come up on system + default config, stay root, and poll for a login in the
+    // main loop below -- dropping to the user and loading their ~/.config the
+    // moment they log in. Privilege dropping is one-way, so staying root until
+    // then is exactly what lets a late login still take effect.
+    let groups = ["input", "video"];
     let target_user = user::resolve_target_user();
-    let user_cfg_dir = target_user.as_ref().map(|u| u.home.join(".config/not-quite-tiny-dfr"));
-    match &target_user {
-        Some(u) => println!(
-            "not-quite-tiny-dfr: serving user {:?}, config dir {}",
-            u.name,
-            user_cfg_dir.as_ref().unwrap().display()
-        ),
-        None => println!("not-quite-tiny-dfr: no logged-in user found; using system config, running as nobody"),
-    }
-    // Icons named in the config are looked up in the user's config dir first.
-    let _ = USER_ICON_DIR.set(user_cfg_dir.clone());
 
-    // Config override layers, lowest precedence first: system /etc, then the
-    // per-user ~/.config. Both are merged on load and watched for live-reload.
+    // Config override layers, lowest precedence first: system /etc, then (once we
+    // know who to serve) the per-user ~/.config. Both are merged on load and
+    // watched for live-reload; the user layer is attached later if not known yet.
     let mut cfg_paths = vec![PathBuf::from("/etc/not-quite-tiny-dfr/config.toml")];
-    if let Some(dir) = &user_cfg_dir {
+    if let Some(u) = &target_user {
+        let dir = u.home.join(".config/not-quite-tiny-dfr");
+        println!("not-quite-tiny-dfr: serving user {:?}, config dir {}", u.name, dir.display());
+        // Icons named in the config are looked up in the user's config dir first.
+        let _ = USER_ICON_DIR.set(Some(dir.clone()));
         cfg_paths.push(dir.join("config.toml"));
+    } else {
+        println!("not-quite-tiny-dfr: no logged-in user yet; starting on system config, will load ~/.config on login");
     }
+
     let mut cfg_mgr = ConfigManager::new(cfg_paths, width, height);
     let (mut cfg, mut layers, initial_widgets) = cfg_mgr.load_config();
     let mut pixel_shift = PixelShiftManager::new();
     let mut last = Instant::now();
 
-    // Drop to the resolved user (falling back to `nobody`), keeping the input
-    // and video supplementary groups needed for device access.
-    let groups = ["input", "video"];
-    let drop_user = target_user
-        .as_ref()
-        .map(|u| u.name.as_str())
-        .unwrap_or("nobody");
-    PrivDrop::default()
-        .user(drop_user)
-        .group_list(&groups)
-        .apply()
-        .unwrap_or_else(|e| panic!("Failed to drop privileges: {}", e));
+    // If we already know the user, drop to them now. Otherwise stay root and
+    // defer the drop until someone logs in (handled at the top of the loop).
+    let mut privileges_dropped = false;
+    if let Some(u) = &target_user {
+        drop_privileges(&u.name, &groups);
+        privileges_dropped = true;
+    }
 
-    // Widget worker threads (spawned AFTER the privilege drop, so scripts run as
-    // the user, not root) plus a wake pipe whose read end is polled below.
+    // Widget worker threads are only spawned once privileges have been dropped,
+    // so scripts never run as root: until a user is resolved the runtime is
+    // empty, and the real widgets come up when we reload after login.
     let (wake_read, wake_write) = nix::unistd::pipe().unwrap();
     widget::set_nonblocking(wake_read.as_raw_fd());
     let wake_write = Arc::new(wake_write);
-    let mut widget_rt = WidgetRuntime::new(initial_widgets, wake_write.clone());
+    let mut widget_rt = WidgetRuntime::new(
+        if privileges_dropped { initial_widgets } else { Vec::new() },
+        wake_write.clone(),
+    );
+    let mut last_user_poll = Instant::now();
 
     let mut surface =
         ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
@@ -1112,6 +1131,27 @@ fn real_main(drm: &mut DrmBackend) {
         Local::now().minute()
     };
     loop {
+        // Deferred startup: if we came up before anyone was logged in, poll
+        // logind (throttled) for a login. When one appears, attach the user's
+        // ~/.config layer, drop to them, reload, and bring their widgets up
+        // (now running as that user).
+        if !privileges_dropped && last_user_poll.elapsed() >= USER_POLL_INTERVAL {
+            last_user_poll = Instant::now();
+            if let Some(u) = user::resolve_target_user() {
+                let dir = u.home.join(".config/not-quite-tiny-dfr");
+                println!("not-quite-tiny-dfr: {:?} logged in, loading config dir {}", u.name, dir.display());
+                let _ = USER_ICON_DIR.set(Some(dir.clone()));
+                cfg_mgr.add_path(dir.join("config.toml"));
+                drop_privileges(&u.name, &groups);
+                privileges_dropped = true;
+                let (new_cfg, new_layers, new_widgets) = cfg_mgr.load_config();
+                cfg = new_cfg;
+                layers = new_layers;
+                active_layer = 0;
+                needs_complete_redraw = true;
+                widget_rt = WidgetRuntime::new(new_widgets, wake_write.clone());
+            }
+        }
         if let Some(new_widgets) = cfg_mgr.update_config(&mut cfg, &mut layers) {
             active_layer = 0;
             needs_complete_redraw = true;
@@ -1132,6 +1172,12 @@ fn real_main(drm: &mut DrmBackend) {
                 needs_complete_redraw = true;
             }
             next_timeout_ms = min(next_timeout_ms, pixel_shift_next_timeout_ms);
+        }
+
+        // While still waiting for a login, keep the loop lively so we notice one
+        // within ~a second rather than idling for the full timeout.
+        if !privileges_dropped {
+            next_timeout_ms = min(next_timeout_ms, USER_POLL_INTERVAL.as_millis() as i32);
         }
 
         let current_ts = if layers[active_layer].faster_refresh {

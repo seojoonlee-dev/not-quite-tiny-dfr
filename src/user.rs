@@ -1,14 +1,5 @@
 use nix::unistd::{Uid, User};
-use std::{env, path::PathBuf, process::Command, thread::sleep, time::Duration};
-
-/// How long to wait for seat0 to gain an active session before giving up and
-/// falling back to `nobody`. The daemon is commonly started (via the Touch Bar
-/// udev hotplug / graphical.target) a few seconds before the user's graphical
-/// session finishes activating on seat0, so without this it would resolve no
-/// user and never pick up ~/.config. Bounded so a genuinely user-less boot
-/// (e.g. sitting at a greeter) still falls back in reasonable time.
-const SEAT0_WAIT: Duration = Duration::from_secs(15);
-const SEAT0_POLL_INTERVAL: Duration = Duration::from_millis(500);
+use std::{env, path::PathBuf, process::Command};
 
 /// A resolved target user whose per-user config (~/.config/not-quite-tiny-dfr) should be
 /// read, and to whom privileges are dropped.
@@ -17,20 +8,19 @@ pub struct TargetUser {
     pub home: PathBuf,
 }
 
-/// Work out which user not-quite-tiny-dfr should serve. Resolution order:
+/// Work out which user not-quite-tiny-dfr should serve, without blocking.
+/// Resolution order:
 ///
-/// 1. `NOT_QUITE_TINY_DFR_USER` env var — deterministic, and the recommended way when the
-///    daemon may start before anyone has logged in (so logind has no session
-///    yet). Set it from the systemd unit, e.g. `Environment=NOT_QUITE_TINY_DFR_USER=alice`.
-/// 2. The user owning the active graphical session on seat0, via logind. Because
-///    the daemon is usually started slightly before that session activates, we
-///    poll logind for up to `SEAT0_WAIT` rather than checking just once.
+/// 1. `NOT_QUITE_TINY_DFR_USER` env var — deterministic, and the recommended way
+///    when the daemon may start before anyone has logged in.
+/// 2. The user owning the active graphical session on seat0, via logind.
 ///
-/// Returns `None` when no user can be determined (e.g. started at boot with no
-/// login within the wait window); the caller then falls back to `nobody` +
-/// system config only.
+/// Returns `None` when no user is logged in yet (e.g. the daemon started at boot,
+/// before the greeter). The caller then comes up on system config as root and
+/// keeps calling this (see the main loop) until someone logs in — so a late
+/// login still takes effect, rather than being locked out by an early fallback.
 pub fn resolve_target_user() -> Option<TargetUser> {
-    // The env var is deterministic: honour it immediately and never wait on it.
+    // The env var is deterministic: honour it immediately.
     if let Ok(name) = env::var("NOT_QUITE_TINY_DFR_USER") {
         let name = name.trim();
         if !name.is_empty() {
@@ -40,23 +30,7 @@ pub fn resolve_target_user() -> Option<TargetUser> {
             }
         }
     }
-    wait_for_seat0_user()
-}
-
-/// Poll logind for seat0's active-session user, giving the graphical session a
-/// bounded window to come up before falling back. Returns as soon as a user is
-/// found (usually within a few seconds of a normal login).
-fn wait_for_seat0_user() -> Option<TargetUser> {
-    let deadline = std::time::Instant::now() + SEAT0_WAIT;
-    loop {
-        if let Some(u) = seat0_active_uid().and_then(from_uid) {
-            return Some(u);
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        sleep(SEAT0_POLL_INTERVAL);
-    }
+    seat0_active_uid().and_then(from_uid)
 }
 
 fn from_name(name: &str) -> Option<TargetUser> {
@@ -75,10 +49,22 @@ fn from_uid(uid: u32) -> Option<TargetUser> {
     })
 }
 
-/// Query logind for the uid of the active session on seat0.
+/// Query logind for the uid of the active *user* session on seat0.
+///
+/// We must check the session's `Class`: at boot the display manager runs a
+/// greeter session that owns seat0's active session (e.g. SDDM as uid `sddm`)
+/// before anyone logs in. Accepting it would make us drop privileges to the
+/// greeter's account and load its (empty) config — and since privilege dropping
+/// is one-way, we would then be locked out of ever serving the real user who
+/// logs in afterwards. So we only accept `Class=user` sessions and keep polling
+/// (as root) through the greeter until the actual login replaces it on seat0.
 fn seat0_active_uid() -> Option<u32> {
     let session = loginctl_value(&["show-seat", "seat0", "-p", "ActiveSession", "--value"])?;
     if session.is_empty() {
+        return None;
+    }
+    let class = loginctl_value(&["show-session", &session, "-p", "Class", "--value"])?;
+    if class != "user" {
         return None;
     }
     let uid = loginctl_value(&["show-session", &session, "-p", "User", "--value"])?;

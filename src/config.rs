@@ -540,6 +540,14 @@ impl ConfigManager {
     pub fn load_config(&self) -> (Config, [FunctionLayer; 2], Vec<WidgetSpec>) {
         load_config(&self.cfg_paths, self.width, self.height)
     }
+    /// Add a higher-precedence override layer (and start watching it) after
+    /// construction. Used to attach the per-user ~/.config layer once a user
+    /// logs in, when the daemon started before anyone was logged in. The caller
+    /// reloads afterwards to actually apply it.
+    pub fn add_path(&mut self, path: PathBuf) {
+        self.watches.push(Watch::new(&self.inotify_fd, &path));
+        self.cfg_paths.push(path);
+    }
     /// Returns `Some(new widget specs)` when the config was reloaded (the caller
     /// then rebuilds the widget runtime), or `None` when nothing changed.
     pub fn update_config(
