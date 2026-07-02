@@ -130,26 +130,49 @@ impl ConfigProxy {
     }
 }
 
-fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<Key>, D::Error>
+/// What pressing a button does: emit an input key event, or one of the
+/// daemon-internal actions. In the config an action is the key name
+/// ("VolumeUp", "IllumUp" = keyboard backlight, ...) or an internal action
+/// name ("TouchBarBrightnessUp"/"TouchBarBrightnessDown" = the Touch Bar's
+/// own brightness).
+#[derive(Copy, Clone, PartialEq, Debug)]
+pub enum ButtonAction {
+    Key(Key),
+    TouchBarBrightnessUp,
+    TouchBarBrightnessDown,
+}
+
+impl<'de> Deserialize<'de> for ButtonAction {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let name = String::deserialize(deserializer)?;
+        match name.as_str() {
+            "TouchBarBrightnessUp" => Ok(ButtonAction::TouchBarBrightnessUp),
+            "TouchBarBrightnessDown" => Ok(ButtonAction::TouchBarBrightnessDown),
+            _ => Key::deserialize(de::value::StrDeserializer::new(&name)).map(ButtonAction::Key),
+        }
+    }
+}
+
+fn array_or_single<'de, D>(deserializer: D) -> Result<Vec<ButtonAction>, D::Error>
 where
     D: Deserializer<'de>,
 {
     struct ArrayOrSingle;
 
     impl<'de> Visitor<'de> for ArrayOrSingle {
-        type Value = Vec<Key>;
+        type Value = Vec<ButtonAction>;
 
         fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
             f.write_str("string or array of strings")
         }
 
-        fn visit_str<E: de::Error>(self, value: &str) -> Result<Vec<Key>, E> {
+        fn visit_str<E: de::Error>(self, value: &str) -> Result<Vec<ButtonAction>, E> {
             Ok(vec![Deserialize::deserialize(
                 de::value::BorrowedStrDeserializer::new(value),
             )?])
         }
 
-        fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<Vec<Key>, A::Error> {
+        fn visit_seq<A: de::SeqAccess<'de>>(self, seq: A) -> Result<Vec<ButtonAction>, A::Error> {
             Deserialize::deserialize(de::value::SeqAccessDeserializer::new(seq))
         }
     }
@@ -168,7 +191,7 @@ pub struct ButtonConfig {
     pub battery: Option<String>,
     pub locale: Option<String>,
     #[serde(deserialize_with = "array_or_single", default)]
-    pub action: Vec<Key>,
+    pub action: Vec<ButtonAction>,
     pub stretch: Option<usize>,
     pub icon_width: Option<i32>,
     pub icon_height: Option<i32>,
@@ -214,14 +237,24 @@ fn resolve_font_pattern(family: Option<&str>, bold: Option<bool>) -> String {
 /// The stock F1-F12 primary layer, used when the config sets no PrimaryLayerKeys.
 fn default_primary_layer() -> Vec<ButtonConfig> {
     [
-        Key::F1, Key::F2, Key::F3, Key::F4, Key::F5, Key::F6, Key::F7, Key::F8, Key::F9, Key::F10,
-        Key::F11, Key::F12,
+        Key::F1,
+        Key::F2,
+        Key::F3,
+        Key::F4,
+        Key::F5,
+        Key::F6,
+        Key::F7,
+        Key::F8,
+        Key::F9,
+        Key::F10,
+        Key::F11,
+        Key::F12,
     ]
     .into_iter()
     .enumerate()
     .map(|(i, key)| ButtonConfig {
         text: Some(format!("F{}", i + 1)),
-        action: vec![key],
+        action: vec![ButtonAction::Key(key)],
         ..Default::default()
     })
     .collect()
@@ -246,7 +279,7 @@ fn default_media_layer() -> Vec<ButtonConfig> {
     .into_iter()
     .map(|(icon, key)| ButtonConfig {
         icon: Some(icon.to_string()),
-        action: vec![key],
+        action: vec![ButtonAction::Key(key)],
         ..Default::default()
     })
     .collect()
@@ -258,7 +291,7 @@ fn esc_button() -> ButtonConfig {
         icon: None,
         text: Some("esc".into()),
         theme: None,
-        action: vec![Key::Esc],
+        action: vec![ButtonAction::Key(Key::Esc)],
         stretch: None,
         time: None,
         locale: None,
@@ -368,7 +401,8 @@ fn load_background_image(path: &str, width: i32, height: i32) -> Result<ImageSur
         (height as f64 - ih * scale) / 2.0,
     );
     c.scale(scale, scale);
-    c.set_source_surface(&src, 0.0, 0.0).map_err(|e| e.to_string())?;
+    c.set_source_surface(&src, 0.0, 0.0)
+        .map_err(|e| e.to_string())?;
     c.paint().map_err(|e| e.to_string())?;
     Ok(dst)
 }
@@ -383,8 +417,7 @@ fn load_config(
     width: u16,
     height: u16,
 ) -> (Config, [FunctionLayer; 2], Vec<WidgetSpec>) {
-    let mut base =
-        toml::from_str::<ConfigProxy>(&read_to_string(BASE_CFG_PATH).unwrap()).unwrap();
+    let mut base = toml::from_str::<ConfigProxy>(&read_to_string(BASE_CFG_PATH).unwrap()).unwrap();
     let mut config_error: Option<String> = None;
     for path in override_paths {
         match read_to_string(path) {
@@ -392,7 +425,10 @@ fn load_config(
                 Ok(over) => base.merge(over),
                 Err(e) => {
                     eprintln!("not-quite-tiny-dfr: {}: {e}", path.display());
-                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("config.toml");
+                    let name = path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .unwrap_or("config.toml");
                     config_error.get_or_insert_with(|| short_error(name, &e.to_string()));
                 }
             },
@@ -428,8 +464,9 @@ fn load_config(
         }
         None => {
             let mut media_layer_keys = base.media_layer_keys.unwrap_or_else(default_media_layer);
-            let mut primary_layer_keys =
-                base.primary_layer_keys.unwrap_or_else(default_primary_layer);
+            let mut primary_layer_keys = base
+                .primary_layer_keys
+                .unwrap_or_else(default_primary_layer);
             let media_esc = prepend_esc_if_needed(&mut media_layer_keys, width);
             let primary_esc = prepend_esc_if_needed(&mut primary_layer_keys, width);
             // How many button-slots a layer shows at once; layers with more
@@ -454,7 +491,10 @@ fn load_config(
                 primary_esc as usize,
                 scroll_loop,
             );
-            if base.media_layer_default.unwrap_or(DEFAULT_MEDIA_LAYER_DEFAULT) {
+            if base
+                .media_layer_default
+                .unwrap_or(DEFAULT_MEDIA_LAYER_DEFAULT)
+            {
                 [media_layer, fkey_layer]
             } else {
                 [fkey_layer, media_layer]
@@ -465,8 +505,12 @@ fn load_config(
         show_button_outlines: base
             .show_button_outlines
             .unwrap_or(DEFAULT_SHOW_BUTTON_OUTLINES),
-        enable_pixel_shift: base.enable_pixel_shift.unwrap_or(DEFAULT_ENABLE_PIXEL_SHIFT),
-        adaptive_brightness: base.adaptive_brightness.unwrap_or(DEFAULT_ADAPTIVE_BRIGHTNESS),
+        enable_pixel_shift: base
+            .enable_pixel_shift
+            .unwrap_or(DEFAULT_ENABLE_PIXEL_SHIFT),
+        adaptive_brightness: base
+            .adaptive_brightness
+            .unwrap_or(DEFAULT_ADAPTIVE_BRIGHTNESS),
         font_face: load_font(&resolve_font_pattern(
             base.font_family.as_deref(),
             base.font_bold,
@@ -603,7 +647,12 @@ impl ConfigManager {
         None
     }
     #[cold]
-    fn handle_events(&mut self, cfg: &mut Config, layers: &mut [FunctionLayer; 2], evts: Result<Vec<InotifyEvent>, Errno>) -> Option<Vec<WidgetSpec>> {
+    fn handle_events(
+        &mut self,
+        cfg: &mut Config,
+        layers: &mut [FunctionLayer; 2],
+        evts: Result<Vec<InotifyEvent>, Errno>,
+    ) -> Option<Vec<WidgetSpec>> {
         let evts = match evts {
             Ok(evts) => evts,
             Err(_) => return None,
@@ -623,9 +672,9 @@ impl ConfigManager {
         // Reload only when an event names one of our config files in the
         // directory it lives in.
         let reload = evts.iter().any(|evt| {
-            self.watches.iter().any(|w| {
-                w.wd == Some(evt.wd) && evt.name.as_deref() == Some(w.name.as_os_str())
-            })
+            self.watches
+                .iter()
+                .any(|w| w.wd == Some(evt.wd) && evt.name.as_deref() == Some(w.name.as_os_str()))
         });
         if !reload {
             return None;
@@ -687,7 +736,7 @@ mod tests {
     fn error_banner_keeps_esc_on_wide_panels() {
         // Wide panels get the auto Esc key; the error banner must keep it.
         assert_eq!(error_layer("config error", 2170).buttons.len(), 2); // esc + banner
-        // Narrow panels have no auto Esc, so just the banner.
+                                                                        // Narrow panels have no auto Esc, so just the banner.
         assert_eq!(error_layer("config error", 1000).buttons.len(), 1);
     }
 

@@ -34,6 +34,9 @@
 #     { Text = "F12", Action = "F12" },
 # ]
 
+# Actions are Linux key names ("IllumDown"/"IllumUp" = keyboard backlight)
+# or the daemon-internal "TouchBarBrightnessDown"/"TouchBarBrightnessUp",
+# which adjust the Touch Bar's own brightness (10 levels, hold to repeat).
 # MediaLayerKeys = [
 #     { Icon = "brightness_low",  Action = "BrightnessDown" },
 #     { Icon = "brightness_high", Action = "BrightnessUp"   },

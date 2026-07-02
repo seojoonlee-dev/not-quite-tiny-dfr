@@ -55,7 +55,7 @@ mod widget;
 
 use crate::config::ConfigManager;
 use backlight::BacklightManager;
-use config::{ButtonConfig, Config};
+use config::{ButtonAction, ButtonConfig, Config};
 use display::DrmBackend;
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_HEIGHT_PX, PIXEL_SHIFT_WIDTH_PX};
 use style::Color;
@@ -190,7 +190,7 @@ struct Button {
     image: ButtonImage,
     changed: bool,
     active: bool,
-    action: Vec<Key>,
+    action: Vec<ButtonAction>,
     icon_width: f64,
     icon_height: f64,
     // Per-button style overrides; fall back to the global Style when None.
@@ -301,8 +301,12 @@ fn try_load_image(
         }
         candidates.push(PathBuf::from(format!("/etc/not-quite-tiny-dfr/{name}.svg")));
         candidates.push(PathBuf::from(format!("/etc/not-quite-tiny-dfr/{name}.png")));
-        candidates.push(PathBuf::from(format!("/usr/share/not-quite-tiny-dfr/{name}.svg")));
-        candidates.push(PathBuf::from(format!("/usr/share/not-quite-tiny-dfr/{name}.png")));
+        candidates.push(PathBuf::from(format!(
+            "/usr/share/not-quite-tiny-dfr/{name}.svg"
+        )));
+        candidates.push(PathBuf::from(format!(
+            "/usr/share/not-quite-tiny-dfr/{name}.png"
+        )));
         locations = candidates;
     };
 
@@ -430,7 +434,7 @@ impl Button {
             text_color: None,
         }
     }
-    fn new_text(text: String, action: Vec<Key>) -> Button {
+    fn new_text(text: String, action: Vec<ButtonAction>) -> Button {
         Button {
             action,
             active: false,
@@ -443,7 +447,7 @@ impl Button {
             text_color: None,
         }
     }
-    fn new_command(id: usize, action: Vec<Key>) -> Button {
+    fn new_command(id: usize, action: Vec<ButtonAction>) -> Button {
         Button {
             action,
             active: false,
@@ -463,7 +467,7 @@ impl Button {
     fn new_icon(
         path: impl AsRef<str>,
         theme: Option<impl AsRef<str>>,
-        action: Vec<Key>,
+        action: Vec<ButtonAction>,
         icon_width: i32,
         icon_height: i32,
     ) -> Button {
@@ -490,7 +494,7 @@ impl Button {
         panic!("failed to load icon");
     }
     fn new_battery(
-        action: Vec<Key>,
+        action: Vec<ButtonAction>,
         battery_mode: String,
         theme: Option<impl AsRef<str>>,
     ) -> Button {
@@ -498,15 +502,25 @@ impl Button {
         let mut plain = Vec::new();
         let mut charging = Vec::new();
         for icon in [
-            "battery_0_bar", "battery_1_bar", "battery_2_bar", "battery_3_bar",
-            "battery_4_bar", "battery_5_bar", "battery_6_bar", "battery_full",
+            "battery_0_bar",
+            "battery_1_bar",
+            "battery_2_bar",
+            "battery_3_bar",
+            "battery_4_bar",
+            "battery_5_bar",
+            "battery_6_bar",
+            "battery_full",
         ] {
             plain.push(Self::load_battery_image(icon, theme.as_ref()));
         }
         for icon in [
-            "battery_charging_20", "battery_charging_30", "battery_charging_50",
-            "battery_charging_60", "battery_charging_80",
-            "battery_charging_90", "battery_charging_full",
+            "battery_charging_20",
+            "battery_charging_30",
+            "battery_charging_50",
+            "battery_charging_60",
+            "battery_charging_80",
+            "battery_charging_90",
+            "battery_charging_full",
         ] {
             charging.push(Self::load_battery_image(icon, theme.as_ref()));
         }
@@ -536,7 +550,7 @@ impl Button {
         }
     }
 
-    fn new_time(action: Vec<Key>, format: &str, locale_str: Option<&str>) -> Button {
+    fn new_time(action: Vec<ButtonAction>, format: &str, locale_str: Option<&str>) -> Button {
         let format_str = if format == "24hr" {
             "%H:%M    %a %-e %b"
         } else if format == "12hr" {
@@ -873,7 +887,6 @@ struct ScrollGeometry {
     max_offset: f64,
 }
 
-
 impl FunctionLayer {
     /// The scroll layout for this layer, or `None` when it doesn't scroll
     /// (scrolling disabled, or all the buttons already fit).
@@ -1168,7 +1181,11 @@ impl FunctionLayer {
                 };
                 // The button, plus (when looping) a copy one period to the
                 // left when it straddles the wrap seam.
-                let wrap_copy = if self.scroll_loop { x0 - geo.period } else { f64::INFINITY };
+                let wrap_copy = if self.scroll_loop {
+                    x0 - geo.period
+                } else {
+                    f64::INFINITY
+                };
                 for base in [x0, wrap_copy] {
                     if base >= geo.region_width || base + button_width <= 0.0 {
                         continue;
@@ -1220,10 +1237,9 @@ impl FunctionLayer {
         } else {
             Vec::new()
         };
-        let virtual_button_width = (effective_width
-            - 2.0 * edge
-            - spacing * (self.virtual_button_count - 1) as f64)
-            / self.virtual_button_count as f64;
+        let virtual_button_width =
+            (effective_width - 2.0 * edge - spacing * (self.virtual_button_count - 1) as f64)
+                / self.virtual_button_count as f64;
 
         if complete_redraw {
             set_background_source(&c, style, bg_shift);
@@ -1243,8 +1259,7 @@ impl FunctionLayer {
                 continue;
             };
 
-            let left_edge = (start as f64 * (virtual_button_width + spacing))
-                .floor()
+            let left_edge = (start as f64 * (virtual_button_width + spacing)).floor()
                 + edge
                 + pixel_shift_x
                 + (pixel_shift_width / 2) as f64;
@@ -1299,7 +1314,15 @@ impl FunctionLayer {
         modified_regions
     }
 
-    fn hit(&self, style: &style::Style, width: u16, height: u16, x: f64, y: f64, i: Option<usize>) -> Option<usize> {
+    fn hit(
+        &self,
+        style: &style::Style,
+        width: u16,
+        height: u16,
+        x: f64,
+        y: f64,
+        i: Option<usize>,
+    ) -> Option<usize> {
         let spacing = style.button_spacing;
         let edge = style.edge_padding;
         if y < 0.1 * height as f64 || y > 0.9 * height as f64 {
@@ -1312,7 +1335,10 @@ impl FunctionLayer {
                 // Pinned (Esc) region.
                 let rel = x - edge;
                 let slot = (rel.max(0.0) / pitch) as usize;
-                if rel >= 0.0 && slot < self.pinned_slots && rel - slot as f64 * pitch <= geo.slot_width {
+                if rel >= 0.0
+                    && slot < self.pinned_slots
+                    && rel - slot as f64 * pitch <= geo.slot_width
+                {
                     self.button_at_slot(slot)
                 } else {
                     None
@@ -1341,8 +1367,8 @@ impl FunctionLayer {
         }
 
         let usable = width as f64 - 2.0 * edge;
-        let virtual_button_width =
-            (usable - spacing * (self.virtual_button_count - 1) as f64) / self.virtual_button_count as f64;
+        let virtual_button_width = (usable - spacing * (self.virtual_button_count - 1) as f64)
+            / self.virtual_button_count as f64;
 
         let i = i.unwrap_or_else(|| {
             let virtual_i =
@@ -1413,15 +1439,28 @@ where
         .unwrap();
 }
 
-fn toggle_keys<F>(uinput: &mut UInputHandle<F>, codes: &Vec<Key>, value: i32)
+fn toggle_keys<F>(uinput: &mut UInputHandle<F>, codes: &Vec<ButtonAction>, value: i32)
 where
     F: AsRawFd,
 {
     if codes.is_empty() {
         return;
     }
-    for kc in codes {
-        emit(uinput, EventKind::Key, *kc as u16, value);
+    for action in codes {
+        match action {
+            // Handled inside the daemon; no input event leaves it.
+            ButtonAction::TouchBarBrightnessUp | ButtonAction::TouchBarBrightnessDown => {
+                if value <= 1 {
+                    let delta = if *action == ButtonAction::TouchBarBrightnessUp {
+                        1
+                    } else {
+                        -1
+                    };
+                    backlight::dim_button(delta, value == 1);
+                }
+            }
+            ButtonAction::Key(kc) => emit(uinput, EventKind::Key, *kc as u16, value),
+        }
     }
     emit(
         uinput,
@@ -1530,7 +1569,7 @@ fn emergency_mode(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) -> ! {
         },
     };
     let _ = epoll.add(input_tb.as_fd(), EpollEvent::new(EpollFlags::EPOLLIN, 0));
-    let esc_action = vec![Key::Esc];
+    let esc_action = vec![ButtonAction::Key(Key::Esc)];
     let mut esc_slots = HashSet::new();
     loop {
         let _ = epoll.wait(&mut [EpollEvent::new(EpollFlags::EPOLLIN, 0)], 60_000u16);
@@ -1588,7 +1627,11 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
     let mut cfg_paths = vec![PathBuf::from("/etc/not-quite-tiny-dfr/config.toml")];
     if let Some(u) = &target_user {
         let dir = u.home.join(".config/not-quite-tiny-dfr");
-        println!("not-quite-tiny-dfr: serving user {:?}, config dir {}", u.name, dir.display());
+        println!(
+            "not-quite-tiny-dfr: serving user {:?}, config dir {}",
+            u.name,
+            dir.display()
+        );
         // Icons named in the config are looked up in the user's config dir first.
         let _ = USER_ICON_DIR.set(Some(dir.clone()));
         cfg_paths.push(dir.join("config.toml"));
@@ -1652,7 +1695,11 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         });
     }
     let mut widget_rt = WidgetRuntime::new(
-        if privileges_dropped { initial_widgets } else { Vec::new() },
+        if privileges_dropped {
+            initial_widgets
+        } else {
+            Vec::new()
+        },
         wake_write.clone(),
     );
     let mut last_user_poll = Instant::now();
@@ -1661,6 +1708,7 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
     let mut active_layer = 0;
     let mut needs_complete_redraw = true;
+    let mut last_soft_dim = 1.0;
 
     let mut input_tb = Libinput::new_with_udev(Interface);
     let mut input_main = Libinput::new_with_udev(Interface);
@@ -1713,7 +1761,11 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
             last_user_poll = Instant::now();
             if let Some(u) = user::resolve_target_user() {
                 let dir = u.home.join(".config/not-quite-tiny-dfr");
-                println!("not-quite-tiny-dfr: {:?} logged in, loading config dir {}", u.name, dir.display());
+                println!(
+                    "not-quite-tiny-dfr: {:?} logged in, loading config dir {}",
+                    u.name,
+                    dir.display()
+                );
                 let _ = USER_ICON_DIR.set(Some(dir.clone()));
                 cfg_mgr.add_path(dir.join("config.toml"));
                 drop_privileges(&u.name, &groups);
@@ -1741,7 +1793,14 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         // or the start of a scroll.
         let mut hold_wait_ms: Option<u64> = None;
         for state in touches.values_mut() {
-            let TouchState::Pending { layer, btn: Some(btn), start_x, x, at } = *state else {
+            let TouchState::Pending {
+                layer,
+                btn: Some(btn),
+                start_x,
+                x,
+                at,
+            } = *state
+            else {
                 continue;
             };
             if (x - start_x).abs() > SCROLL_SLOP_PX {
@@ -1899,7 +1958,28 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 // so skip the frame entirely.
                 if !clips.is_empty() {
                     let data = surface.data().unwrap();
-                    drm.map().unwrap().as_mut()[..data.len()].copy_from_slice(&data);
+                    {
+                        let mut map = drm.map().unwrap();
+                        let out = &mut map.as_mut()[..data.len()];
+                        let dim = backlight.soft_dim_factor();
+                        if dim < 1.0 {
+                            // Software brightness: the appletb hardware backlight
+                            // only has full/dim/off, so finer levels are done by
+                            // scaling the pixels on their way to the framebuffer.
+                            let mut lut = [0u8; 256];
+                            for (i, v) in lut.iter_mut().enumerate() {
+                                *v = (i as f64 * dim) as u8;
+                            }
+                            for (dst, src) in out.chunks_exact_mut(4).zip(data.chunks_exact(4)) {
+                                dst[0] = lut[src[0] as usize];
+                                dst[1] = lut[src[1] as usize];
+                                dst[2] = lut[src[2] as usize];
+                                dst[3] = src[3];
+                            }
+                        } else {
+                            out.copy_from_slice(&data);
+                        }
+                    }
                     drm.dirty(&clips).unwrap();
                 }
                 needs_complete_redraw = false;
@@ -1921,6 +2001,8 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         // motion. The timerfd fires at the deadline with sub-ms precision.
         let frame_pending = scroll_animating
             || needs_complete_redraw
+            || backlight.soft_dim_animating()
+            || backlight::dim_held()
             || layers[active_layer].buttons.iter().any(|b| b.1.changed);
         if frame_pending {
             let remaining = next_frame
@@ -1969,8 +2051,12 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 }
                 Event::Keyboard(KeyboardEvent::Key(key)) => {
                     if key.key() == Key::Fn as u32 {
-                        if cfg.double_press_switch_layers > 0 && key.key_state() == KeyState::Pressed {
-                            if last.elapsed() < Duration::from_millis(cfg.double_press_switch_layers.into()) {
+                        if cfg.double_press_switch_layers > 0
+                            && key.key_state() == KeyState::Pressed
+                        {
+                            if last.elapsed()
+                                < Duration::from_millis(cfg.double_press_switch_layers.into())
+                            {
                                 layers.swap(0, 1);
                             }
                             last = Instant::now();
@@ -2009,13 +2095,16 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                     if !was_flinging {
                                         layer.buttons[btn].1.set_visual_active(true);
                                     }
-                                    touches.insert(dn.seat_slot(), TouchState::Pending {
-                                        layer: active_layer,
-                                        btn: (!was_flinging).then_some(btn),
-                                        start_x: x,
-                                        x,
-                                        at: Instant::now(),
-                                    });
+                                    touches.insert(
+                                        dn.seat_slot(),
+                                        TouchState::Pending {
+                                            layer: active_layer,
+                                            btn: (!was_flinging).then_some(btn),
+                                            start_x: x,
+                                            x,
+                                            at: Instant::now(),
+                                        },
+                                    );
                                 }
                                 // Pinned buttons (Esc) and non-scrollable layers
                                 // keep the immediate press-on-touch behavior.
@@ -2023,20 +2112,26 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                     layer.buttons[btn].1.set_active(uinput, true);
                                     touches.insert(
                                         dn.seat_slot(),
-                                        TouchState::Held { layer: active_layer, btn },
+                                        TouchState::Held {
+                                            layer: active_layer,
+                                            btn,
+                                        },
                                     );
                                 }
                                 // A miss inside the band region can still start
                                 // a scroll drag.
                                 None => {
                                     if geo.is_some_and(|g| x >= g.region_left) {
-                                        touches.insert(dn.seat_slot(), TouchState::Pending {
-                                            layer: active_layer,
-                                            btn: None,
-                                            start_x: x,
-                                            x,
-                                            at: Instant::now(),
-                                        });
+                                        touches.insert(
+                                            dn.seat_slot(),
+                                            TouchState::Pending {
+                                                layer: active_layer,
+                                                btn: None,
+                                                start_x: x,
+                                                x,
+                                                at: Instant::now(),
+                                            },
+                                        );
                                     }
                                 }
                             }
@@ -2056,7 +2151,13 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                         layers[layer].buttons[btn].1.set_active(uinput, hit);
                                     }
                                 }
-                                TouchState::Pending { layer, btn, start_x, at, .. } => {
+                                TouchState::Pending {
+                                    layer,
+                                    btn,
+                                    start_x,
+                                    at,
+                                    ..
+                                } => {
                                     *state = if (x - start_x).abs() > SCROLL_SLOP_PX {
                                         // Became a scroll: the highlighted
                                         // candidate button is off the hook.
@@ -2074,10 +2175,21 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                             velocity: 0.0,
                                         }
                                     } else {
-                                        TouchState::Pending { layer, btn, start_x, x, at }
+                                        TouchState::Pending {
+                                            layer,
+                                            btn,
+                                            start_x,
+                                            x,
+                                            at,
+                                        }
                                     };
                                 }
-                                TouchState::Scroll { layer, last_x, last_t_us, velocity } => {
+                                TouchState::Scroll {
+                                    layer,
+                                    last_x,
+                                    last_t_us,
+                                    velocity,
+                                } => {
                                     if let Some(geo) =
                                         layers[layer].scroll_geometry(width as f64, &cfg.style)
                                     {
@@ -2126,7 +2238,11 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                 }
                                 // A quick tap on the band: press and release
                                 // (it was already lit up since touch-down).
-                                TouchState::Pending { layer, btn: Some(btn), .. } => {
+                                TouchState::Pending {
+                                    layer,
+                                    btn: Some(btn),
+                                    ..
+                                } => {
                                     if btn < layers[layer].buttons.len() {
                                         let button = &mut layers[layer].buttons[btn].1;
                                         button.emit_keys(uinput, true);
@@ -2135,7 +2251,12 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                     }
                                 }
                                 TouchState::Pending { .. } => {}
-                                TouchState::Scroll { layer, last_t_us, velocity, .. } => {
+                                TouchState::Scroll {
+                                    layer,
+                                    last_t_us,
+                                    velocity,
+                                    ..
+                                } => {
                                     // A finger that rested before lifting was
                                     // placing the band, not flicking it: any
                                     // stale velocity from earlier motion must
@@ -2192,6 +2313,11 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
             }
         }
         backlight.update_backlight(&cfg);
+        // A soft-dim change re-scales every pixel, not just changed buttons.
+        if backlight.soft_dim_factor() != last_soft_dim {
+            last_soft_dim = backlight.soft_dim_factor();
+            needs_complete_redraw = true;
+        }
     }
 }
 
@@ -2223,11 +2349,17 @@ mod tests {
     fn no_scroll_when_disabled_or_fitting() {
         let style = Style::default();
         // VisibleButtons unset (0): never scrolls.
-        assert!(text_layer(20, 1, 0).scroll_geometry(W as f64, &style).is_none());
+        assert!(text_layer(20, 1, 0)
+            .scroll_geometry(W as f64, &style)
+            .is_none());
         // 6 band slots fit in 6 visible: no scrolling.
-        assert!(text_layer(7, 1, 6).scroll_geometry(W as f64, &style).is_none());
+        assert!(text_layer(7, 1, 6)
+            .scroll_geometry(W as f64, &style)
+            .is_none());
         // 13 band slots > 6 visible: scrolls.
-        assert!(text_layer(14, 1, 6).scroll_geometry(W as f64, &style).is_some());
+        assert!(text_layer(14, 1, 6)
+            .scroll_geometry(W as f64, &style)
+            .is_some());
     }
 
     #[test]
@@ -2266,7 +2398,7 @@ mod tests {
         let geo = layer.scroll_geometry(W as f64, &style).unwrap();
         let max = geo.max_offset;
         assert!((max - 7.0 * geo.pitch).abs() < 1e-9); // 13 band slots - 6 visible
-        // Offsets clamp at the ends instead of wrapping.
+                                                       // Offsets clamp at the ends instead of wrapping.
         assert!(layer.normalize_offset(&geo, -50.0).abs() < 1e-9);
         assert!((layer.normalize_offset(&geo, max + 50.0) - max).abs() < 1e-9);
         // Snap never rests past the last button (or before the first).
@@ -2280,7 +2412,10 @@ mod tests {
         let x = geo.region_left + geo.region_width - 5.0;
         assert_eq!(layer.hit(&style, W, H, x, y, None), Some(13));
         layer.scroll_offset = 0.0;
-        assert_eq!(layer.hit(&style, W, H, geo.region_left + 5.0, y, None), Some(1));
+        assert_eq!(
+            layer.hit(&style, W, H, geo.region_left + 5.0, y, None),
+            Some(1)
+        );
     }
 
     #[test]
@@ -2350,7 +2485,10 @@ mod tests {
         assert_eq!(layer.hit(&style, W, H, region_left + 5.0, y, None), Some(2));
         // Scrolling backwards wraps around to the last button (the band loops).
         layer.scroll_offset = -pitch;
-        assert_eq!(layer.hit(&style, W, H, region_left + 5.0, y, None), Some(13));
+        assert_eq!(
+            layer.hit(&style, W, H, region_left + 5.0, y, None),
+            Some(13)
+        );
         // Outside the vertical touch band nothing is hit.
         layer.scroll_offset = 0.0;
         assert_eq!(layer.hit(&style, W, H, region_left + 5.0, 1.0, None), None);
