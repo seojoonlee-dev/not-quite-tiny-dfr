@@ -62,6 +62,15 @@ fn set_backlight(mut file: &File, value: u32) {
     file.write_all(format!("{}\n", value).as_bytes()).unwrap();
 }
 
+/// Best-effort: turn the Touch Bar backlight on. Used by the post-crash
+/// emergency screen, where the normal backlight manager is long gone and the
+/// bar may have been left dimmed or off.
+pub fn force_on() {
+    if let Ok(path) = find_backlight() {
+        let _ = fs::write(path.join("brightness"), b"128\n");
+    }
+}
+
 pub struct BacklightManager {
     last_active: Instant,
     max_bl: u32,

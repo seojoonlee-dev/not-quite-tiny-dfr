@@ -44,12 +44,15 @@ pub struct Config {
 const DEFAULT_MEDIA_LAYER_DEFAULT: bool = false;
 const DEFAULT_SHOW_BUTTON_OUTLINES: bool = true;
 const DEFAULT_ENABLE_PIXEL_SHIFT: bool = false;
-const DEFAULT_FONT_TEMPLATE: &str = ":bold";
+// Bold by default, matching the original hardcoded ":bold" pattern.
+const DEFAULT_FONT_BOLD: bool = true;
 const DEFAULT_ADAPTIVE_BRIGHTNESS: bool = true;
 const DEFAULT_ACTIVE_BRIGHTNESS: u32 = 128;
 const DEFAULT_DOUBLE_PRESS_SWITCH_LAYERS: u32 = 0;
 const DEFAULT_DIM_TIMEOUT: u32 = 30;
 const DEFAULT_OFF_TIMEOUT: u32 = 60;
+const DEFAULT_VISIBLE_BUTTONS: usize = 0;
+const DEFAULT_SCROLL_LOOP: bool = true;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -57,7 +60,6 @@ struct ConfigProxy {
     media_layer_default: Option<bool>,
     show_button_outlines: Option<bool>,
     enable_pixel_shift: Option<bool>,
-    font_template: Option<String>,
     font_family: Option<String>,
     font_bold: Option<bool>,
     adaptive_brightness: Option<bool>,
@@ -65,6 +67,8 @@ struct ConfigProxy {
     double_press_switch_layers: Option<u32>,
     dim_timeout: Option<u32>,
     off_timeout: Option<u32>,
+    visible_buttons: Option<usize>,
+    scroll_loop: Option<bool>,
     style: Option<StyleProxy>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
@@ -82,9 +86,6 @@ impl ConfigProxy {
         }
         if o.enable_pixel_shift.is_some() {
             self.enable_pixel_shift = o.enable_pixel_shift;
-        }
-        if o.font_template.is_some() {
-            self.font_template = o.font_template;
         }
         if o.font_family.is_some() {
             self.font_family = o.font_family;
@@ -106,6 +107,12 @@ impl ConfigProxy {
         }
         if o.off_timeout.is_some() {
             self.off_timeout = o.off_timeout;
+        }
+        if o.visible_buttons.is_some() {
+            self.visible_buttons = o.visible_buttons;
+        }
+        if o.scroll_loop.is_some() {
+            self.scroll_loop = o.scroll_loop;
         }
         if o.primary_layer_keys.is_some() {
             self.primary_layer_keys = o.primary_layer_keys;
@@ -192,18 +199,15 @@ fn load_font(name: &str) -> FontFace {
     FontFace::create_from_ft(&face).unwrap()
 }
 
-/// Build the fontconfig pattern for text labels. A plain `FontFamily` resolves
-/// to the REGULAR weight (add FontBold = true for bold); if it is unset we fall
-/// back to the legacy `FontTemplate` pattern, then the default.
-fn resolve_font_pattern(
-    family: Option<&str>,
-    bold: Option<bool>,
-    template: Option<&str>,
-) -> String {
-    match family.map(str::trim).filter(|f| !f.is_empty()) {
-        Some(family) if bold.unwrap_or(false) => format!("{family}:bold"),
-        Some(family) => family.to_string(),
-        None => template.unwrap_or(DEFAULT_FONT_TEMPLATE).to_string(),
+/// Build the fontconfig pattern for text labels, CSS-style: `FontFamily` picks
+/// the family ("" = the system default sans), `FontBold` the weight. Bold is
+/// the default, matching the bar's original look.
+fn resolve_font_pattern(family: Option<&str>, bold: Option<bool>) -> String {
+    let family = family.map(str::trim).unwrap_or("");
+    if bold.unwrap_or(DEFAULT_FONT_BOLD) {
+        format!("{family}:bold")
+    } else {
+        family.to_string()
     }
 }
 
@@ -270,10 +274,14 @@ fn esc_button() -> ButtonConfig {
 }
 
 /// Prepend the auto Esc key on panels wide enough to need one. Used for both the
-/// normal layers and the error banner, so an error never hides Esc.
-fn prepend_esc_if_needed(keys: &mut Vec<ButtonConfig>, width: u16) {
+/// normal layers and the error banner, so an error never hides Esc. Returns
+/// whether a key was added — that key is pinned (excluded from scrolling).
+fn prepend_esc_if_needed(keys: &mut Vec<ButtonConfig>, width: u16) -> bool {
     if width >= 2170 {
         keys.insert(0, esc_button());
+        true
+    } else {
+        false
     }
 }
 
@@ -310,7 +318,7 @@ fn error_layer(message: &str, width: u16) -> FunctionLayer {
         command: None,
         interval: None,
     });
-    FunctionLayer::with_config(keys, &mut Vec::new(), &mut 0, 48)
+    FunctionLayer::with_config(keys, &mut Vec::new(), &mut 0, 48, 0, 0, true)
 }
 
 /// Resolve a background image path: absolute paths are used as-is; relative ones
@@ -335,10 +343,14 @@ fn resolve_image_path(path: &str) -> Option<PathBuf> {
     None
 }
 
-/// Load a PNG and scale/center-crop it to exactly `width` x `height` (CSS
+/// Load a PNG and scale/center-crop it to the bar size (CSS
 /// `background-size: cover`), so an image too tall for the bar shows its middle
-/// band. Returns a bar-sized surface ready to paint at the origin.
+/// band. The surface is made one pixel-shift range larger than the bar in each
+/// axis, so pixel shift can slide the image around without exposing its edges
+/// (the renderer paints it centered, offset by half that margin).
 fn load_background_image(path: &str, width: i32, height: i32) -> Result<ImageSurface, String> {
+    let width = width + crate::pixel_shift::PIXEL_SHIFT_WIDTH_PX as i32;
+    let height = height + crate::pixel_shift::PIXEL_SHIFT_HEIGHT_PX as i32;
     let resolved = resolve_image_path(path).ok_or_else(|| format!("not found: {path}"))?;
     let mut file = File::open(&resolved).map_err(|e| e.to_string())?;
     let src =
@@ -418,19 +430,29 @@ fn load_config(
             let mut media_layer_keys = base.media_layer_keys.unwrap_or_else(default_media_layer);
             let mut primary_layer_keys =
                 base.primary_layer_keys.unwrap_or_else(default_primary_layer);
-            prepend_esc_if_needed(&mut media_layer_keys, width);
-            prepend_esc_if_needed(&mut primary_layer_keys, width);
+            let media_esc = prepend_esc_if_needed(&mut media_layer_keys, width);
+            let primary_esc = prepend_esc_if_needed(&mut primary_layer_keys, width);
+            // How many button-slots a layer shows at once; layers with more
+            // become scrollable (the pinned Esc doesn't count or scroll).
+            let visible_buttons = base.visible_buttons.unwrap_or(DEFAULT_VISIBLE_BUTTONS);
+            let scroll_loop = base.scroll_loop.unwrap_or(DEFAULT_SCROLL_LOOP);
             let media_layer = FunctionLayer::with_config(
                 media_layer_keys,
                 &mut widgets,
                 &mut next_id,
                 default_icon_size,
+                visible_buttons,
+                media_esc as usize,
+                scroll_loop,
             );
             let fkey_layer = FunctionLayer::with_config(
                 primary_layer_keys,
                 &mut widgets,
                 &mut next_id,
                 default_icon_size,
+                visible_buttons,
+                primary_esc as usize,
+                scroll_loop,
             );
             if base.media_layer_default.unwrap_or(DEFAULT_MEDIA_LAYER_DEFAULT) {
                 [media_layer, fkey_layer]
@@ -448,7 +470,6 @@ fn load_config(
         font_face: load_font(&resolve_font_pattern(
             base.font_family.as_deref(),
             base.font_bold,
-            base.font_template.as_deref(),
         )),
         active_brightness: base.active_brightness.unwrap_or(DEFAULT_ACTIVE_BRIGHTNESS),
         double_press_switch_layers: base
@@ -651,6 +672,15 @@ mod tests {
         let style = base.style.unwrap().resolve();
         assert_eq!(style.button_spacing, 0.0); // overridden
         assert_eq!(style.corner_radius, 8.0); // retained through style field-merge
+    }
+
+    #[test]
+    fn visible_buttons_parses_and_merges() {
+        let mut base: ConfigProxy = toml::from_str("VisibleButtons = 8\n").unwrap();
+        assert_eq!(base.visible_buttons, Some(8));
+        let over: ConfigProxy = toml::from_str("VisibleButtons = 12\n").unwrap();
+        base.merge(over);
+        assert_eq!(base.visible_buttons, Some(12));
     }
 
     #[test]

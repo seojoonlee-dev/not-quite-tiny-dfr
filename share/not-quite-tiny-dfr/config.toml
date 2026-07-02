@@ -1,82 +1,24 @@
-# not-quite-tiny-dfr configuration reference.
-#
-# Every setting below is COMMENTED OUT and shows its default value. Uncomment
-# and edit only what you want to change -- anything left commented uses the
-# built-in default. This file is the shipped reference; do not edit it directly.
-#
-# Configs are merged in order of increasing precedence, so a later file only
-# needs to specify what it changes:
-#   1. this reference   (/usr/share/not-quite-tiny-dfr/config.toml)
-#   2. system config    (/etc/not-quite-tiny-dfr/config.toml)
-#   3. per-user config  (~/.config/not-quite-tiny-dfr/config.toml)
-# All three are watched and live-reloaded.
-#
-# TWO TOML RULES to remember when you uncomment things:
-#   * Top-level keys (the globals below, and the PrimaryLayerKeys / MediaLayerKeys
-#     arrays) must all come BEFORE the [Style] table.
-#   * So [Style] must be the LAST thing in the file.
+# not-quite-tiny-dfr configuration.
+# Merged in order: /usr/share -> /etc -> ~/.config (later files win, live-reloaded).
+# Commented values are the built-in defaults; uncomment to override.
+# Top-level keys must come before [Style]; keep [Style] last.
 
-# ============================ Globals ============================
-
-# Show the media-key layer by default (F-keys on Fn) instead of the reverse.
 # MediaLayerDefault = false
-
-# Draw the button rectangles. With this false the bar is just labels/icons
-# (e.g. to show a BackgroundImage through). Note: a button still highlights
-# when pressed, and an explicitly-set [Style] ButtonColor is drawn even here.
 # ShowButtonOutlines = true
-
-# Slowly shift the whole screen to reduce burn-in (macOS does not bother).
 # EnablePixelShift = false
-
-# Font family for text labels, e.g. "Domine" or "JetBrains Mono". A bare family
-# uses the REGULAR weight; set FontBold = true for bold. This is the simple way
-# to pick a font.
-# FontFamily = "Domine"
-# FontBold = false
-
-# Advanced: a raw fontconfig pattern (family + weight etc.), used only when
-# FontFamily is unset. Examples: "" (default sans), ":bold", "Domine:bold".
-# FontTemplate = ":bold"
-
-# Follow the main screen's brightness for the Touch Bar backlight.
+# FontFamily = ""
+# FontBold = true
 # AdaptiveBrightness = true
-
-# Backlight in the active state (0-255). With AdaptiveBrightness it is the
-# maximum point on the brightness curve.
 # ActiveBrightness = 128
-
-# Quick double-press of Fn (within N ms) swaps the default layer. 0 disables it.
 # DoublePressSwitchLayers = 0
-
-# Seconds of inactivity before the Touch Bar DIMS. 0 disables dimming.
 # DimTimeout = 30
-
-# Seconds of inactivity before the Touch Bar turns OFF. 0 disables turn-off.
-# Set both DimTimeout and OffTimeout to 0 to keep the bar always on.
 # OffTimeout = 60
+# VisibleButtons = 0
 
-# ======================= Primary (F-key) layer =======================
-#
-# An array of buttons. Each entry picks ONE content type plus options:
-#   Text     - a text label, e.g. "F1"
-#   Icon     - an svg/png in ~/.config, /etc, or /usr/share (no extension).
-#              With Theme set, an XDG icon name looked up in XDG_DATA_DIRS.
-#   Time     - "24hr", "12hr", or a strftime string; optional Locale.
-#   Battery  - "percentage", "icon", or "both".
-#   Command  - a widget: run a shell command every Interval seconds and show its
-#              stdout (JSON {"text","color"} or plain text). See "Widgets" below.
-#   (none)   - an empty spacer (use Stretch to size it).
-# Common options: Action (a key or ["Ctrl","Alt","F1"] combo), Stretch (width in
-# button-slots, >=1), IconWidth/IconHeight (px, default 48), and the per-button
-# style overrides Color / ColorActive / TextColor (same hex format as [Style]).
-# The Esc key is added automatically on Macs without a physical one.
-#
-# Widgets run arbitrary commands as your user -- only use scripts you trust
-# (see the README). A CPU-temperature widget ships with the app:
-#   { Command = "sh /usr/share/not-quite-tiny-dfr/widgets/cpu_temp.sh", Interval = 2, Stretch = 2 }
-#
-# Default (used when unset): F1 through F12.
+# Whether a scrollable layer wraps around like a band (true) or stops at the
+# first/last button (false).
+# ScrollLoop = true
+
 # PrimaryLayerKeys = [
 #     { Text = "F1",  Action = "F1"  },
 #     { Text = "F2",  Action = "F2"  },
@@ -92,9 +34,6 @@
 #     { Text = "F12", Action = "F12" },
 # ]
 
-# ========================== Media-key layer ==========================
-#
-# Default (used when unset): the standard brightness/media/volume icons.
 # MediaLayerKeys = [
 #     { Icon = "brightness_low",  Action = "BrightnessDown" },
 #     { Icon = "brightness_high", Action = "BrightnessUp"   },
@@ -110,52 +49,17 @@
 #     { Icon = "volume_up",       Action = "VolumeUp"       },
 # ]
 
-# ===================== Appearance ([Style], keep LAST) =====================
-#
-# Colors are hex strings: "#rgb", "#rgba", "#rrggbb", or "#rrggbbaa" (alpha).
 # [Style]
-
-# Solid bar background.
 # Background = "#000000"
-
-# Whole-bar background image (PNG). Scaled to cover the bar and center-cropped,
-# so a too-tall image shows its middle band. Absolute path, or a bare name
-# searched in ~/.config, /etc, then /usr/share. Background and BackgroundImage
-# are mutually exclusive -- whichever is written LATER here wins.
-# BackgroundImage = "/home/me/Pictures/touchbar.png"
-
-# Idle button fill. Drawn when ShowButtonOutlines is true, or whenever you set
-# this explicitly (so you can tint buttons over a BackgroundImage even with
-# outlines off). Leave unset to keep buttons see-through.
+# BackgroundImage = ""
 # ButtonColor = "#333333"
-
-# Button fill while pressed.
 # ButtonColorActive = "#666666"
-
-# Text label color (does not affect SVG icons, which keep their own colors).
 # TextColor = "#ffffff"
-
-# Gap between buttons, in pixels. 0 = edge-to-edge.
 # ButtonSpacing = 16
-
-# Padding between the left/right screen edges and the first/last button, in px.
 # EdgePadding = 0
-
-# Button corner radius, in pixels. Capped at half the button height.
 # CornerRadius = 8
-
-# Font size for text labels.
 # FontSize = 32
-
-# Default icon size in px, for buttons that don't set IconWidth/IconHeight
-# (e.g. the brightness/volume icons). Scales those icons like FontSize scales text.
 # IconSize = 48
-
-# Button height as a percentage (0-100) of the bar height.
 # HeightPercent = 90
-
-# Battery-widget fill while charging.
 # BatteryChargingColor = "#00b300"
-
-# Battery-widget fill when the charge is low.
 # BatteryLowColor = "#b30000"

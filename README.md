@@ -43,3 +43,22 @@ a Python script, a compiled binary.
 
 Event-driven / streaming widgets (a long-lived process that pushes updates
 instantly, rather than polling) are planned but not yet implemented.
+
+## Scrollable layers
+
+Want more buttons than fit on the bar? Set
+
+```toml
+VisibleButtons = 12
+```
+
+and add as many buttons to a layer as you like. The layer shows 12 slots at a
+time; **flick horizontally** to scroll through the rest, with momentum, and the
+strip **wraps around like a band** — scrolling past the last button loops back
+to the first (set `ScrollLoop = false` to stop at the ends instead). The
+auto-added **Esc key stays pinned** on the left and never scrolls.
+
+On a scrollable layer, a quick **tap** presses a button, **holding** your
+finger still for a moment holds the key down (key repeat for volume/brightness
+still works), and a horizontal **drag** scrolls. Layers that fit within
+`VisibleButtons` behave exactly as before.
