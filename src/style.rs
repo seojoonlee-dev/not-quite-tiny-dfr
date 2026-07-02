@@ -195,7 +195,9 @@ impl<'de> Deserialize<'de> for StyleProxy {
                         "FontSize" => s.font_size = Some(map.next_value()?),
                         "IconSize" => s.icon_size = Some(map.next_value()?),
                         "HeightPercent" => s.height_percent = Some(map.next_value()?),
-                        "BatteryChargingColor" => s.battery_charging_color = Some(map.next_value()?),
+                        "BatteryChargingColor" => {
+                            s.battery_charging_color = Some(map.next_value()?)
+                        }
                         "BatteryLowColor" => s.battery_low_color = Some(map.next_value()?),
                         // Unknown keys are ignored (kept lenient on purpose).
                         _ => {
@@ -252,7 +254,10 @@ impl StyleProxy {
             corner_radius: self.corner_radius.unwrap_or(d.corner_radius),
             font_size: self.font_size.unwrap_or(d.font_size),
             icon_size: self.icon_size.unwrap_or(d.icon_size).max(0.0),
-            height_percent: self.height_percent.unwrap_or(d.height_percent).clamp(0.0, 100.0),
+            height_percent: self
+                .height_percent
+                .unwrap_or(d.height_percent)
+                .clamp(0.0, 100.0),
             battery_charging_color: self
                 .battery_charging_color
                 .unwrap_or(d.battery_charging_color),
@@ -288,7 +293,10 @@ mod tests {
 
     #[test]
     fn parses_alpha_and_short_forms() {
-        assert!(approx(Color::from_hex("#00000080").unwrap().a, 128.0 / 255.0));
+        assert!(approx(
+            Color::from_hex("#00000080").unwrap().a,
+            128.0 / 255.0
+        ));
         assert_eq!(Color::from_hex("#fff").unwrap(), Color::rgb(1.0, 1.0, 1.0));
         assert_eq!(Color::from_hex("#f00f").unwrap(), Color::rgb(1.0, 0.0, 0.0));
     }

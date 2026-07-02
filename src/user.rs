@@ -26,7 +26,9 @@ pub fn resolve_target_user() -> Option<TargetUser> {
         if !name.is_empty() {
             match from_name(name) {
                 Some(u) => return Some(u),
-                None => eprintln!("not-quite-tiny-dfr: NOT_QUITE_TINY_DFR_USER={name:?} not found, ignoring"),
+                None => eprintln!(
+                    "not-quite-tiny-dfr: NOT_QUITE_TINY_DFR_USER={name:?} not found, ignoring"
+                ),
             }
         }
     }

@@ -69,7 +69,8 @@ impl WidgetRuntime {
     /// read end lives in the main epoll loop; a byte is written whenever a
     /// widget's output changes, so the loop wakes and redraws.
     pub fn new(specs: Vec<WidgetSpec>, wake: Arc<OwnedFd>) -> WidgetRuntime {
-        let results: Arc<Mutex<HashMap<usize, WidgetOutput>>> = Arc::new(Mutex::new(HashMap::new()));
+        let results: Arc<Mutex<HashMap<usize, WidgetOutput>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let stop = Arc::new(AtomicBool::new(false));
         for spec in specs {
             let results = results.clone();
@@ -251,6 +252,9 @@ mod tests {
         assert_eq!(WidgetSpec::interval_from_secs(Some(0.001)), MIN_INTERVAL);
         assert_eq!(WidgetSpec::interval_from_secs(Some(-5.0)), MIN_INTERVAL);
         assert_eq!(WidgetSpec::interval_from_secs(None), Duration::from_secs(2));
-        assert_eq!(WidgetSpec::interval_from_secs(Some(5.0)), Duration::from_secs(5));
+        assert_eq!(
+            WidgetSpec::interval_from_secs(Some(5.0)),
+            Duration::from_secs(5)
+        );
     }
 }
