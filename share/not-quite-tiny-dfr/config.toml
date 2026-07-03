@@ -19,6 +19,10 @@
 # first/last button (false).
 # ScrollLoop = true
 
+# ScrollRubberBand = true
+
+# LayerSwipe = true
+
 # PrimaryLayerKeys = [
 #     { Text = "F1",  Action = "F1"  },
 #     { Text = "F2",  Action = "F2"  },

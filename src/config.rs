@@ -35,6 +35,8 @@ pub struct Config {
     pub dim_timeout: u32,
     /// Seconds of inactivity before turning the Touch Bar off; 0 disables it.
     pub off_timeout: u32,
+    /// Whether a vertical swipe on the bar slides between the two layers.
+    pub layer_swipe: bool,
     pub style: Style,
 }
 
@@ -53,6 +55,8 @@ const DEFAULT_DIM_TIMEOUT: u32 = 30;
 const DEFAULT_OFF_TIMEOUT: u32 = 60;
 const DEFAULT_VISIBLE_BUTTONS: usize = 0;
 const DEFAULT_SCROLL_LOOP: bool = true;
+const DEFAULT_SCROLL_RUBBER_BAND: bool = true;
+const DEFAULT_LAYER_SWIPE: bool = true;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -69,6 +73,8 @@ struct ConfigProxy {
     off_timeout: Option<u32>,
     visible_buttons: Option<usize>,
     scroll_loop: Option<bool>,
+    scroll_rubber_band: Option<bool>,
+    layer_swipe: Option<bool>,
     style: Option<StyleProxy>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
@@ -113,6 +119,12 @@ impl ConfigProxy {
         }
         if o.scroll_loop.is_some() {
             self.scroll_loop = o.scroll_loop;
+        }
+        if o.scroll_rubber_band.is_some() {
+            self.scroll_rubber_band = o.scroll_rubber_band;
+        }
+        if o.layer_swipe.is_some() {
+            self.layer_swipe = o.layer_swipe;
         }
         if o.primary_layer_keys.is_some() {
             self.primary_layer_keys = o.primary_layer_keys;
@@ -351,7 +363,7 @@ fn error_layer(message: &str, width: u16) -> FunctionLayer {
         command: None,
         interval: None,
     });
-    FunctionLayer::with_config(keys, &mut Vec::new(), &mut 0, 48, 0, 0, true)
+    FunctionLayer::with_config(keys, &mut Vec::new(), &mut 0, 48, 0, 0, true, true)
 }
 
 /// Resolve a background image path: absolute paths are used as-is; relative ones
@@ -473,6 +485,9 @@ fn load_config(
             // become scrollable (the pinned Esc doesn't count or scroll).
             let visible_buttons = base.visible_buttons.unwrap_or(DEFAULT_VISIBLE_BUTTONS);
             let scroll_loop = base.scroll_loop.unwrap_or(DEFAULT_SCROLL_LOOP);
+            let scroll_rubber_band = base
+                .scroll_rubber_band
+                .unwrap_or(DEFAULT_SCROLL_RUBBER_BAND);
             let media_layer = FunctionLayer::with_config(
                 media_layer_keys,
                 &mut widgets,
@@ -481,6 +496,7 @@ fn load_config(
                 visible_buttons,
                 media_esc as usize,
                 scroll_loop,
+                scroll_rubber_band,
             );
             let fkey_layer = FunctionLayer::with_config(
                 primary_layer_keys,
@@ -490,6 +506,7 @@ fn load_config(
                 visible_buttons,
                 primary_esc as usize,
                 scroll_loop,
+                scroll_rubber_band,
             );
             if base
                 .media_layer_default
@@ -521,6 +538,7 @@ fn load_config(
             .unwrap_or(DEFAULT_DOUBLE_PRESS_SWITCH_LAYERS),
         dim_timeout: base.dim_timeout.unwrap_or(DEFAULT_DIM_TIMEOUT),
         off_timeout: base.off_timeout.unwrap_or(DEFAULT_OFF_TIMEOUT),
+        layer_swipe: base.layer_swipe.unwrap_or(DEFAULT_LAYER_SWIPE),
         style,
     };
     (cfg, layers, widgets)
@@ -730,6 +748,24 @@ mod tests {
         let over: ConfigProxy = toml::from_str("VisibleButtons = 12\n").unwrap();
         base.merge(over);
         assert_eq!(base.visible_buttons, Some(12));
+    }
+
+    #[test]
+    fn scroll_rubber_band_parses_and_merges() {
+        let mut base: ConfigProxy = toml::from_str("ScrollRubberBand = true\n").unwrap();
+        assert_eq!(base.scroll_rubber_band, Some(true));
+        let over: ConfigProxy = toml::from_str("ScrollRubberBand = false\n").unwrap();
+        base.merge(over);
+        assert_eq!(base.scroll_rubber_band, Some(false));
+    }
+
+    #[test]
+    fn layer_swipe_parses_and_merges() {
+        let mut base: ConfigProxy = toml::from_str("LayerSwipe = true\n").unwrap();
+        assert_eq!(base.layer_swipe, Some(true));
+        let over: ConfigProxy = toml::from_str("LayerSwipe = false\n").unwrap();
+        base.merge(over);
+        assert_eq!(base.layer_swipe, Some(false));
     }
 
     #[test]

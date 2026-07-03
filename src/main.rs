@@ -109,14 +109,31 @@ const FRAME_SLACK: Duration = Duration::from_micros(500);
 const SNAP_TAU: f64 = 0.08;
 /// The snap glide is finished once within this many px of its target.
 const SNAP_EPSILON: f64 = 0.5;
+/// Rubber-band overscroll (non-looping bands only): hard cap in px on how far
+/// past an end the band can be pulled. Drag resistance grows asymptotically
+/// toward it, so the cap is approached but never reached.
+const RUBBER_BAND_RANGE: f64 = 160.0;
+/// Time constant of the critically damped spring that returns a fling
+/// overshooting past an end: one continuous out-and-back bounce, no
+/// friction phase to wait out.
+const RUBBER_SPRING_TAU: f64 = 0.08;
+/// Cap on the momentum handed to that spring when a fling crosses an end,
+/// keeping the bounce peak (~130 px) under the drag stretch cap.
+const RUBBER_MAX_BOUNCE_VELOCITY: f64 = 3000.0;
+/// Minimum release velocity (px/s) for a two-finger layer swipe to commit
+/// the switch regardless of how far it has slid. Layer swiping is a
+/// two-finger HORIZONTAL fling: the digitizer never reports Y movement
+/// (verified with evtest -- the axis is declared but silent), so vertical
+/// gestures cannot exist on this hardware.
+const LAYER_SWIPE_MIN_VELOCITY: f64 = 300.0;
 
 /// What one finger on the bar is currently doing.
 #[derive(Clone, Copy)]
 enum TouchState {
     /// Holding an activated button (its key is down until release).
     Held { layer: usize, btn: usize },
-    /// On a scrollable band, not yet disambiguated between tap, hold, and
-    /// scroll. `btn` is `None` when the touch only caught a moving band (or hit
+    /// Not yet disambiguated between tap, hold, scroll, and layer swipe.
+    /// `btn` is `None` when the touch only caught a moving band (or hit
     /// a gap) and so should never press anything.
     Pending {
         layer: usize,
@@ -134,6 +151,25 @@ enum TouchState {
         last_t_us: u64,
         velocity: f64,
     },
+    /// Two-finger horizontal swipe switching layers: the whole bar slides
+    /// sideways with the fingers (`layer_shift` in the main loop).
+    LayerSwipe {
+        last_x: f64,
+        last_t_us: u64,
+        velocity: f64,
+    },
+}
+
+impl TouchState {
+    /// Short label for NQTD_TOUCH_LOG diagnostics.
+    fn name(&self) -> &'static str {
+        match self {
+            TouchState::Held { .. } => "held",
+            TouchState::Pending { .. } => "pending",
+            TouchState::Scroll { .. } => "scroll",
+            TouchState::LayerSwipe { .. } => "swipe",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -855,6 +891,9 @@ pub struct FunctionLayer {
     visible_slots: usize,
     /// Whether the band wraps around like a loop, or stops at its ends.
     scroll_loop: bool,
+    /// When not looping, whether overscroll past an end stretches out with
+    /// rubber-band resistance and springs back, instead of clamping dead.
+    scroll_rubber_band: bool,
     /// Scroll position along the virtual strip, in px; wraps modulo the period.
     scroll_offset: f64,
     /// Fling momentum in px/s (in finger direction); 0 when not coasting.
@@ -887,7 +926,48 @@ struct ScrollGeometry {
     max_offset: f64,
 }
 
+impl ScrollGeometry {
+    /// Map a raw offset (tracking the finger 1:1) to the displayed one:
+    /// overshoot past either end is compressed asymptotically toward
+    /// RUBBER_BAND_RANGE, which is what makes the band feel elastic.
+    fn rubber_display(&self, raw: f64) -> f64 {
+        let compress = |x: f64| RUBBER_BAND_RANGE * x / (x + RUBBER_BAND_RANGE);
+        if raw < 0.0 {
+            -compress(-raw)
+        } else if raw > self.max_offset {
+            self.max_offset + compress(raw - self.max_offset)
+        } else {
+            raw
+        }
+    }
+
+    /// Inverse of `rubber_display`, so drags and flings can integrate in raw
+    /// (finger) space and stay path-independent: the same travel back always
+    /// returns the band to where it started stretching.
+    fn rubber_raw(&self, displayed: f64) -> f64 {
+        // The compression never actually reaches the cap; the min() only
+        // guards the division against float dust at extreme offsets.
+        let expand = |d: f64| {
+            let d = d.min(RUBBER_BAND_RANGE - 1e-6);
+            RUBBER_BAND_RANGE * d / (RUBBER_BAND_RANGE - d)
+        };
+        if displayed < 0.0 {
+            -expand(-displayed)
+        } else if displayed > self.max_offset {
+            self.max_offset + expand(displayed - self.max_offset)
+        } else {
+            displayed
+        }
+    }
+}
+
 impl FunctionLayer {
+    /// Whether overscroll on this layer rubber-bands (only meaningful without
+    /// looping: a looping band has no ends to overshoot).
+    fn rubber_bands(&self) -> bool {
+        !self.scroll_loop && self.scroll_rubber_band
+    }
+
     /// The scroll layout for this layer, or `None` when it doesn't scroll
     /// (scrolling disabled, or all the buttons already fit).
     fn scroll_geometry(&self, width: f64, style: &style::Style) -> Option<ScrollGeometry> {
@@ -994,6 +1074,7 @@ impl FunctionLayer {
         visible_buttons: usize,
         pinned_count: usize,
         scroll_loop: bool,
+        scroll_rubber_band: bool,
     ) -> FunctionLayer {
         if cfg.is_empty() {
             panic!("Invalid configuration, layer has 0 buttons");
@@ -1045,6 +1126,7 @@ impl FunctionLayer {
             pinned_slots,
             visible_slots: visible_buttons,
             scroll_loop,
+            scroll_rubber_band,
             scroll_offset: 0.0,
             scroll_velocity: 0.0,
             scroll_snap: None,
@@ -1059,6 +1141,11 @@ impl FunctionLayer {
         surface: &Surface,
         pixel_shift: (f64, f64),
         complete_redraw: bool,
+        // Layer-swipe slide: the whole layer draws shifted sideways by this
+        // many px along the bar. `paint_background` is false for the second
+        // layer of a sliding composite, so it doesn't wipe the first.
+        slide_offset: f64,
+        paint_background: bool,
     ) -> Vec<ClipRect> {
         let c = Context::new(surface).unwrap();
         c.translate(height as f64, 0.0);
@@ -1105,10 +1192,13 @@ impl FunctionLayer {
             } else {
                 Vec::new()
             };
-            if complete_redraw {
+            if complete_redraw && paint_background {
                 set_background_source(&c, style, bg_shift);
                 c.paint().unwrap();
             }
+            // The layer-swipe slide moves every button (but not the
+            // background) sideways as one piece.
+            c.translate(slide_offset, 0.0);
             for i in 0..self.pinned_count {
                 let end = if i + 1 < self.buttons.len() {
                     self.buttons[i + 1].0
@@ -1241,10 +1331,13 @@ impl FunctionLayer {
             (effective_width - 2.0 * edge - spacing * (self.virtual_button_count - 1) as f64)
                 / self.virtual_button_count as f64;
 
-        if complete_redraw {
+        if complete_redraw && paint_background {
             set_background_source(&c, style, bg_shift);
             c.paint().unwrap();
         }
+        // The layer-swipe slide moves every button (but not the background)
+        // sideways as one piece.
+        c.translate(slide_offset, 0.0);
 
         for i in 0..self.buttons.len() {
             let end = if i + 1 < self.buttons.len() {
@@ -1345,14 +1438,15 @@ impl FunctionLayer {
                 }
             } else {
                 // The band: translate into strip coordinates (wrapped when
-                // looping; offsets are already clamped when not).
+                // looping; negative only while rubber-banded past the start,
+                // where the finger is left of the first button).
                 let sx = if self.scroll_loop {
                     (x - geo.region_left + self.scroll_offset).rem_euclid(geo.period)
                 } else {
                     x - geo.region_left + self.scroll_offset
                 };
                 let slot = (sx / pitch) as usize;
-                if sx - slot as f64 * pitch <= geo.slot_width {
+                if sx >= 0.0 && sx - slot as f64 * pitch <= geo.slot_width {
                     self.button_at_slot(slot + self.pinned_slots)
                 } else {
                     None // in the gap between buttons
@@ -1645,6 +1739,11 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
     let mut last = Instant::now();
     // Last time fling momentum was integrated (see the top of the main loop).
     let mut fling_tick = Instant::now();
+    // Vertical layer-swipe slide: how far the visible layer is slid off the
+    // bar (px, signed), and the slide's animation target -- +-height commits
+    // the swap, 0 aborts back to the current layer.
+    let mut layer_shift: f64 = 0.0;
+    let mut layer_slide_target: Option<f64> = None;
     // The 60 Hz pacing gate: absolute deadline of the next frame, and when
     // the previous frame started (only for the frame log's period readout).
     let mut next_frame = Instant::now();
@@ -1652,6 +1751,7 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
     // NQTD_FRAME_LOG=1 prints per-frame timings to the journal, for chasing
     // pacing problems on real hardware.
     let frame_log = std::env::var_os("NQTD_FRAME_LOG").is_some_and(|v| v != "0");
+    let touch_log = std::env::var_os("NQTD_TOUCH_LOG").is_some_and(|v| v != "0");
     // The battery reading whose rendering is currently on screen; battery
     // buttons only redraw when the poller's cache moves away from this.
     let mut last_battery_drawn = *BATTERY_STATE.lock().unwrap();
@@ -1830,8 +1930,61 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         let anim_dt = fling_tick.elapsed().as_secs_f64();
         fling_tick = Instant::now();
         let mut scroll_animating = false;
+        // Advance the sideways layer slide. Reaching +-width swaps the
+        // layers; reaching 0 aborts back to the current one.
+        if let Some(target) = layer_slide_target {
+            let delta = target - layer_shift;
+            if delta.abs() <= SNAP_EPSILON {
+                if target != 0.0 {
+                    layers.swap(0, 1);
+                }
+                layer_shift = 0.0;
+                layer_slide_target = None;
+            } else {
+                layer_shift += delta * (1.0 - (-anim_dt / SNAP_TAU).exp());
+            }
+            scroll_animating = true;
+            needs_complete_redraw = true;
+        } else if layer_shift != 0.0
+            && !touches
+                .values()
+                .any(|t| matches!(t, TouchState::LayerSwipe { .. }))
+        {
+            // Safety net: a slide left dangling (e.g. its touch was cancelled)
+            // resolves toward whichever layer is showing more.
+            let w = width as f64;
+            layer_slide_target = Some(if layer_shift.abs() > w / 2.0 {
+                w.copysign(layer_shift)
+            } else {
+                0.0
+            });
+            scroll_animating = true;
+        }
         for (i, layer) in layers.iter_mut().enumerate() {
             if layer.scroll_velocity == 0.0 && layer.scroll_snap.is_none() {
+                // Safety net: a rubber-banding band must never REST stretched
+                // past an end. Whatever path left it overscrolled with nothing
+                // armed (a cancelled touch, a missed release), spring it back
+                // -- unless a finger on this layer is holding the stretch.
+                let finger_on_layer = touches.values().any(|t| match *t {
+                    TouchState::Held { layer, .. }
+                    | TouchState::Pending { layer, .. }
+                    | TouchState::Scroll { layer, .. } => layer == i,
+                    // A layer swipe holds the slide, not any band stretch.
+                    TouchState::LayerSwipe { .. } => false,
+                });
+                if !layer.rubber_bands() || finger_on_layer {
+                    continue;
+                }
+                let Some(geo) = layer.scroll_geometry(width as f64, &cfg.style) else {
+                    continue;
+                };
+                if layer.scroll_offset < 0.0 || layer.scroll_offset > geo.max_offset {
+                    layer.scroll_snap = Some(layer.scroll_offset.clamp(0.0, geo.max_offset));
+                    // Step from the next frame: this tick's anim_dt spans the
+                    // idle gap and would teleport the glide to its target.
+                    scroll_animating = true;
+                }
                 continue;
             }
             let Some(geo) = layer.scroll_geometry(width as f64, &cfg.style) else {
@@ -1840,22 +1993,67 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 continue;
             };
             if layer.scroll_velocity != 0.0 {
-                layer.scroll_offset = layer
-                    .normalize_offset(&geo, layer.scroll_offset - layer.scroll_velocity * anim_dt);
-                // Without looping a fling stops dead at the ends (which are
-                // always slot-aligned, so no snap glide is needed).
-                if !layer.scroll_loop
-                    && ((layer.scroll_offset <= 0.0 && layer.scroll_velocity > 0.0)
-                        || (layer.scroll_offset >= geo.max_offset && layer.scroll_velocity < 0.0))
-                {
-                    layer.scroll_velocity = 0.0;
-                    layer.scroll_snap = None;
-                }
-                layer.scroll_velocity *= (-anim_dt / layer.fling_tau).exp();
-                if layer.scroll_velocity.abs() < FLING_STOP_VELOCITY {
-                    // Hand the residual distance over to the snap glide.
-                    layer.scroll_velocity = 0.0;
-                    layer.scroll_snap = Some(layer.snap_target(&geo, layer.scroll_offset));
+                if layer.rubber_bands() {
+                    let edge = layer.scroll_offset.clamp(0.0, geo.max_offset);
+                    let over = layer.scroll_offset - edge;
+                    if over != 0.0 {
+                        // Past an end: a critically damped spring hauls the
+                        // band back in one continuous out-and-back motion.
+                        // scroll_offset moves by -velocity, so integrate its
+                        // rate u = -velocity (semi-implicit Euler).
+                        let omega = 1.0 / RUBBER_SPRING_TAU;
+                        let mut u = -layer.scroll_velocity;
+                        u -= (omega * omega * over + 2.0 * omega * u) * anim_dt;
+                        layer.scroll_offset += u * anim_dt;
+                        layer.scroll_velocity = -u;
+                        if (layer.scroll_offset - edge).abs() <= SNAP_EPSILON
+                            && u.abs() < FLING_STOP_VELOCITY
+                        {
+                            // Settled: the ends are slot-aligned, no glide.
+                            layer.scroll_offset = edge;
+                            layer.scroll_velocity = 0.0;
+                        }
+                    } else {
+                        let next = layer.scroll_offset - layer.scroll_velocity * anim_dt;
+                        if next < 0.0 || next > geo.max_offset {
+                            // Crossing an end: cap the momentum handed to the
+                            // spring so the bounce can't stretch further than
+                            // a hard drag.
+                            layer.scroll_velocity = layer
+                                .scroll_velocity
+                                .clamp(-RUBBER_MAX_BOUNCE_VELOCITY, RUBBER_MAX_BOUNCE_VELOCITY);
+                            layer.scroll_offset -= layer.scroll_velocity * anim_dt;
+                        } else {
+                            layer.scroll_offset = next;
+                            layer.scroll_velocity *= (-anim_dt / layer.fling_tau).exp();
+                            if layer.scroll_velocity.abs() < FLING_STOP_VELOCITY {
+                                layer.scroll_velocity = 0.0;
+                                layer.scroll_snap =
+                                    Some(layer.snap_target(&geo, layer.scroll_offset));
+                            }
+                        }
+                    }
+                } else {
+                    layer.scroll_offset = layer.normalize_offset(
+                        &geo,
+                        layer.scroll_offset - layer.scroll_velocity * anim_dt,
+                    );
+                    // Without looping a fling stops dead at the ends (which are
+                    // always slot-aligned, so no snap glide is needed).
+                    if !layer.scroll_loop
+                        && ((layer.scroll_offset <= 0.0 && layer.scroll_velocity > 0.0)
+                            || (layer.scroll_offset >= geo.max_offset
+                                && layer.scroll_velocity < 0.0))
+                    {
+                        layer.scroll_velocity = 0.0;
+                        layer.scroll_snap = None;
+                    }
+                    layer.scroll_velocity *= (-anim_dt / layer.fling_tau).exp();
+                    if layer.scroll_velocity.abs() < FLING_STOP_VELOCITY {
+                        // Hand the residual distance over to the snap glide.
+                        layer.scroll_velocity = 0.0;
+                        layer.scroll_snap = Some(layer.snap_target(&geo, layer.scroll_offset));
+                    }
                 }
             } else if let Some(target) = layer.scroll_snap {
                 let delta = target - layer.scroll_offset;
@@ -1944,14 +2142,44 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 } else {
                     (0.0, 0.0)
                 };
-                let clips = layers[active_layer].draw(
-                    &cfg,
-                    width as i32,
-                    height as i32,
-                    &surface,
-                    shift,
-                    needs_complete_redraw,
-                );
+                let clips = if layer_shift != 0.0 {
+                    // Mid layer-swipe: composite both layers sliding along
+                    // the bar, the incoming one a full bar-width away.
+                    let w = width as f64;
+                    let incoming_off = layer_shift - w.copysign(layer_shift);
+                    let clips = layers[active_layer].draw(
+                        &cfg,
+                        width as i32,
+                        height as i32,
+                        &surface,
+                        shift,
+                        true,
+                        layer_shift,
+                        true,
+                    );
+                    layers[1 - active_layer].draw(
+                        &cfg,
+                        width as i32,
+                        height as i32,
+                        &surface,
+                        shift,
+                        true,
+                        incoming_off,
+                        false,
+                    );
+                    clips
+                } else {
+                    layers[active_layer].draw(
+                        &cfg,
+                        width as i32,
+                        height as i32,
+                        &surface,
+                        shift,
+                        needs_complete_redraw,
+                        0.0,
+                        true,
+                    )
+                };
                 let draw_done = Instant::now();
                 // A changed button that is scrolled out of view produces no dirty
                 // rects; flushing zero clips is EINVAL (this crashed the daemon),
@@ -2079,6 +2307,24 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                         TouchEvent::Down(dn) => {
                             let x = dn.x_transformed(width as u32);
                             let y = dn.y_transformed(height as u32);
+                            if touch_log {
+                                println!("touch: down slot={} x={x:.1} y={y:.1}", dn.seat_slot());
+                            }
+                            // Touching a bar that is mid layer-slide catches
+                            // the slide and takes it over as a new swipe; no
+                            // button on a half-shown layer should press.
+                            if layer_shift != 0.0 || layer_slide_target.is_some() {
+                                layer_slide_target = None;
+                                touches.insert(
+                                    dn.seat_slot(),
+                                    TouchState::LayerSwipe {
+                                        last_x: x,
+                                        last_t_us: dn.time_usec(),
+                                        velocity: 0.0,
+                                    },
+                                );
+                                continue;
+                            }
                             let layer = &mut layers[active_layer];
                             // Touching the band catches it: any fling stops, and
                             // a catch-tap should not also press a button. A
@@ -2088,10 +2334,14 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                             layer.scroll_snap = None;
                             let geo = layer.scroll_geometry(width as f64, &cfg.style);
                             match layer.hit(&cfg.style, width, height, x, y, None) {
-                                // Band buttons wait out the tap/hold/scroll
-                                // ambiguity before pressing anything, but light
-                                // up right away.
-                                Some(btn) if geo.is_some() && btn >= layer.pinned_count => {
+                                // Band buttons (and, with layer swipe on, any
+                                // unpinned button) wait out the tap/hold/scroll/
+                                // swipe ambiguity before pressing anything, but
+                                // light up right away.
+                                Some(btn)
+                                    if btn >= layer.pinned_count
+                                        && (geo.is_some() || cfg.layer_swipe) =>
+                                {
                                     if !was_flinging {
                                         layer.buttons[btn].1.set_visual_active(true);
                                     }
@@ -2106,8 +2356,8 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                         },
                                     );
                                 }
-                                // Pinned buttons (Esc) and non-scrollable layers
-                                // keep the immediate press-on-touch behavior.
+                                // Pinned buttons (Esc) keep the immediate
+                                // press-on-touch behavior.
                                 Some(btn) => {
                                     layer.buttons[btn].1.set_active(uinput, true);
                                     touches.insert(
@@ -2119,9 +2369,10 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                     );
                                 }
                                 // A miss inside the band region can still start
-                                // a scroll drag.
+                                // a scroll drag; with layer swipe on, a miss
+                                // anywhere can start a swipe.
                                 None => {
-                                    if geo.is_some_and(|g| x >= g.region_left) {
+                                    if geo.is_some_and(|g| x >= g.region_left) || cfg.layer_swipe {
                                         touches.insert(
                                             dn.seat_slot(),
                                             TouchState::Pending {
@@ -2139,9 +2390,34 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                         TouchEvent::Motion(mtn) => {
                             let x = mtn.x_transformed(width as u32);
                             let y = mtn.y_transformed(height as u32);
+                            // Two-finger detection, computed before borrowing
+                            // this touch's state: a horizontal drag with a
+                            // second (non-held) finger down is a layer swipe,
+                            // and only one finger drives the slide at a time.
+                            let multi = touches
+                                .values()
+                                .filter(|t| !matches!(t, TouchState::Held { .. }))
+                                .count()
+                                >= 2;
+                            let has_swipe = touches
+                                .values()
+                                .any(|t| matches!(t, TouchState::LayerSwipe { .. }));
+                            // A band scroll already in progress owns the
+                            // gesture: a finger added mid-scroll must not
+                            // start a layer swipe on top of it.
+                            let has_scroll = touches
+                                .values()
+                                .any(|t| matches!(t, TouchState::Scroll { .. }));
                             let Some(state) = touches.get_mut(&mtn.seat_slot()) else {
                                 continue;
                             };
+                            if touch_log {
+                                println!(
+                                    "touch: move slot={} x={x:.1} y={y:.1} state={}",
+                                    mtn.seat_slot(),
+                                    state.name()
+                                );
+                            }
                             match *state {
                                 TouchState::Held { layer, btn } => {
                                     if btn < layers[layer].buttons.len() {
@@ -2158,8 +2434,17 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                     at,
                                     ..
                                 } => {
-                                    *state = if (x - start_x).abs() > SCROLL_SLOP_PX {
-                                        // Became a scroll: the highlighted
+                                    let crossed = (x - start_x).abs() > SCROLL_SLOP_PX;
+                                    // With a second finger down, a horizontal
+                                    // drag swipes layers; alone, it scrolls
+                                    // the band.
+                                    let became_swipe = crossed
+                                        && cfg.layer_swipe
+                                        && multi
+                                        && !has_swipe
+                                        && !has_scroll;
+                                    if crossed {
+                                        // Became a gesture: the highlighted
                                         // candidate button is off the hook.
                                         if let Some(btn) = btn {
                                             if btn < layers[layer].buttons.len() {
@@ -2168,6 +2453,19 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                                     .set_visual_active(false);
                                             }
                                         }
+                                    }
+                                    *state = if became_swipe {
+                                        TouchState::LayerSwipe {
+                                            last_x: x,
+                                            last_t_us: mtn.time_usec(),
+                                            velocity: 0.0,
+                                        }
+                                    } else if crossed
+                                        && !multi
+                                        && layers[layer]
+                                            .scroll_geometry(width as f64, &cfg.style)
+                                            .is_some()
+                                    {
                                         TouchState::Scroll {
                                             layer,
                                             last_x: x,
@@ -2177,7 +2475,12 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                     } else {
                                         TouchState::Pending {
                                             layer,
-                                            btn,
+                                            // A drag that can't scroll or swipe
+                                            // (single finger on a non-scrolling
+                                            // layer, or a second finger next to
+                                            // an active swipe) is a cancelled
+                                            // tap.
+                                            btn: if crossed { None } else { btn },
                                             start_x,
                                             x,
                                             at,
@@ -2202,8 +2505,15 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                         // phantom mega-fling.
                                         let dt = t_us.saturating_sub(last_t_us) as f64 / 1e6;
                                         let l = &mut layers[layer];
-                                        l.scroll_offset =
-                                            l.normalize_offset(&geo, l.scroll_offset - dx);
+                                        l.scroll_offset = if l.rubber_bands() {
+                                            // Track the finger in raw space so
+                                            // pulling past an end meets growing
+                                            // resistance, and dragging back
+                                            // retraces the same stretch.
+                                            geo.rubber_display(geo.rubber_raw(l.scroll_offset) - dx)
+                                        } else {
+                                            l.normalize_offset(&geo, l.scroll_offset - dx)
+                                        };
                                         // Smooth the release velocity over the
                                         // last few motion events, capped so one
                                         // glitchy event can't run away with it.
@@ -2224,20 +2534,52 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                         }
                                     }
                                 }
+                                TouchState::LayerSwipe {
+                                    last_x,
+                                    last_t_us,
+                                    velocity,
+                                } => {
+                                    let t_us = mtn.time_usec();
+                                    let dx = x - last_x;
+                                    let dt = t_us.saturating_sub(last_t_us) as f64 / 1e6;
+                                    let w = width as f64;
+                                    layer_shift = (layer_shift + dx).clamp(-w, w);
+                                    let velocity = if dt > 0.0 {
+                                        (0.6 * (dx / dt) + 0.4 * velocity)
+                                            .clamp(-FLING_MAX_VELOCITY, FLING_MAX_VELOCITY)
+                                    } else {
+                                        velocity
+                                    };
+                                    *state = TouchState::LayerSwipe {
+                                        last_x: x,
+                                        last_t_us: t_us,
+                                        velocity,
+                                    };
+                                    if dx != 0.0 {
+                                        needs_complete_redraw = true;
+                                    }
+                                }
                             }
                         }
                         TouchEvent::Up(up) => {
                             let Some(state) = touches.remove(&up.seat_slot()) else {
                                 continue;
                             };
+                            if touch_log {
+                                println!(
+                                    "touch: up slot={} state={}",
+                                    up.seat_slot(),
+                                    state.name()
+                                );
+                            }
                             match state {
                                 TouchState::Held { layer, btn } => {
                                     if btn < layers[layer].buttons.len() {
                                         layers[layer].buttons[btn].1.set_active(uinput, false);
                                     }
                                 }
-                                // A quick tap on the band: press and release
-                                // (it was already lit up since touch-down).
+                                // A quick tap: press and release (it was
+                                // already lit up since touch-down).
                                 TouchState::Pending {
                                     layer,
                                     btn: Some(btn),
@@ -2272,7 +2614,16 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                         layers[layer].scroll_geometry(width as f64, &cfg.style)
                                     {
                                         let l = &mut layers[layer];
-                                        if velocity.abs() >= FLING_MIN_VELOCITY {
+                                        if l.rubber_bands()
+                                            && (l.scroll_offset < 0.0
+                                                || l.scroll_offset > geo.max_offset)
+                                        {
+                                            // Let go while stretched past an
+                                            // end: discard any fling and spring
+                                            // back to the edge.
+                                            l.scroll_snap =
+                                                Some(l.scroll_offset.clamp(0.0, geo.max_offset));
+                                        } else if velocity.abs() >= FLING_MIN_VELOCITY {
                                             // Align the natural landing point
                                             // with a slot boundary by adjusting
                                             // the friction, not the velocity:
@@ -2303,6 +2654,32 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                         }
                                         fling_tick = Instant::now();
                                     }
+                                }
+                                TouchState::LayerSwipe {
+                                    last_t_us,
+                                    velocity,
+                                    ..
+                                } => {
+                                    let velocity = if up.time_usec().saturating_sub(last_t_us)
+                                        > FLING_STALE_US
+                                    {
+                                        0.0
+                                    } else {
+                                        velocity
+                                    };
+                                    let w = width as f64;
+                                    // A flick commits the swap in its direction;
+                                    // otherwise the slide settles to whichever
+                                    // layer is showing more.
+                                    layer_slide_target =
+                                        Some(if velocity.abs() >= LAYER_SWIPE_MIN_VELOCITY {
+                                            w.copysign(velocity)
+                                        } else if layer_shift.abs() > w / 2.0 {
+                                            w.copysign(layer_shift)
+                                        } else {
+                                            0.0
+                                        });
+                                    fling_tick = Instant::now();
                                 }
                             }
                         }
@@ -2338,7 +2715,16 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        FunctionLayer::with_config(keys, &mut Vec::new(), &mut 0, 48, visible, pinned, looping)
+        FunctionLayer::with_config(
+            keys,
+            &mut Vec::new(),
+            &mut 0,
+            48,
+            visible,
+            pinned,
+            looping,
+            true,
+        )
     }
 
     fn text_layer(n: usize, pinned: usize, visible: usize) -> FunctionLayer {
@@ -2388,7 +2774,16 @@ mod tests {
                 ..Default::default()
             })
             .collect();
-        FunctionLayer::with_config(keys, &mut Vec::new(), &mut 0, 48, visible, pinned, true)
+        FunctionLayer::with_config(
+            keys,
+            &mut Vec::new(),
+            &mut 0,
+            48,
+            visible,
+            pinned,
+            true,
+            true,
+        )
     }
 
     #[test]
@@ -2414,6 +2809,47 @@ mod tests {
         layer.scroll_offset = 0.0;
         assert_eq!(
             layer.hit(&style, W, H, geo.region_left + 5.0, y, None),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn rubber_band_compresses_and_inverts() {
+        let style = Style::default();
+        let layer = text_layer_mode(14, 1, 6, false);
+        let geo = layer.scroll_geometry(W as f64, &style).unwrap();
+        let max = geo.max_offset;
+        // In range both maps are the identity.
+        assert!((geo.rubber_display(0.5 * max) - 0.5 * max).abs() < 1e-9);
+        assert!((geo.rubber_raw(0.5 * max) - 0.5 * max).abs() < 1e-9);
+        // Overshoot compresses monotonically and stays under the cap.
+        let d1 = geo.rubber_display(-100.0);
+        let d2 = geo.rubber_display(-300.0);
+        assert!(d1 < 0.0 && d2 < d1);
+        assert!(-d2 < RUBBER_BAND_RANGE);
+        let d3 = geo.rubber_display(max + 200.0);
+        assert!(d3 > max && d3 - max < RUBBER_BAND_RANGE);
+        // raw -> displayed -> raw round-trips, so drags retrace their stretch.
+        for raw in [-400.0, -10.0, 3.0, max + 50.0] {
+            assert!((geo.rubber_raw(geo.rubber_display(raw)) - raw).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn overscrolled_band_hits_nothing_left_of_first_button() {
+        let style = Style::default();
+        let mut layer = text_layer_mode(14, 1, 6, false);
+        let geo = layer.scroll_geometry(W as f64, &style).unwrap();
+        let y = (H / 2) as f64;
+        // Rubber-banded past the start the band sits shifted right; the
+        // exposed gap at the region's left edge must not read as a button.
+        layer.scroll_offset = -40.0;
+        assert_eq!(
+            layer.hit(&style, W, H, geo.region_left + 5.0, y, None),
+            None
+        );
+        assert_eq!(
+            layer.hit(&style, W, H, geo.region_left + 45.0, y, None),
             Some(1)
         );
     }
