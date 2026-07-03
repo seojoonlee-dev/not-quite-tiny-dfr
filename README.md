@@ -53,6 +53,7 @@ Each entry in `PrimaryLayerKeys`, `MediaLayerKeys`, or `Layers` is a table with:
 | `Time` | string | unset | Make this a clock: a strftime format string, e.g. `"%H:%M"`. |
 | `Locale` | string | unset | Locale used for the `Time` format. |
 | `Battery` | string | unset | Make this a battery indicator; value is the display mode: `"icon"`, `"percentage"`, or `"both"`. |
+| `CpuTemp` | string | unset | Make this a CPU temperature indicator; value is the unit: `"celsius"` or `"fahrenheit"`. |
 | `Action` | string or array | none | Linux key name (`"F1"`, `"VolumeUp"`, `"IllumUp"` = keyboard backlight, …) or internal action `"TouchBarBrightnessUp"`/`"TouchBarBrightnessDown"` (the bar's own brightness, 10 levels, hold to repeat). An array sends a chord. |
 | `Pinned` | bool | `false` | Keep this leading button outside the scrolling band and still during layer swipes. Pinned slots must match across all layers, or the config is rejected. |
 | `Stretch` | int | `1` | How many button slots this button spans. |
@@ -122,13 +123,16 @@ Colors are hex strings: `#rgb`, `#rgba`, `#rrggbb`, or `#rrggbbaa`.
 | `HeightPercent` | number | `90` | Button height as a percentage (0–100) of the bar height. |
 | `BatteryChargingColor` | color | `#00b300` | Battery indicator color while charging. |
 | `BatteryLowColor` | color | `#b30000` | Battery indicator color when low. |
+| `CpuTempCoolColor` | color | `#8ec07c` | CPU temperature text color below 70 °C. |
+| `CpuTempWarmColor` | color | `#fabd2f` | CPU temperature text color from 70 °C. |
+| `CpuTempHotColor` | color | `#fb4934` | CPU temperature text color from 85 °C. |
 
 ## Custom widgets
 
 A widget runs a shell command every `Interval` seconds and shows its output:
 
 ```toml
-{ Command = "sh ~/.config/not-quite-tiny-dfr/cpu_temp.sh", Interval = 2, Stretch = 2 }
+{ Command = "sh ~/.config/not-quite-tiny-dfr/weather.sh", Interval = 300, Stretch = 2 }
 ```
 
 The command's stdout is read as **JSON** if it looks like JSON, otherwise as
@@ -157,19 +161,44 @@ a Python script, a compiled binary.
 Event-driven / streaming widgets (a long-lived process that pushes updates
 instantly, rather than polling) are planned but not yet implemented.
 
-### Bundled widget scripts
+## CPU temperature widget
 
-Scripts shipped with the app are installed to
-`/usr/share/not-quite-tiny-dfr/widgets/`:
+The CPU temperature indicator is built into the daemon:
 
-- **`cpu_temp.sh`** — prints the CPU/SoC temperature as color-coded JSON:
-  green below 70 °C, yellow from 70 °C, red from 85 °C. It reads the
-  `x86_pkg_temp` thermal zone when present (Intel), and falls back to the
-  hottest thermal zone otherwise (e.g. Apple Silicon). Use it with:
+```toml
+{ CpuTemp = "celsius", Stretch = 2 }
+```
 
-  ```toml
-  { Command = "sh /usr/share/not-quite-tiny-dfr/widgets/cpu_temp.sh", Interval = 2, Stretch = 2 }
-  ```
+The value picks the unit: `"celsius"` or `"fahrenheit"`. It reads the
+`x86_pkg_temp` thermal zone when present (Intel), and falls back to the hottest
+zone under `/sys/class/thermal` otherwise (e.g. Apple Silicon). A background
+thread polls sysfs every 2 seconds, and the button redraws only when the
+reading changes.
+
+The label (e.g. `CPU 62°C`) is color-coded by temperature:
+`CpuTempCoolColor` below 70 °C, `CpuTempWarmColor` from 70 °C, and
+`CpuTempHotColor` from 85 °C (see the `[Style]` table). If no thermal zone is
+readable the button shows `CPU n/a`.
+
+## Battery widget
+
+The battery indicator is built into the daemon (no script involved):
+
+```toml
+{ Battery = "both", Stretch = 2 }
+```
+
+The value picks the display mode: `"icon"`, `"percentage"`, or `"both"`. The
+first device of type `Battery` under `/sys/class/power_supply` is used
+automatically; if none exists the button shows `Battery N/A`. A background
+thread polls sysfs once per second, and the button redraws only when the
+reading changes.
+
+The icon steps through the bundled `battery_0_bar` … `battery_full` SVGs
+(charging variants get a bolt overlay). The button fill also signals state —
+`BatteryChargingColor` while charging, `BatteryLowColor` when discharging below
+10% — and is drawn even with `ShowButtonOutlines = false`. Like any button it
+accepts `Theme`, `Stretch`, and even an `Action`.
 
 ## Scrollable layers
 
