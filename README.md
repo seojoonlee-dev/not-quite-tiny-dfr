@@ -24,7 +24,7 @@ misbehaving.
 | `MediaLayerDefault` | bool | `false` | Show the media layer (instead of F-keys) by default. Ignored when `Layers` is set. |
 | `ShowButtonOutlines` | bool | `true` | Draw the filled rounded rectangle behind each button. |
 | `EnablePixelShift` | bool | `false` | Periodically shift the image by a pixel to reduce OLED burn-in. |
-| `FontFamily` | string | `""` | Font family for text labels; `""` uses the system default sans. |
+| `FontFamily` | string | `""` | Font family for text labels; `""` uses the system default sans. Rendering falls back across system fonts per glyph, so symbols/emoji outside the family still show. |
 | `FontBold` | bool | `true` | Render labels in bold. |
 | `AdaptiveBrightness` | bool | `true` | Follow the ambient light sensor for bar brightness. |
 | `ActiveBrightness` | u32 | `128` | Fixed brightness (0–255) when `AdaptiveBrightness = false`. |
@@ -132,7 +132,7 @@ Colors are hex strings: `#rgb`, `#rgba`, `#rrggbb`, or `#rrggbbaa`.
 A widget runs a shell command every `Interval` seconds and shows its output:
 
 ```toml
-{ Command = "sh ~/.config/not-quite-tiny-dfr/weather.sh", Interval = 300, Stretch = 2 }
+{ Command = "sh ~/.config/not-quite-tiny-dfr/my_widget.sh", Interval = 5, Stretch = 2 }
 ```
 
 The command's stdout is read as **JSON** if it looks like JSON, otherwise as
@@ -160,6 +160,28 @@ a Python script, a compiled binary.
 
 Event-driven / streaming widgets (a long-lived process that pushes updates
 instantly, rather than polling) are planned but not yet implemented.
+
+### Bundled widget scripts
+
+Scripts shipped with the app are installed to
+`/usr/share/not-quite-tiny-dfr/widgets/`:
+
+- **`weather.sh`** — shows the current condition and temperature (e.g.
+  `Partly Cloudy 29°C`) from [wttr.in](https://wttr.in). The location is
+  geolocated by IP unless passed as an argument, and flags pick the fields:
+  `-e` renders the condition as an emoji instead of text (e.g. `☀️ 29°C`),
+  `-H` appends humidity, `-w` appends wind:
+
+  ```toml
+  { Command = "sh /usr/share/not-quite-tiny-dfr/widgets/weather.sh -e -H Seoul", Interval = 900, Stretch = 3 }
+  ```
+
+  If the network or wttr.in is unavailable it shows `weather n/a` and retries
+  on the next interval.
+
+  Text is rendered with pango, which falls back across system fonts per
+  glyph — color emoji (and `-w`'s wind arrows) render as long as an emoji
+  font (e.g. `noto-fonts-emoji`) is installed system-wide.
 
 ## CPU temperature widget
 

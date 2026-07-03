@@ -47,7 +47,6 @@ use udev::MonitorBuilder;
 mod backlight;
 mod config;
 mod display;
-mod fonts;
 mod pixel_shift;
 mod style;
 mod user;
@@ -62,6 +61,8 @@ use style::Color;
 use widget::{WidgetRuntime, WidgetSpec};
 
 const DEFAULT_ICON_SIZE: i32 = 48;
+/// Gap in px between the battery icon and its percentage text ("both" mode).
+const BATTERY_ICON_TEXT_GAP: f64 = 8.0;
 
 /// The user's `~/.config/not-quite-tiny-dfr` directory, if a target user was resolved.
 /// Icons named in the config are looked up here first. Set once — either at
@@ -306,6 +307,33 @@ fn set_background_source(c: &Context, style: &style::Style, shift: (f64, f64)) {
     } else {
         style.background.set_source(c);
     }
+}
+
+/// Lay `text` out in the bar font. Pango shapes with per-glyph font fallback
+/// (and color emoji), which the cairo toy API's single font face could not.
+fn text_layout(c: &Context, style: &style::Style, text: &str) -> pango::Layout {
+    let layout = pangocairo::functions::create_layout(c);
+    layout.set_font_description(Some(&style.font));
+    layout.set_text(text);
+    layout
+}
+
+/// Draw `layout` horizontally centered in the button and vertically centered
+/// in the bar, with the cairo source as the text color.
+fn show_layout_centered(
+    c: &Context,
+    layout: &pango::Layout,
+    height: i32,
+    button_left_edge: f64,
+    button_width: u64,
+    y_shift: f64,
+) {
+    let (tw, th) = layout.pixel_size();
+    c.move_to(
+        button_left_edge + (button_width as f64 / 2.0 - tw as f64 / 2.0).round(),
+        y_shift + ((height as f64 - th as f64) / 2.0).round(),
+    );
+    pangocairo::functions::show_layout(c, layout);
 }
 
 fn try_load_svg(path: &str) -> Result<ButtonImage> {
@@ -732,6 +760,7 @@ impl Button {
     fn render(
         &self,
         c: &Context,
+        style: &style::Style,
         height: i32,
         button_left_edge: f64,
         button_width: u64,
@@ -739,12 +768,8 @@ impl Button {
     ) {
         match &self.image {
             ButtonImage::Text(text) => {
-                let extents = c.text_extents(text).unwrap();
-                c.move_to(
-                    button_left_edge + (button_width as f64 / 2.0 - extents.width() / 2.0).round(),
-                    y_shift + (height as f64 / 2.0 + extents.height() / 2.0).round(),
-                );
-                c.show_text(text).unwrap();
+                let layout = text_layout(c, style, text);
+                show_layout_centered(c, &layout, height, button_left_edge, button_width, y_shift);
             }
             ButtonImage::Svg(svg) => {
                 let x =
@@ -767,13 +792,8 @@ impl Button {
                 let formatted_time = current_time
                     .format_localized_with_items(format.iter(), *locale)
                     .to_string();
-                let time_extents = c.text_extents(&formatted_time).unwrap();
-                c.move_to(
-                    button_left_edge
-                        + (button_width as f64 / 2.0 - time_extents.width() / 2.0).round(),
-                    y_shift + (height as f64 / 2.0 + time_extents.height() / 2.0).round(),
-                );
-                c.show_text(&formatted_time).unwrap();
+                let layout = text_layout(c, style, &formatted_time);
+                show_layout_centered(c, &layout, height, button_left_edge, button_width, y_shift);
             }
             ButtonImage::Battery(battery_mode, icons) => {
                 let (capacity, state) = *BATTERY_STATE.lock().unwrap();
@@ -805,16 +825,18 @@ impl Button {
                     None
                 };
                 let percent_str = format!("{:.0}%", capacity);
-                let extents = c.text_extents(&percent_str).unwrap();
-                let mut width = extents.width();
-                let mut text_offset = 0;
+                let layout = text_layout(c, style, &percent_str);
+                let (text_width, text_height) = layout.pixel_size();
+                let mut width = text_width as f64;
+                let mut text_offset = 0.0;
                 if let Some(svg) = icon {
                     if !battery_mode.should_draw_text() {
                         width = DEFAULT_ICON_SIZE as f64;
                     } else {
-                        width += DEFAULT_ICON_SIZE as f64;
+                        width += DEFAULT_ICON_SIZE as f64 + BATTERY_ICON_TEXT_GAP;
+                        text_offset = BATTERY_ICON_TEXT_GAP;
                     }
-                    text_offset = DEFAULT_ICON_SIZE;
+                    text_offset += DEFAULT_ICON_SIZE as f64;
                     let x = button_left_edge + (button_width as f64 / 2.0 - width / 2.0).round();
                     let y = y_shift + ((height as f64 - DEFAULT_ICON_SIZE as f64) / 2.0).round();
 
@@ -827,29 +849,19 @@ impl Button {
                 if battery_mode.should_draw_text() {
                     c.move_to(
                         button_left_edge
-                            + (button_width as f64 / 2.0 - width / 2.0 + text_offset as f64)
-                                .round(),
-                        y_shift + (height as f64 / 2.0 + extents.height() / 2.0).round(),
+                            + (button_width as f64 / 2.0 - width / 2.0 + text_offset).round(),
+                        y_shift + ((height as f64 - text_height as f64) / 2.0).round(),
                     );
-                    c.show_text(&percent_str).unwrap();
+                    pangocairo::functions::show_layout(c, &layout);
                 }
             }
             ButtonImage::CpuTemp(unit) => {
-                let text = cpu_temp_text(*unit);
-                let extents = c.text_extents(&text).unwrap();
-                c.move_to(
-                    button_left_edge + (button_width as f64 / 2.0 - extents.width() / 2.0).round(),
-                    y_shift + (height as f64 / 2.0 + extents.height() / 2.0).round(),
-                );
-                c.show_text(&text).unwrap();
+                let layout = text_layout(c, style, &cpu_temp_text(*unit));
+                show_layout_centered(c, &layout, height, button_left_edge, button_width, y_shift);
             }
             ButtonImage::Command { text, .. } => {
-                let extents = c.text_extents(text).unwrap();
-                c.move_to(
-                    button_left_edge + (button_width as f64 / 2.0 - extents.width() / 2.0).round(),
-                    y_shift + (height as f64 / 2.0 + extents.height() / 2.0).round(),
-                );
-                c.show_text(text).unwrap();
+                let layout = text_layout(c, style, text);
+                show_layout_centered(c, &layout, height, button_left_edge, button_width, y_shift);
             }
             ButtonImage::Spacer => (),
         }
@@ -994,7 +1006,7 @@ fn paint_button(
         c.fill().unwrap();
     }
     button.effective_text_color(style).set_source(c);
-    button.render(c, height, left_edge, button_width.ceil() as u64, y_shift);
+    button.render(c, style, height, left_edge, button_width.ceil() as u64, y_shift);
 }
 
 #[derive(Default)]
@@ -1418,8 +1430,6 @@ impl FunctionLayer {
         // arcs overlap into a degenerate shape that stops responding to changes.
         let radius = style.corner_radius.clamp(0.0, (top - bot) / 2.0);
         let (pixel_shift_x, pixel_shift_y) = pixel_shift;
-        c.set_font_face(&config.font_face);
-        c.set_font_size(style.font_size);
 
         if let Some(geo) = self.scroll_geometry(effective_width, style) {
             // Band movement (scroll/fling/snap) arrives as complete_redraw --

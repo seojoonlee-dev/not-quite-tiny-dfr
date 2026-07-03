@@ -1,9 +1,7 @@
-use crate::fonts::{FontConfig, Pattern};
-use crate::style::{Color, Style, StyleProxy};
+use crate::style::{build_font, Color, Style, StyleProxy};
 use crate::widget::WidgetSpec;
 use crate::FunctionLayer;
-use cairo::{Context, FontFace, Format, ImageSurface};
-use freetype::Library as FtLibrary;
+use cairo::{Context, Format, ImageSurface};
 use input_linux::Key;
 use nix::{
     errno::Errno,
@@ -27,7 +25,6 @@ const BASE_CFG_PATH: &str = "/usr/share/not-quite-tiny-dfr/config.toml";
 pub struct Config {
     pub show_button_outlines: bool,
     pub enable_pixel_shift: bool,
-    pub font_face: FontFace,
     pub adaptive_brightness: bool,
     pub active_brightness: u32,
     pub double_press_switch_layers: u32,
@@ -240,33 +237,6 @@ pub struct ButtonConfig {
     // Text/Icon/etc. when set.
     pub command: Option<String>,
     pub interval: Option<f64>,
-}
-
-fn load_font(name: &str) -> FontFace {
-    let fontconfig = FontConfig::new();
-    let mut pattern = Pattern::new(name);
-    fontconfig.perform_substitutions(&mut pattern);
-    let pat_match = match fontconfig.match_pattern(&pattern) {
-        Ok(pat) => pat,
-        Err(_) => panic!("Unable to find specified font. If you are using the default config, make sure you have at least one font installed")
-    };
-    let file_name = pat_match.get_file_name();
-    let file_idx = pat_match.get_font_index();
-    let ft_library = FtLibrary::init().unwrap();
-    let face = ft_library.new_face(file_name, file_idx).unwrap();
-    FontFace::create_from_ft(&face).unwrap()
-}
-
-/// Build the fontconfig pattern for text labels, CSS-style: `FontFamily` picks
-/// the family ("" = the system default sans), `FontBold` the weight. Bold is
-/// the default, matching the bar's original look.
-fn resolve_font_pattern(family: Option<&str>, bold: Option<bool>) -> String {
-    let family = family.map(str::trim).unwrap_or("");
-    if bold.unwrap_or(DEFAULT_FONT_BOLD) {
-        format!("{family}:bold")
-    } else {
-        family.to_string()
-    }
 }
 
 /// The stock Esc + F1-F12 primary layer, used when the config sets no
@@ -506,6 +476,11 @@ fn load_config(
 
     let style_proxy = base.style.take().unwrap_or_default();
     let mut style = style_proxy.resolve();
+    style.font = build_font(
+        base.font_family.as_deref(),
+        base.font_bold.unwrap_or(DEFAULT_FONT_BOLD),
+        style.font_size,
+    );
     // Load the background image once here (we know the bar size), if it wins.
     if let Some(path) = style_proxy.image_path() {
         match load_background_image(path, width as i32, height as i32) {
@@ -605,10 +580,6 @@ fn load_config(
         adaptive_brightness: base
             .adaptive_brightness
             .unwrap_or(DEFAULT_ADAPTIVE_BRIGHTNESS),
-        font_face: load_font(&resolve_font_pattern(
-            base.font_family.as_deref(),
-            base.font_bold,
-        )),
         active_brightness: base.active_brightness.unwrap_or(DEFAULT_ACTIVE_BRIGHTNESS),
         double_press_switch_layers: base
             .double_press_switch_layers

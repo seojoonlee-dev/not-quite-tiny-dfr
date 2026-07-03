@@ -10,8 +10,10 @@ repository = "https://github.com/seojoonlee-dev/not-quite-tiny-dfr.git"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-cairo-rs = { version = "0.22", default-features = false, features = ["freetype", "png"] }
+cairo-rs = { version = "0.22", default-features = false, features = ["png"] }
 librsvg-rebind = "0.3"
+pango = "0.22"
+pangocairo = "0.22"
 drm = "0.14"
 anyhow = "1"
 input = "0.9"
@@ -24,10 +26,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 rand = "0.8"
-freetype-rs = "0.38"
 freedesktop-icons = "0.4.0"
 chrono = { version = "0.4", features = ["unstable-locales"] }
 udev = "0.9"
-
-[build-dependencies]
-pkg-config = "0.3"

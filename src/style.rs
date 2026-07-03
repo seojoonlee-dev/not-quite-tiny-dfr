@@ -81,6 +81,26 @@ impl<'de> Deserialize<'de> for Color {
     }
 }
 
+/// Build the pango font description for text labels, CSS-style: `family` picks
+/// the font family (`None` = the system default sans), `bold` the weight, and
+/// `size_px` is the `FontSize` in device pixels.
+pub fn build_font(family: Option<&str>, bold: bool, size_px: f64) -> pango::FontDescription {
+    let mut font = pango::FontDescription::new();
+    font.set_family(
+        family
+            .map(str::trim)
+            .filter(|f| !f.is_empty())
+            .unwrap_or("sans"),
+    );
+    font.set_weight(if bold {
+        pango::Weight::Bold
+    } else {
+        pango::Weight::Normal
+    });
+    font.set_absolute_size(size_px * pango::SCALE as f64);
+    font
+}
+
 /// Whether the resolved background should be a solid color or an image. Records
 /// which of `Background` / `BackgroundImage` was declared later so that one wins.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +112,11 @@ pub enum BackgroundSource {
 /// Fully-resolved visual style used by the renderer.
 #[derive(Clone)]
 pub struct Style {
+    /// The pango font all text is laid out with (family, weight, and
+    /// `FontSize` as absolute size). Pango falls back across system fonts per
+    /// glyph, so emoji and other symbols render even when the configured
+    /// family lacks them.
+    pub font: pango::FontDescription,
     pub background: Color,
     /// Pre-cropped, bar-sized background image; painted instead of `background`
     /// when present. Loaded by the config loader, which knows the bar size.
@@ -124,6 +149,7 @@ impl Default for Style {
     fn default() -> Style {
         // Defaults reproduce the original hardcoded look.
         Style {
+            font: build_font(None, true, 32.0),
             background: Color::rgb(0.0, 0.0, 0.0),
             background_image: None,
             button_color: Color::rgb(0.2, 0.2, 0.2),
@@ -260,6 +286,9 @@ impl StyleProxy {
     pub fn resolve(&self) -> Style {
         let d = Style::default();
         Style {
+            // Placeholder at the right size; the config loader rebuilds it
+            // with the configured FontFamily/FontBold.
+            font: build_font(None, true, self.font_size.unwrap_or(d.font_size)),
             background: self.background.unwrap_or(d.background),
             background_image: None,
             button_color: self.button_color.unwrap_or(d.button_color),
