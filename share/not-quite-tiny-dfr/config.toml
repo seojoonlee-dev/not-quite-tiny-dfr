@@ -66,7 +66,7 @@
 # Layers = [
 #     [ { Text = "esc", Action = "Esc", Pinned = true }, { Text = "F1", Action = "F1" }, { Text = "F2", Action = "F2" } ],
 #     [ { Text = "esc", Action = "Esc", Pinned = true }, { Icon = "play_pause", Action = "PlayPause" } ],
-#     [ { Text = "esc", Action = "Esc", Pinned = true }, { Time = "%H:%M" } ],
+#     [ { Text = "esc", Action = "Esc", Pinned = true }, { Time = "%H:%M" }, { CpuTemp = "celsius", Stretch = 2 } ],
 # ]
 
 # [Style]
@@ -83,3 +83,6 @@
 # HeightPercent = 90
 # BatteryChargingColor = "#00b300"
 # BatteryLowColor = "#b30000"
+# CpuTempCoolColor = "#8ec07c"
+# CpuTempWarmColor = "#fabd2f"
+# CpuTempHotColor = "#fb4934"

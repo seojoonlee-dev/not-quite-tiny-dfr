@@ -91,6 +91,11 @@ const FLING_MAX_VELOCITY: f64 = 8000.0;
 const FLING_STALE_US: u64 = 80_000;
 /// How often the battery poller thread re-reads sysfs.
 const BATTERY_POLL: Duration = Duration::from_secs(1);
+/// How often the CPU temperature poller thread re-reads sysfs.
+const CPU_TEMP_POLL: Duration = Duration::from_secs(2);
+/// CpuTemp widget color thresholds, in °C.
+const CPU_TEMP_WARM_C: i32 = 70;
+const CPU_TEMP_HOT_C: i32 = 85;
 /// A fling decelerating below this (px/s) stops.
 const FLING_STOP_VELOCITY: f64 = 40.0;
 /// Exponential-decay time constant of fling friction, in seconds.
@@ -202,6 +207,17 @@ enum BatteryState {
 /// -- that was a visible frame hitch on every battery refresh.
 static BATTERY_STATE: Mutex<(u32, BatteryState)> = Mutex::new((100, BatteryState::NotCharging));
 
+/// Latest CPU temperature in whole °C, updated by a poller thread (same
+/// never-read-sysfs-on-the-render-path rule as BATTERY_STATE). `None` means no
+/// readable thermal zone.
+static CPU_TEMP_STATE: Mutex<Option<i32>> = Mutex::new(None);
+
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum CpuTempUnit {
+    Celsius,
+    Fahrenheit,
+}
+
 struct BatteryImages {
     plain: Vec<Handle>,
     charging: Vec<Handle>,
@@ -230,6 +246,7 @@ enum ButtonImage {
     Bitmap(ImageSurface),
     Time(Vec<ChronoItem<'static>>, Locale),
     Battery(BatteryIconMode, BatteryImages),
+    CpuTemp(CpuTempUnit),
     /// A command widget: `text`/`color` are updated from its script's output.
     Command {
         id: usize,
@@ -445,6 +462,46 @@ fn get_battery_state(battery: &str) -> (u32, BatteryState) {
     (capacity, status)
 }
 
+/// The `temp` file of the x86 package-temperature thermal zone, when one
+/// exists. Its absence selects the hottest-zone fallback in `read_cpu_temp`.
+fn find_cpu_temp_zone() -> Option<PathBuf> {
+    for entry in fs::read_dir("/sys/class/thermal").ok()?.flatten() {
+        let path = entry.path();
+        if fs::read_to_string(path.join("type")).is_ok_and(|t| t.trim() == "x86_pkg_temp") {
+            return Some(path.join("temp"));
+        }
+    }
+    None
+}
+
+/// Read the CPU/SoC temperature in whole °C: the x86 package sensor when
+/// present (`zone`), otherwise the hottest thermal zone (e.g. Apple Silicon).
+fn read_cpu_temp(zone: Option<&Path>) -> Option<i32> {
+    fn read_millideg(path: &Path) -> Option<i64> {
+        fs::read_to_string(path).ok()?.trim().parse().ok()
+    }
+    let millideg = match zone {
+        Some(path) => read_millideg(path),
+        None => fs::read_dir("/sys/class/thermal")
+            .ok()?
+            .flatten()
+            .filter_map(|e| read_millideg(&e.path().join("temp")))
+            .max(),
+    }?;
+    Some((millideg / 1000) as i32)
+}
+
+/// The CpuTemp widget's label for the current cached reading.
+fn cpu_temp_text(unit: CpuTempUnit) -> String {
+    match *CPU_TEMP_STATE.lock().unwrap() {
+        Some(c) => match unit {
+            CpuTempUnit::Celsius => format!("CPU {c}\u{00b0}C"),
+            CpuTempUnit::Fahrenheit => format!("CPU {}\u{00b0}F", c * 9 / 5 + 32),
+        },
+        None => "CPU n/a".to_string(),
+    }
+}
+
 impl Button {
     fn with_config(cfg: ButtonConfig, default_icon_size: i32) -> Button {
         let (bg_color, bg_color_active, text_color) = (cfg.color, cfg.color_active, cfg.text_color);
@@ -466,6 +523,8 @@ impl Button {
             } else {
                 Button::new_text("Battery N/A".to_string(), cfg.action)
             }
+        } else if let Some(unit) = cfg.cpu_temp {
+            Button::new_cpu_temp(cfg.action, &unit)
         } else {
             Button::new_spacer()
         };
@@ -595,6 +654,30 @@ impl Button {
                     charging,
                 },
             ),
+            icon_width: 0.0,
+            icon_height: 0.0,
+            bg_color: None,
+            bg_color_active: None,
+            text_color: None,
+        }
+    }
+
+    fn new_cpu_temp(action: Vec<ButtonAction>, unit: &str) -> Button {
+        // An unknown unit is only worth a journal line, not a daemon abort:
+        // this also runs on live config reloads.
+        let unit = match unit {
+            "celsius" => CpuTempUnit::Celsius,
+            "fahrenheit" => CpuTempUnit::Fahrenheit,
+            other => {
+                eprintln!("not-quite-tiny-dfr: unknown CpuTemp unit {other:?}, using \"celsius\"");
+                CpuTempUnit::Celsius
+            }
+        };
+        Button {
+            action,
+            active: false,
+            changed: false,
+            image: ButtonImage::CpuTemp(unit),
             icon_width: 0.0,
             icon_height: 0.0,
             bg_color: None,
@@ -751,6 +834,15 @@ impl Button {
                     c.show_text(&percent_str).unwrap();
                 }
             }
+            ButtonImage::CpuTemp(unit) => {
+                let text = cpu_temp_text(*unit);
+                let extents = c.text_extents(&text).unwrap();
+                c.move_to(
+                    button_left_edge + (button_width as f64 / 2.0 - extents.width() / 2.0).round(),
+                    y_shift + (height as f64 / 2.0 + extents.height() / 2.0).round(),
+                );
+                c.show_text(&text).unwrap();
+            }
             ButtonImage::Command { text, .. } => {
                 let extents = c.text_extents(text).unwrap();
                 c.move_to(
@@ -763,13 +855,25 @@ impl Button {
         }
     }
     /// The color to draw this button's text in, letting a command widget's own
-    /// JSON `color` override the configured/default text color.
+    /// JSON `color` -- or a CpuTemp widget's cool/warm/hot coding -- override
+    /// the configured/default text color.
     fn effective_text_color(&self, style: &style::Style) -> Color {
         if let ButtonImage::Command {
             color: Some(color), ..
         } = &self.image
         {
             return *color;
+        }
+        if let ButtonImage::CpuTemp(_) = &self.image {
+            match *CPU_TEMP_STATE.lock().unwrap() {
+                Some(c) if c >= CPU_TEMP_HOT_C => return style.cpu_temp_hot_color,
+                Some(c) if c >= CPU_TEMP_WARM_C => return style.cpu_temp_warm_color,
+                Some(_) => {
+                    return self.text_color.unwrap_or(style.cpu_temp_cool_color);
+                }
+                // No sensor: "CPU n/a" in the ordinary text color.
+                None => {}
+            }
         }
         self.text_color.unwrap_or(style.text_color)
     }
@@ -897,6 +1001,7 @@ fn paint_button(
 pub struct FunctionLayer {
     displays_time: bool,
     displays_battery: bool,
+    displays_cpu_temp: bool,
     buttons: Vec<(usize, Button)>,
     virtual_button_count: usize,
     faster_refresh: bool,
@@ -1201,6 +1306,7 @@ impl FunctionLayer {
         let mut virtual_button_count = 0;
         let displays_time = cfg.iter().any(|cfg| cfg.time.is_some());
         let displays_battery = cfg.iter().any(|cfg| cfg.battery.is_some());
+        let displays_cpu_temp = cfg.iter().any(|cfg| cfg.cpu_temp.is_some());
         let buttons = cfg
             .into_iter()
             .scan(&mut virtual_button_count, |state, mut cfg| {
@@ -1237,6 +1343,7 @@ impl FunctionLayer {
         FunctionLayer {
             displays_time,
             displays_battery,
+            displays_cpu_temp,
             buttons,
             virtual_button_count,
             faster_refresh,
@@ -1934,6 +2041,8 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
     // The battery reading whose rendering is currently on screen; battery
     // buttons only redraw when the poller's cache moves away from this.
     let mut last_battery_drawn = *BATTERY_STATE.lock().unwrap();
+    // Same, for CpuTemp buttons.
+    let mut last_cpu_temp_drawn = *CPU_TEMP_STATE.lock().unwrap();
 
     // If we already know the user, drop to them now. Otherwise stay root and
     // defer the drop until someone logs in (handled at the top of the loop).
@@ -1972,6 +2081,31 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
             }
             thread::sleep(BATTERY_POLL);
         });
+    }
+    // CPU temperature polling mirrors the battery poller: reading thermal
+    // sysfs can be slow on T2 (SMC-backed), so it stays off the render path.
+    {
+        let cpu_zone = find_cpu_temp_zone();
+        if let Some(seed) = read_cpu_temp(cpu_zone.as_deref()) {
+            *CPU_TEMP_STATE.lock().unwrap() = Some(seed);
+            let wake = wake_write.clone();
+            thread::spawn(move || loop {
+                let reading = read_cpu_temp(cpu_zone.as_deref());
+                let changed = {
+                    let mut shared = CPU_TEMP_STATE.lock().unwrap();
+                    let changed = *shared != reading;
+                    *shared = reading;
+                    changed
+                };
+                if changed {
+                    let byte = [1u8];
+                    unsafe {
+                        libc::write(wake.as_raw_fd(), byte.as_ptr() as *const libc::c_void, 1);
+                    }
+                }
+                thread::sleep(CPU_TEMP_POLL);
+            });
+        }
     }
     let mut widget_rt = WidgetRuntime::new(
         if privileges_dropped {
@@ -2318,6 +2452,17 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 last_battery_drawn = reading;
                 for button in &mut layers[active_layer].buttons {
                     if let ButtonImage::Battery(_, _) = button.1.image {
+                        button.1.changed = true;
+                    }
+                }
+            }
+        }
+        if layers[active_layer].displays_cpu_temp {
+            let reading = *CPU_TEMP_STATE.lock().unwrap();
+            if reading != last_cpu_temp_drawn {
+                last_cpu_temp_drawn = reading;
+                for button in &mut layers[active_layer].buttons {
+                    if let ButtonImage::CpuTemp(_) = button.1.image {
                         button.1.changed = true;
                     }
                 }

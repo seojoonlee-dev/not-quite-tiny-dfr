@@ -218,6 +218,9 @@ pub struct ButtonConfig {
     pub theme: Option<String>,
     pub time: Option<String>,
     pub battery: Option<String>,
+    // Built-in CPU temperature widget; the value is the unit ("celsius" or
+    // "fahrenheit").
+    pub cpu_temp: Option<String>,
     pub locale: Option<String>,
     #[serde(deserialize_with = "array_or_single", default)]
     pub action: Vec<ButtonAction>,
@@ -340,6 +343,7 @@ fn esc_button() -> ButtonConfig {
         time: None,
         locale: None,
         battery: None,
+        cpu_temp: None,
         icon_width: None,
         icon_height: None,
         color: None,
@@ -376,6 +380,7 @@ fn error_layer(message: &str) -> FunctionLayer {
             time: None,
             locale: None,
             battery: None,
+            cpu_temp: None,
             icon_width: None,
             icon_height: None,
             color: None,
@@ -861,6 +866,13 @@ mod tests {
         let over: ConfigProxy = toml::from_str("LayerSwipe = false\n").unwrap();
         base.merge(over);
         assert_eq!(base.layer_swipe, Some(false));
+    }
+
+    #[test]
+    fn cpu_temp_button_parses() {
+        let cfg: ButtonConfig = toml::from_str("CpuTemp = \"celsius\"\nStretch = 2\n").unwrap();
+        assert_eq!(cfg.cpu_temp.as_deref(), Some("celsius"));
+        assert_eq!(cfg.stretch, Some(2));
     }
 
     #[test]
