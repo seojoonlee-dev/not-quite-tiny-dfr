@@ -105,6 +105,17 @@ const FRAME_PERIOD: Duration = Duration::from_micros(16_667);
 /// latency, so a wake landing just short of the boundary draws now instead of
 /// slipping a whole extra millisecond.
 const FRAME_SLACK: Duration = Duration::from_micros(500);
+/// A flush this slow is not congestion, it is appletbdrm waiting out (part
+/// of) its 1 s response timeout: the T2's display stream is desyncing. A
+/// healthy frame is single-digit ms of draw and tens of ms of flush.
+const FLUSH_STALL_MIN: Duration = Duration::from_millis(200);
+/// Cool-down after a stalled flush, doubling per consecutive stall (capped
+/// via FLUSH_STALL_MAX_DOUBLINGS). Feeding more frames into a desyncing
+/// stream is what escalates a glitchy panel into a permanently wedged one,
+/// so the daemon goes quiet and only probes occasionally.
+const FLUSH_COOLDOWN_BASE: Duration = Duration::from_secs(2);
+/// Cap on the cool-down doubling (2 s * 2^4 = 32 s between probes at worst).
+const FLUSH_STALL_MAX_DOUBLINGS: u32 = 4;
 /// Time constant of the post-scroll snap glide (to the nearest slot boundary).
 const SNAP_TAU: f64 = 0.08;
 /// The snap glide is finished once within this many px of its target.
@@ -120,6 +131,12 @@ const RUBBER_SPRING_TAU: f64 = 0.08;
 /// Cap on the momentum handed to that spring when a fling crosses an end,
 /// keeping the bounce peak (~130 px) under the drag stretch cap.
 const RUBBER_MAX_BOUNCE_VELOCITY: f64 = 3000.0;
+/// Hard cap on the animation timestep, in seconds. The step is real elapsed
+/// time between loop iterations, and an iteration can stall well past a
+/// second (USB flush backlog, scheduling); integrating a gap like that in
+/// one go teleports flings across the band. Capped, a stall just plays the
+/// animation out slower.
+const MAX_ANIM_DT: f64 = 0.05;
 /// Minimum release velocity (px/s) for a two-finger layer swipe to commit
 /// the switch regardless of how far it has slid. Layer swiping is a
 /// two-finger HORIZONTAL fling: the digitizer never reports Y movement
@@ -237,7 +254,7 @@ struct Button {
 
 /// Copy the latest widget outputs into their buttons, marking changed ones for
 /// redraw. Cheap enough to call every loop iteration (the results map is small).
-fn apply_widget_results(layers: &mut [FunctionLayer; 2], rt: &WidgetRuntime) {
+fn apply_widget_results(layers: &mut [FunctionLayer], rt: &WidgetRuntime) {
     let map = rt.results();
     for layer in layers.iter_mut() {
         for (_, button) in layer.buttons.iter_mut() {
@@ -883,10 +900,14 @@ pub struct FunctionLayer {
     buttons: Vec<(usize, Button)>,
     virtual_button_count: usize,
     faster_refresh: bool,
-    /// Leading buttons pinned in place (the auto Esc); they never scroll.
+    /// Leading buttons declared `Pinned` in the config (the Esc), when
+    /// PinnedIgnoreScroll applies them; they never scroll with the band.
     pinned_count: usize,
     /// Virtual slots occupied by the pinned buttons.
     pinned_slots: usize,
+    /// Whether the pinned buttons also hold still during a layer swipe
+    /// (PinnedIgnoreLayerSwipe).
+    pin_swipe: bool,
     /// How many slots the scrolling region shows at once; 0 disables scrolling.
     visible_slots: usize,
     /// Whether the band wraps around like a loop, or stops at its ends.
@@ -905,6 +926,57 @@ pub struct FunctionLayer {
     /// or shrunk at release so the natural landing point is slot-aligned while
     /// the release velocity stays continuous (a velocity jump reads as a hitch).
     fling_tau: f64,
+}
+
+/// For a layer slide in the given direction on `layers[active]`: which
+/// neighbor slides in, how far the slide travels, and whether the pinned
+/// prefix holds still. The prefix can only hold still when BOTH sides of the
+/// transition pin the same slots -- with one side unpinned there is nothing
+/// coherent to hold, so the whole bar slides and a layer whose Esc is pinned
+/// simply carries it along for that transition.
+fn slide_params(
+    layers: &[FunctionLayer],
+    active: usize,
+    dir_positive: bool,
+    width: f64,
+    style: &style::Style,
+) -> (usize, f64, bool) {
+    let n = layers.len();
+    let incoming = if dir_positive {
+        (active + n - 1) % n
+    } else {
+        (active + 1) % n
+    };
+    let a = &layers[active];
+    let stay = a.swipe_pinned_slots() > 0
+        && a.swipe_pinned_slots() == layers[incoming].swipe_pinned_slots();
+    let travel = if stay {
+        a.slide_travel(width, style)
+    } else {
+        width
+    };
+    (incoming, travel, stay)
+}
+
+/// A layer-swap rotation renumbers `layers`; touch states hold layer
+/// indices, so they must rotate the same way or a finger keeps acting on
+/// whichever layer slid into its old index (e.g. releasing its held key on
+/// the wrong layer's button, or scrolling the wrong band).
+fn rotate_touch_layers<K>(touches: &mut HashMap<K, TouchState>, n: usize, left: bool) {
+    for state in touches.values_mut() {
+        match state {
+            TouchState::Held { layer, .. }
+            | TouchState::Pending { layer, .. }
+            | TouchState::Scroll { layer, .. } => {
+                *layer = if left {
+                    (*layer + n - 1) % n
+                } else {
+                    (*layer + 1) % n
+                };
+            }
+            TouchState::LayerSwipe { .. } => {}
+        }
+    }
 }
 
 /// Layout of a scrollable layer: a pinned region on the left (Esc) and a
@@ -966,6 +1038,45 @@ impl FunctionLayer {
     /// looping: a looping band has no ends to overshoot).
     fn rubber_bands(&self) -> bool {
         !self.scroll_loop && self.scroll_rubber_band
+    }
+
+    /// Leading buttons that hold still during a layer slide.
+    fn swipe_pinned_count(&self) -> usize {
+        if self.pin_swipe {
+            self.pinned_count
+        } else {
+            0
+        }
+    }
+
+    /// Virtual slots those buttons occupy.
+    fn swipe_pinned_slots(&self) -> usize {
+        if self.pin_swipe {
+            self.pinned_slots
+        } else {
+            0
+        }
+    }
+
+    /// How far a layer slide travels before the swap commits. With buttons
+    /// held still at the left, only the region right of them slides, so the
+    /// travel is that region's width plus one button gap -- the incoming
+    /// content then abuts the outgoing content seamlessly instead of towing
+    /// an Esc-sized hole behind it. With nothing held still it is the full
+    /// bar width.
+    fn slide_travel(&self, width: f64, style: &style::Style) -> f64 {
+        if self.swipe_pinned_slots() == 0 {
+            return width;
+        }
+        let spacing = style.button_spacing;
+        let edge = style.edge_padding;
+        if let Some(geo) = self.scroll_geometry(width, style) {
+            return geo.region_width + spacing;
+        }
+        let n = self.virtual_button_count as f64;
+        let vbw = (width - 2.0 * edge - spacing * (n - 1.0)) / n;
+        let guard = edge + self.swipe_pinned_slots() as f64 * (vbw + spacing);
+        (width - edge - guard) + spacing
     }
 
     /// The scroll layout for this layer, or `None` when it doesn't scroll
@@ -1066,19 +1177,26 @@ impl FunctionLayer {
         Some(idx)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn with_config(
         cfg: Vec<ButtonConfig>,
         widgets: &mut Vec<WidgetSpec>,
         next_id: &mut usize,
         default_icon_size: i32,
         visible_buttons: usize,
-        pinned_count: usize,
         scroll_loop: bool,
         scroll_rubber_band: bool,
+        pin_scroll: bool,
+        pin_swipe: bool,
     ) -> FunctionLayer {
         if cfg.is_empty() {
             panic!("Invalid configuration, layer has 0 buttons");
         }
+        // The pinned region is the leading run of buttons marked Pinned in
+        // the config (the declared Esc); PinnedIgnoreScroll turns the whole
+        // mechanism off for scrolling.
+        let declared_pinned = cfg.iter().take_while(|c| c.pinned.unwrap_or(false)).count();
+        let pinned_count = if pin_scroll { declared_pinned } else { 0 };
 
         let mut virtual_button_count = 0;
         let displays_time = cfg.iter().any(|cfg| cfg.time.is_some());
@@ -1124,6 +1242,7 @@ impl FunctionLayer {
             faster_refresh,
             pinned_count,
             pinned_slots,
+            pin_swipe,
             visible_slots: visible_buttons,
             scroll_loop,
             scroll_rubber_band,
@@ -1141,16 +1260,33 @@ impl FunctionLayer {
         surface: &Surface,
         pixel_shift: (f64, f64),
         complete_redraw: bool,
-        // Layer-swipe slide: the whole layer draws shifted sideways by this
-        // many px along the bar. `paint_background` is false for the second
-        // layer of a sliding composite, so it doesn't wipe the first.
+        // Layer-swipe slide: buttons draw shifted sideways by this many px
+        // along the bar. When `slide_pins` (both sides of the transition pin
+        // the same slots -- see slide_params), the pinned Esc stays put like
+        // it does for band scrolling; otherwise it slides along with the
+        // rest. `base_pass` is false for the incoming layer of a sliding
+        // composite: it must not repaint the background or stack a second
+        // Esc on top of a held-still one.
         slide_offset: f64,
-        paint_background: bool,
+        slide_pins: bool,
+        base_pass: bool,
     ) -> Vec<ClipRect> {
         let c = Context::new(surface).unwrap();
         c.translate(height as f64, 0.0);
         c.rotate((90.0f64).to_radians());
         let style = &config.style;
+        // The buttons that hold still for THIS slide (0 when the transition
+        // partner's pinning doesn't match).
+        let static_count = if slide_pins {
+            self.swipe_pinned_count()
+        } else {
+            0
+        };
+        let static_slots = if slide_pins {
+            self.swipe_pinned_slots()
+        } else {
+            0
+        };
         // With a background image, pixel shift slides the image instead of the
         // buttons: the layout stays put and the panel still gets its burn-in
         // relief from the image pixels moving underneath.
@@ -1192,14 +1328,24 @@ impl FunctionLayer {
             } else {
                 Vec::new()
             };
-            if complete_redraw && paint_background {
+            if complete_redraw && base_pass {
                 set_background_source(&c, style, bg_shift);
                 c.paint().unwrap();
             }
-            // The layer-swipe slide moves every button (but not the
-            // background) sideways as one piece.
-            c.translate(slide_offset, 0.0);
-            for i in 0..self.pinned_count {
+            // Pinned buttons hold still during a layer slide when the
+            // transition keeps them static; otherwise they ride along (and
+            // the incoming layer draws its own copy sliding in instead of
+            // skipping it).
+            let pinned_stay = static_count > 0;
+            c.save().unwrap();
+            if !pinned_stay {
+                c.translate(slide_offset, 0.0);
+            }
+            for i in 0..if base_pass || !pinned_stay {
+                self.pinned_count
+            } else {
+                0
+            } {
                 let end = if i + 1 < self.buttons.len() {
                     self.buttons[i + 1].0
                 } else {
@@ -1244,10 +1390,24 @@ impl FunctionLayer {
                 );
                 button.changed = false;
             }
+            c.restore().unwrap();
             // The band, clipped to its region so wrapped copies (and partial
-            // clears) never bleed over the pinned Esc or off the bar.
+            // clears) never bleed over the pinned Esc or off the bar. During
+            // a layer slide the window travels with the layer (second clip,
+            // in slid space) but stays inside the fixed band area (first
+            // clip), so it can never cover a held-still Esc; with nothing
+            // held still the fixed clip opens up to the whole bar.
             let region_left = geo.region_left + shift_x;
+            let fixed_left = if pinned_stay { region_left } else { 0.0 };
             c.save().unwrap();
+            c.rectangle(
+                fixed_left,
+                0.0,
+                region_left + geo.region_width - fixed_left,
+                h,
+            );
+            c.clip();
+            c.translate(slide_offset, 0.0);
             c.rectangle(region_left, 0.0, geo.region_width, h);
             c.clip();
             for i in self.pinned_count..self.buttons.len() {
@@ -1331,15 +1491,31 @@ impl FunctionLayer {
             (effective_width - 2.0 * edge - spacing * (self.virtual_button_count - 1) as f64)
                 / self.virtual_button_count as f64;
 
-        if complete_redraw && paint_background {
+        if complete_redraw && base_pass {
             set_background_source(&c, style, bg_shift);
             c.paint().unwrap();
         }
-        // The layer-swipe slide moves every button (but not the background)
-        // sideways as one piece.
-        c.translate(slide_offset, 0.0);
 
+        c.save().unwrap();
         for i in 0..self.buttons.len() {
+            if i == static_count {
+                // Everything after the held-still buttons slides with a
+                // layer swipe, behind a clip that keeps it off their area.
+                if static_slots > 0 {
+                    let guard = (static_slots as f64 * (virtual_button_width + spacing)).floor()
+                        + edge
+                        + pixel_shift_x
+                        + (pixel_shift_width / 2) as f64;
+                    c.rectangle(guard, 0.0, width as f64 - guard, height as f64);
+                    c.clip();
+                }
+                c.translate(slide_offset, 0.0);
+            }
+            // The incoming layer of a sliding composite skips its held-still
+            // buttons: the outgoing layer's identical ones are already there.
+            if i < static_count && !base_pass {
+                continue;
+            }
             let end = if i + 1 < self.buttons.len() {
                 self.buttons[i + 1].0
             } else {
@@ -1403,6 +1579,7 @@ impl FunctionLayer {
                 ));
             }
         }
+        c.restore().unwrap();
 
         modified_regions
     }
@@ -1748,6 +1925,8 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
     // the previous frame started (only for the frame log's period readout).
     let mut next_frame = Instant::now();
     let mut last_frame_start = Instant::now();
+    // Consecutive stalled flushes (see the cool-down at the flush site).
+    let mut flush_stalls: u32 = 0;
     // NQTD_FRAME_LOG=1 prints per-frame timings to the journal, for chasing
     // pacing problems on real hardware.
     let frame_log = std::env::var_os("NQTD_FRAME_LOG").is_some_and(|v| v != "0");
@@ -1927,16 +2106,21 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         // momentum (exponential friction), then a smooth snap glide so the
         // band never rests with a button cut off mid-slot. Inactive layers
         // keep animating too, so they settle.
-        let anim_dt = fling_tick.elapsed().as_secs_f64();
+        let anim_dt = fling_tick.elapsed().as_secs_f64().min(MAX_ANIM_DT);
         fling_tick = Instant::now();
         let mut scroll_animating = false;
-        // Advance the sideways layer slide. Reaching +-width swaps the
-        // layers; reaching 0 aborts back to the current one.
+        // Advance the sideways layer slide. The layers form a wrapping
+        // carousel: committing at -width rotates to the next layer, +width
+        // to the previous one, and 0 aborts back to the current one.
         if let Some(target) = layer_slide_target {
             let delta = target - layer_shift;
             if delta.abs() <= SNAP_EPSILON {
-                if target != 0.0 {
-                    layers.swap(0, 1);
+                if target < 0.0 {
+                    layers.rotate_left(1);
+                    rotate_touch_layers(&mut touches, layers.len(), true);
+                } else if target > 0.0 {
+                    layers.rotate_right(1);
+                    rotate_touch_layers(&mut touches, layers.len(), false);
                 }
                 layer_shift = 0.0;
                 layer_slide_target = None;
@@ -1952,15 +2136,32 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         {
             // Safety net: a slide left dangling (e.g. its touch was cancelled)
             // resolves toward whichever layer is showing more.
-            let w = width as f64;
-            layer_slide_target = Some(if layer_shift.abs() > w / 2.0 {
-                w.copysign(layer_shift)
+            let (_, t, _) = slide_params(
+                &layers,
+                active_layer,
+                layer_shift > 0.0,
+                width as f64,
+                &cfg.style,
+            );
+            layer_slide_target = Some(if layer_shift.abs() > t / 2.0 {
+                t.copysign(layer_shift)
             } else {
                 0.0
             });
             scroll_animating = true;
         }
         for (i, layer) in layers.iter_mut().enumerate() {
+            // Self-heal any non-finite scroll state: NaN fails every settle
+            // comparison, so it would otherwise animate (and force full
+            // redraws) forever, with no button hittable -- a frozen bar.
+            if !layer.scroll_offset.is_finite()
+                || !layer.scroll_velocity.is_finite()
+                || layer.scroll_snap.is_some_and(|t| !t.is_finite())
+            {
+                layer.scroll_offset = 0.0;
+                layer.scroll_velocity = 0.0;
+                layer.scroll_snap = None;
+            }
             if layer.scroll_velocity == 0.0 && layer.scroll_snap.is_none() {
                 // Safety net: a rubber-banding band must never REST stretched
                 // past an end. Whatever path left it overscrolled with nothing
@@ -1999,12 +2200,18 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                     if over != 0.0 {
                         // Past an end: a critically damped spring hauls the
                         // band back in one continuous out-and-back motion.
-                        // scroll_offset moves by -velocity, so integrate its
-                        // rate u = -velocity (semi-implicit Euler).
+                        // scroll_offset moves by -velocity, so its rate is
+                        // u = -velocity. Stepped with the exact closed-form
+                        // solution, NOT Euler: Euler diverges when a stalled
+                        // frame hands it a long timestep (this froze the bar
+                        // -- the state exploded to NaN and never settled),
+                        // while the closed form only ever decays.
                         let omega = 1.0 / RUBBER_SPRING_TAU;
-                        let mut u = -layer.scroll_velocity;
-                        u -= (omega * omega * over + 2.0 * omega * u) * anim_dt;
-                        layer.scroll_offset += u * anim_dt;
+                        let u0 = -layer.scroll_velocity;
+                        let b = u0 + omega * over;
+                        let decay = (-omega * anim_dt).exp();
+                        let u = (u0 - omega * b * anim_dt) * decay;
+                        layer.scroll_offset = edge + (over + b * anim_dt) * decay;
                         layer.scroll_velocity = -u;
                         if (layer.scroll_offset - edge).abs() <= SNAP_EPSILON
                             && u.abs() < FLING_STOP_VELOCITY
@@ -2144,9 +2351,19 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 };
                 let clips = if layer_shift != 0.0 {
                     // Mid layer-swipe: composite both layers sliding along
-                    // the bar, the incoming one a full bar-width away.
-                    let w = width as f64;
-                    let incoming_off = layer_shift - w.copysign(layer_shift);
+                    // the bar, the incoming one exactly one slide-travel away
+                    // so its content abuts the outgoing content seamlessly
+                    // (a full bar-width would tow an Esc-sized hole). Which
+                    // neighbor slides in depends on the direction: dragging
+                    // right reveals the previous layer, left the next.
+                    let (incoming, travel, stay) = slide_params(
+                        &layers,
+                        active_layer,
+                        layer_shift > 0.0,
+                        width as f64,
+                        &cfg.style,
+                    );
+                    let incoming_off = layer_shift - travel.copysign(layer_shift);
                     let clips = layers[active_layer].draw(
                         &cfg,
                         width as i32,
@@ -2155,9 +2372,10 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                         shift,
                         true,
                         layer_shift,
+                        stay,
                         true,
                     );
-                    layers[1 - active_layer].draw(
+                    layers[incoming].draw(
                         &cfg,
                         width as i32,
                         height as i32,
@@ -2165,6 +2383,7 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                         shift,
                         true,
                         incoming_off,
+                        stay,
                         false,
                     );
                     clips
@@ -2177,6 +2396,7 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                         shift,
                         needs_complete_redraw,
                         0.0,
+                        true,
                         true,
                     )
                 };
@@ -2208,7 +2428,12 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                             out.copy_from_slice(&data);
                         }
                     }
-                    drm.dirty(&clips).unwrap();
+                    if let Err(err) = drm.dirty(&clips) {
+                        // A struggling appletbdrm surfaces its errors here;
+                        // panicking into emergency mode would only pile more
+                        // traffic onto a panel that needs the opposite.
+                        println!("dirty flush failed: {err}");
+                    }
                 }
                 needs_complete_redraw = false;
                 if frame_log {
@@ -2220,6 +2445,39 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                         was_complete,
                         clips.len(),
                     );
+                }
+                // The flush is a synchronous request/response with the T2
+                // over USB. A stalled flush means appletbdrm is waiting out
+                // its response timeout -- the display stream is desyncing
+                // ("Failed to read response (-110)" in the kernel log), and
+                // the panel goes through a glitchy phase before continued
+                // traffic wedges it completely (endless "Failed to send
+                // message", dead until reboot). So at the first stall the
+                // daemon goes quiet, backing off exponentially while stalls
+                // persist; a healthy flush ends the episode. Mild overruns
+                // just reschedule from completion instead of firing the next
+                // frame back-to-back.
+                let frame_end = Instant::now();
+                let frame_cost = frame_end - now;
+                if frame_cost >= FLUSH_STALL_MIN {
+                    let cooldown =
+                        FLUSH_COOLDOWN_BASE * (1 << flush_stalls.min(FLUSH_STALL_MAX_DOUBLINGS));
+                    flush_stalls += 1;
+                    next_frame = frame_end + cooldown;
+                    println!(
+                        "flush stalled ({} ms): cooling down {} s (stall #{})",
+                        frame_cost.as_millis(),
+                        cooldown.as_secs(),
+                        flush_stalls,
+                    );
+                } else {
+                    if flush_stalls > 0 {
+                        println!("flush healthy again after {flush_stalls} stall(s)");
+                        flush_stalls = 0;
+                    }
+                    if frame_cost > FRAME_PERIOD {
+                        next_frame = frame_end + frame_cost;
+                    }
                 }
             }
         }
@@ -2278,7 +2536,9 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                     }
                 }
                 Event::Keyboard(KeyboardEvent::Key(key)) => {
-                    if key.key() == Key::Fn as u32 {
+                    // Fn peeks at the next layer; with a single layer there is
+                    // nothing to peek at (or swap to).
+                    if key.key() == Key::Fn as u32 && layers.len() > 1 {
                         if cfg.double_press_switch_layers > 0
                             && key.key_state() == KeyState::Pressed
                         {
@@ -2312,18 +2572,78 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                             }
                             // Touching a bar that is mid layer-slide catches
                             // the slide and takes it over as a new swipe; no
-                            // button on a half-shown layer should press.
+                            // button on a half-shown layer should press. The
+                            // pinned Esc sits outside the slide and keeps
+                            // pressing normally. But only while the slide is
+                            // still visibly traveling: its exponential tail
+                            // spends a long time within a few (invisible)
+                            // pixels of done, and hijacking touches there
+                            // turned every scroll started right after a layer
+                            // switch into a phantom swipe.
                             if layer_shift != 0.0 || layer_slide_target.is_some() {
+                                let target = layer_slide_target.unwrap_or(0.0);
+                                let swiping = touches
+                                    .values()
+                                    .any(|t| matches!(t, TouchState::LayerSwipe { .. }));
+                                if swiping || (target - layer_shift).abs() > SCROLL_SLOP_PX {
+                                    // Only a held-still Esc is at its resting spot
+                                    // and safe to press; when this transition
+                                    // slides everything, nothing is static.
+                                    let dir_positive = if layer_shift != 0.0 {
+                                        layer_shift > 0.0
+                                    } else {
+                                        target > 0.0
+                                    };
+                                    let (_, _, stay) = slide_params(
+                                        &layers,
+                                        active_layer,
+                                        dir_positive,
+                                        width as f64,
+                                        &cfg.style,
+                                    );
+                                    let esc_hit = layers[active_layer]
+                                        .hit(&cfg.style, width, height, x, y, None)
+                                        .filter(|&btn| {
+                                            stay && btn < layers[active_layer].swipe_pinned_count()
+                                        });
+                                    if let Some(btn) = esc_hit {
+                                        layers[active_layer].buttons[btn]
+                                            .1
+                                            .set_active(uinput, true);
+                                        touches.insert(
+                                            dn.seat_slot(),
+                                            TouchState::Held {
+                                                layer: active_layer,
+                                                btn,
+                                            },
+                                        );
+                                    } else {
+                                        layer_slide_target = None;
+                                        touches.insert(
+                                            dn.seat_slot(),
+                                            TouchState::LayerSwipe {
+                                                last_x: x,
+                                                last_t_us: dn.time_usec(),
+                                                velocity: 0.0,
+                                            },
+                                        );
+                                    }
+                                    continue;
+                                }
+                                // Within a finger-slop of settling: the touch
+                                // means the layer the user can already see.
+                                // Finish the slide on the spot (a sub-slop
+                                // jump) and let the touch land normally.
+                                if target < 0.0 {
+                                    layers.rotate_left(1);
+                                    rotate_touch_layers(&mut touches, layers.len(), true);
+                                } else if target > 0.0 {
+                                    layers.rotate_right(1);
+                                    rotate_touch_layers(&mut touches, layers.len(), false);
+                                }
+                                layer_shift = 0.0;
                                 layer_slide_target = None;
-                                touches.insert(
-                                    dn.seat_slot(),
-                                    TouchState::LayerSwipe {
-                                        last_x: x,
-                                        last_t_us: dn.time_usec(),
-                                        velocity: 0.0,
-                                    },
-                                );
-                                continue;
+                                needs_complete_redraw = true;
                             }
                             let layer = &mut layers[active_layer];
                             // Touching the band catches it: any fling stops, and
@@ -2440,6 +2760,7 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                     // the band.
                                     let became_swipe = crossed
                                         && cfg.layer_swipe
+                                        && layers.len() > 1
                                         && multi
                                         && !has_swipe
                                         && !has_scroll;
@@ -2542,8 +2863,14 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                     let t_us = mtn.time_usec();
                                     let dx = x - last_x;
                                     let dt = t_us.saturating_sub(last_t_us) as f64 / 1e6;
-                                    let w = width as f64;
-                                    layer_shift = (layer_shift + dx).clamp(-w, w);
+                                    let (_, travel, _) = slide_params(
+                                        &layers,
+                                        active_layer,
+                                        layer_shift + dx > 0.0,
+                                        width as f64,
+                                        &cfg.style,
+                                    );
+                                    layer_shift = (layer_shift + dx).clamp(-travel, travel);
                                     let velocity = if dt > 0.0 {
                                         (0.6 * (dx / dt) + 0.4 * velocity)
                                             .clamp(-FLING_MAX_VELOCITY, FLING_MAX_VELOCITY)
@@ -2667,15 +2994,28 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                     } else {
                                         velocity
                                     };
-                                    let w = width as f64;
                                     // A flick commits the swap in its direction;
                                     // otherwise the slide settles to whichever
-                                    // layer is showing more.
+                                    // layer is showing more. The travel depends
+                                    // on which transition the direction picks.
+                                    let dir_positive = if velocity.abs() >= LAYER_SWIPE_MIN_VELOCITY
+                                    {
+                                        velocity > 0.0
+                                    } else {
+                                        layer_shift > 0.0
+                                    };
+                                    let (_, t, _) = slide_params(
+                                        &layers,
+                                        active_layer,
+                                        dir_positive,
+                                        width as f64,
+                                        &cfg.style,
+                                    );
                                     layer_slide_target =
                                         Some(if velocity.abs() >= LAYER_SWIPE_MIN_VELOCITY {
-                                            w.copysign(velocity)
-                                        } else if layer_shift.abs() > w / 2.0 {
-                                            w.copysign(layer_shift)
+                                            t.copysign(velocity)
+                                        } else if layer_shift.abs() > t / 2.0 {
+                                            t.copysign(layer_shift)
                                         } else {
                                             0.0
                                         });
@@ -2706,12 +3046,13 @@ mod tests {
     const W: u16 = 2170;
     const H: u16 = 60;
 
-    /// A layer of `n` text buttons, the first `pinned` of them pinned, showing
-    /// `visible` slots at a time (0 = scrolling disabled).
+    /// A layer of `n` text buttons, the first `pinned` of them marked Pinned,
+    /// showing `visible` slots at a time (0 = scrolling disabled).
     fn text_layer_mode(n: usize, pinned: usize, visible: usize, looping: bool) -> FunctionLayer {
         let keys = (0..n)
             .map(|i| ButtonConfig {
                 text: Some(format!("B{i}")),
+                pinned: (i < pinned).then_some(true),
                 ..Default::default()
             })
             .collect();
@@ -2721,8 +3062,9 @@ mod tests {
             &mut 0,
             48,
             visible,
-            pinned,
             looping,
+            true,
+            true,
             true,
         )
     }
@@ -2770,6 +3112,7 @@ mod tests {
             .enumerate()
             .map(|(i, s)| ButtonConfig {
                 text: Some(format!("B{i}")),
+                pinned: (i < pinned).then_some(true),
                 stretch: Some(*s),
                 ..Default::default()
             })
@@ -2780,10 +3123,101 @@ mod tests {
             &mut 0,
             48,
             visible,
-            pinned,
+            true,
+            true,
             true,
             true,
         )
+    }
+
+    #[test]
+    fn pinned_flags_declare_the_pinned_run() {
+        let style = Style::default();
+        // Two leading Pinned buttons -> both outside the band.
+        let layer = text_layer_mode(14, 2, 6, true);
+        assert_eq!(layer.pinned_count, 2);
+        assert_eq!(layer.pinned_slots, 2);
+        assert!(layer.scroll_geometry(W as f64, &style).is_some());
+        // PinnedIgnoreScroll = false dissolves the pinned region entirely.
+        let keys = (0..14)
+            .map(|i| ButtonConfig {
+                text: Some(format!("B{i}")),
+                pinned: (i < 2).then_some(true),
+                ..Default::default()
+            })
+            .collect();
+        let layer = FunctionLayer::with_config(
+            keys,
+            &mut Vec::new(),
+            &mut 0,
+            48,
+            6,
+            true,
+            true,
+            false,
+            true,
+        );
+        assert_eq!(layer.pinned_count, 0);
+        assert_eq!(layer.swipe_pinned_count(), 0);
+        // PinnedIgnoreLayerSwipe = false keeps the scroll pin but lets the
+        // buttons slide with a layer swipe.
+        let keys = (0..14)
+            .map(|i| ButtonConfig {
+                text: Some(format!("B{i}")),
+                pinned: (i < 2).then_some(true),
+                ..Default::default()
+            })
+            .collect();
+        let layer = FunctionLayer::with_config(
+            keys,
+            &mut Vec::new(),
+            &mut 0,
+            48,
+            6,
+            true,
+            true,
+            true,
+            false,
+        );
+        assert_eq!(layer.pinned_count, 2);
+        assert_eq!(layer.swipe_pinned_count(), 0);
+        assert_eq!(layer.slide_travel(W as f64, &style), W as f64);
+    }
+
+    #[test]
+    fn mixed_pinning_slides_the_whole_bar() {
+        let style = Style::default();
+        // A pins its esc, B doesn't: nothing can hold still coherently, so
+        // that transition slides the full bar and A carries its esc along.
+        let layers = vec![text_layer(14, 1, 6), text_layer(14, 0, 6)];
+        let (incoming, travel, stay) = slide_params(&layers, 0, false, W as f64, &style);
+        assert_eq!(incoming, 1);
+        assert!(!stay);
+        assert_eq!(travel, W as f64);
+        // Same from B's side going back to A.
+        let (_, travel, stay) = slide_params(&layers, 1, true, W as f64, &style);
+        assert!(!stay);
+        assert_eq!(travel, W as f64);
+        // Matching pins hold the esc still and travel only the band region.
+        let layers = vec![text_layer(14, 1, 6), text_layer(14, 1, 6)];
+        let (_, travel, stay) = slide_params(&layers, 0, false, W as f64, &style);
+        assert!(stay);
+        assert!(travel < W as f64);
+    }
+
+    #[test]
+    fn slide_travel_spans_the_sliding_region() {
+        let style = Style::default();
+        // Pinned esc held still: travel = band region + one gap, so the
+        // incoming layer abuts the outgoing content with no Esc-sized hole.
+        let layer = text_layer(14, 1, 6);
+        let geo = layer.scroll_geometry(W as f64, &style).unwrap();
+        let t = layer.slide_travel(W as f64, &style);
+        assert!((t - (geo.region_width + style.button_spacing)).abs() < 1e-9);
+        assert!(t < W as f64);
+        // Nothing pinned: the whole bar slides.
+        let layer = text_layer(14, 0, 6);
+        assert_eq!(layer.slide_travel(W as f64, &style), W as f64);
     }
 
     #[test]

@@ -23,7 +23,13 @@
 
 # LayerSwipe = true
 
+# PinnedIgnoreScroll = true
+# PinnedIgnoreLayerSwipe = true
+
+# Pinned must mark the same leading slots on every layer; a mismatch is a
+# config error (red banner on the bar).
 # PrimaryLayerKeys = [
+#     { Text = "esc", Action = "Esc", Pinned = true },
 #     { Text = "F1",  Action = "F1"  },
 #     { Text = "F2",  Action = "F2"  },
 #     { Text = "F3",  Action = "F3"  },
@@ -42,6 +48,7 @@
 # or the daemon-internal "TouchBarBrightnessDown"/"TouchBarBrightnessUp",
 # which adjust the Touch Bar's own brightness (10 levels, hold to repeat).
 # MediaLayerKeys = [
+#     { Text = "esc", Action = "Esc", Pinned = true },
 #     { Icon = "brightness_low",  Action = "BrightnessDown" },
 #     { Icon = "brightness_high", Action = "BrightnessUp"   },
 #     { Icon = "mic_off",         Action = "MicMute"        },
@@ -54,6 +61,12 @@
 #     { Icon = "volume_off",      Action = "Mute"           },
 #     { Icon = "volume_down",     Action = "VolumeDown"     },
 #     { Icon = "volume_up",       Action = "VolumeUp"       },
+# ]
+
+# Layers = [
+#     [ { Text = "esc", Action = "Esc", Pinned = true }, { Text = "F1", Action = "F1" }, { Text = "F2", Action = "F2" } ],
+#     [ { Text = "esc", Action = "Esc", Pinned = true }, { Icon = "play_pause", Action = "PlayPause" } ],
+#     [ { Text = "esc", Action = "Esc", Pinned = true }, { Time = "%H:%M" } ],
 # ]
 
 # [Style]

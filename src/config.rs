@@ -57,6 +57,8 @@ const DEFAULT_VISIBLE_BUTTONS: usize = 0;
 const DEFAULT_SCROLL_LOOP: bool = true;
 const DEFAULT_SCROLL_RUBBER_BAND: bool = true;
 const DEFAULT_LAYER_SWIPE: bool = true;
+const DEFAULT_PINNED_IGNORE_SCROLL: bool = true;
+const DEFAULT_PINNED_IGNORE_LAYER_SWIPE: bool = true;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -75,9 +77,15 @@ struct ConfigProxy {
     scroll_loop: Option<bool>,
     scroll_rubber_band: Option<bool>,
     layer_swipe: Option<bool>,
+    pinned_ignore_scroll: Option<bool>,
+    pinned_ignore_layer_swipe: Option<bool>,
     style: Option<StyleProxy>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
+    // Any number of layers, each an array of buttons; swiping cycles through
+    // them in order. When set (non-empty), this wins over PrimaryLayerKeys /
+    // MediaLayerKeys / MediaLayerDefault.
+    layers: Option<Vec<Vec<ButtonConfig>>>,
 }
 
 impl ConfigProxy {
@@ -126,11 +134,20 @@ impl ConfigProxy {
         if o.layer_swipe.is_some() {
             self.layer_swipe = o.layer_swipe;
         }
+        if o.pinned_ignore_scroll.is_some() {
+            self.pinned_ignore_scroll = o.pinned_ignore_scroll;
+        }
+        if o.pinned_ignore_layer_swipe.is_some() {
+            self.pinned_ignore_layer_swipe = o.pinned_ignore_layer_swipe;
+        }
         if o.primary_layer_keys.is_some() {
             self.primary_layer_keys = o.primary_layer_keys;
         }
         if o.media_layer_keys.is_some() {
             self.media_layer_keys = o.media_layer_keys;
+        }
+        if o.layers.is_some() {
+            self.layers = o.layers;
         }
         // The [Style] table merges field-by-field rather than replacing wholesale.
         if let Some(user_style) = o.style {
@@ -204,6 +221,9 @@ pub struct ButtonConfig {
     pub locale: Option<String>,
     #[serde(deserialize_with = "array_or_single", default)]
     pub action: Vec<ButtonAction>,
+    // Leading buttons marked Pinned sit outside the scrolling band and hold
+    // still during layer swipes (each behavior has its own global toggle).
+    pub pinned: Option<bool>,
     pub stretch: Option<usize>,
     pub icon_width: Option<i32>,
     pub icon_height: Option<i32>,
@@ -246,64 +266,76 @@ fn resolve_font_pattern(family: Option<&str>, bold: Option<bool>) -> String {
     }
 }
 
-/// The stock F1-F12 primary layer, used when the config sets no PrimaryLayerKeys.
+/// The stock Esc + F1-F12 primary layer, used when the config sets no
+/// PrimaryLayerKeys. The Esc is a regular (pinned) button here, not an
+/// injected special case: configs that define their own layers declare
+/// their own Esc.
 fn default_primary_layer() -> Vec<ButtonConfig> {
-    [
-        Key::F1,
-        Key::F2,
-        Key::F3,
-        Key::F4,
-        Key::F5,
-        Key::F6,
-        Key::F7,
-        Key::F8,
-        Key::F9,
-        Key::F10,
-        Key::F11,
-        Key::F12,
-    ]
-    .into_iter()
-    .enumerate()
-    .map(|(i, key)| ButtonConfig {
-        text: Some(format!("F{}", i + 1)),
-        action: vec![ButtonAction::Key(key)],
-        ..Default::default()
-    })
-    .collect()
+    std::iter::once(esc_button())
+        .chain(
+            [
+                Key::F1,
+                Key::F2,
+                Key::F3,
+                Key::F4,
+                Key::F5,
+                Key::F6,
+                Key::F7,
+                Key::F8,
+                Key::F9,
+                Key::F10,
+                Key::F11,
+                Key::F12,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, key)| ButtonConfig {
+                text: Some(format!("F{}", i + 1)),
+                action: vec![ButtonAction::Key(key)],
+                ..Default::default()
+            }),
+        )
+        .collect()
 }
 
 /// The stock media-key layer, used when the config sets no MediaLayerKeys.
 fn default_media_layer() -> Vec<ButtonConfig> {
-    [
-        ("brightness_low", Key::BrightnessDown),
-        ("brightness_high", Key::BrightnessUp),
-        ("mic_off", Key::MicMute),
-        ("search", Key::Search),
-        ("backlight_low", Key::IllumDown),
-        ("backlight_high", Key::IllumUp),
-        ("fast_rewind", Key::PreviousSong),
-        ("play_pause", Key::PlayPause),
-        ("fast_forward", Key::NextSong),
-        ("volume_off", Key::Mute),
-        ("volume_down", Key::VolumeDown),
-        ("volume_up", Key::VolumeUp),
-    ]
-    .into_iter()
-    .map(|(icon, key)| ButtonConfig {
-        icon: Some(icon.to_string()),
-        action: vec![ButtonAction::Key(key)],
-        ..Default::default()
-    })
-    .collect()
+    std::iter::once(esc_button())
+        .chain(
+            [
+                ("brightness_low", Key::BrightnessDown),
+                ("brightness_high", Key::BrightnessUp),
+                ("mic_off", Key::MicMute),
+                ("search", Key::Search),
+                ("backlight_low", Key::IllumDown),
+                ("backlight_high", Key::IllumUp),
+                ("fast_rewind", Key::PreviousSong),
+                ("play_pause", Key::PlayPause),
+                ("fast_forward", Key::NextSong),
+                ("volume_off", Key::Mute),
+                ("volume_down", Key::VolumeDown),
+                ("volume_up", Key::VolumeUp),
+            ]
+            .into_iter()
+            .map(|(icon, key)| ButtonConfig {
+                icon: Some(icon.to_string()),
+                action: vec![ButtonAction::Key(key)],
+                ..Default::default()
+            }),
+        )
+        .collect()
 }
 
-/// The Esc key that is auto-added on Macs without a physical one.
+/// The pinned Esc button used by the default layers and the error banner.
+/// Esc is never injected automatically: user-defined layers declare their
+/// own (`Pinned = true` marks it pinned).
 fn esc_button() -> ButtonConfig {
     ButtonConfig {
         icon: None,
         text: Some("esc".into()),
         theme: None,
         action: vec![ButtonAction::Key(Key::Esc)],
+        pinned: Some(true),
         stretch: None,
         time: None,
         locale: None,
@@ -315,18 +347,6 @@ fn esc_button() -> ButtonConfig {
         text_color: None,
         command: None,
         interval: None,
-    }
-}
-
-/// Prepend the auto Esc key on panels wide enough to need one. Used for both the
-/// normal layers and the error banner, so an error never hides Esc. Returns
-/// whether a key was added — that key is pinned (excluded from scrolling).
-fn prepend_esc_if_needed(keys: &mut Vec<ButtonConfig>, width: u16) -> bool {
-    if width >= 2170 {
-        keys.insert(0, esc_button());
-        true
-    } else {
-        false
     }
 }
 
@@ -343,27 +363,29 @@ fn short_error(name: &str, full: &str) -> String {
 }
 
 /// A full-width banner layer showing `message`, with the Esc key kept usable.
-fn error_layer(message: &str, width: u16) -> FunctionLayer {
-    let mut keys = Vec::new();
-    prepend_esc_if_needed(&mut keys, width);
-    keys.push(ButtonConfig {
-        icon: None,
-        text: Some(message.to_string()),
-        theme: None,
-        action: vec![], // inert: shows the message, sends nothing
-        stretch: Some(24),
-        time: None,
-        locale: None,
-        battery: None,
-        icon_width: None,
-        icon_height: None,
-        color: None,
-        color_active: None,
-        text_color: None,
-        command: None,
-        interval: None,
-    });
-    FunctionLayer::with_config(keys, &mut Vec::new(), &mut 0, 48, 0, 0, true, true)
+fn error_layer(message: &str) -> FunctionLayer {
+    let keys = vec![
+        esc_button(),
+        ButtonConfig {
+            icon: None,
+            text: Some(message.to_string()),
+            theme: None,
+            action: vec![], // inert: shows the message, sends nothing
+            pinned: None,
+            stretch: Some(24),
+            time: None,
+            locale: None,
+            battery: None,
+            icon_width: None,
+            icon_height: None,
+            color: None,
+            color_active: None,
+            text_color: None,
+            command: None,
+            interval: None,
+        },
+    ];
+    FunctionLayer::with_config(keys, &mut Vec::new(), &mut 0, 48, 0, true, true, true, true)
 }
 
 /// Resolve a background image path: absolute paths are used as-is; relative ones
@@ -419,6 +441,34 @@ fn load_background_image(path: &str, width: i32, height: i32) -> Result<ImageSur
     Ok(dst)
 }
 
+/// Slots covered by a layer's declared pinned prefix (the leading run of
+/// `Pinned = true` buttons), counted the same way FunctionLayer::with_config
+/// counts them.
+fn declared_pinned_slots(keys: &[ButtonConfig]) -> usize {
+    keys.iter()
+        .take_while(|c| c.pinned.unwrap_or(false))
+        .map(|c| c.stretch.unwrap_or(1).max(1))
+        .sum()
+}
+
+/// Layer swipes only keep the pinned prefix still when every layer pins the
+/// same slots; a mismatch silently forces the whole-bar slide path for every
+/// transition, where nothing is static and mid-slide touches can't press
+/// anything. A disagreeing config is rejected like a parse error -- red
+/// banner on the bar, not a journal-only warning -- instead of silently
+/// picking one behavior.
+fn pin_mismatch_error(key_sets: &[Vec<ButtonConfig>]) -> Option<String> {
+    let pin_slots: Vec<usize> = key_sets.iter().map(|k| declared_pinned_slots(k)).collect();
+    if pin_slots.iter().any(|&s| s != pin_slots[0]) {
+        Some(short_error(
+            "Pinned",
+            &format!("must match on every layer (leading slots {pin_slots:?})"),
+        ))
+    } else {
+        None
+    }
+}
+
 /// Load and merge the config. `override_paths` are override layers applied in
 /// increasing order of precedence (e.g. `[/etc/.../config.toml,
 /// ~/.config/.../config.toml]`) on top of the shipped base template. Missing
@@ -428,7 +478,7 @@ fn load_config(
     override_paths: &[PathBuf],
     width: u16,
     height: u16,
-) -> (Config, [FunctionLayer; 2], Vec<WidgetSpec>) {
+) -> (Config, Vec<FunctionLayer>, Vec<WidgetSpec>) {
     let mut base = toml::from_str::<ConfigProxy>(&read_to_string(BASE_CFG_PATH).unwrap()).unwrap();
     let mut config_error: Option<String> = None;
     for path in override_paths {
@@ -463,6 +513,40 @@ fn load_config(
     // Command widgets found while building the layers, with unique ids.
     let mut widgets = Vec::new();
     let mut next_id = 0;
+    // The freeform Layers list wins; PrimaryLayerKeys/MediaLayerKeys
+    // (with MediaLayerDefault ordering) are the two-layer fallback.
+    let key_sets: Vec<Vec<ButtonConfig>> = match base.layers.take() {
+        Some(sets) if sets.iter().any(|s| !s.is_empty()) => {
+            let (kept, empty): (Vec<_>, Vec<_>) = sets.into_iter().partition(|s| !s.is_empty());
+            if !empty.is_empty() {
+                eprintln!("not-quite-tiny-dfr: ignoring empty layer(s) in Layers");
+            }
+            kept
+        }
+        _ => {
+            let media = base.media_layer_keys.unwrap_or_else(default_media_layer);
+            let primary = base
+                .primary_layer_keys
+                .unwrap_or_else(default_primary_layer);
+            if base
+                .media_layer_default
+                .unwrap_or(DEFAULT_MEDIA_LAYER_DEFAULT)
+            {
+                vec![media, primary]
+            } else {
+                vec![primary, media]
+            }
+        }
+    };
+    // Cross-layer validation is a config error like a parse failure: the bar
+    // shows the banner rather than running with a quietly altered layout. A
+    // parse error keeps precedence -- these key sets may be a stale mix.
+    if config_error.is_none() {
+        if let Some(err) = pin_mismatch_error(&key_sets) {
+            eprintln!("not-quite-tiny-dfr: {err}");
+            config_error = Some(err);
+        }
+    }
     let layers = match &config_error {
         Some(message) => {
             // Unmistakable red banner; blend button fill into it and keep white
@@ -472,50 +556,38 @@ fn load_config(
             style.background_image = None; // don't let an image hide the error
             style.button_color = red;
             style.text_color = Color::rgb(1.0, 1.0, 1.0);
-            [error_layer(message, width), error_layer(message, width)]
+            vec![error_layer(message), error_layer(message)]
         }
         None => {
-            let mut media_layer_keys = base.media_layer_keys.unwrap_or_else(default_media_layer);
-            let mut primary_layer_keys = base
-                .primary_layer_keys
-                .unwrap_or_else(default_primary_layer);
-            let media_esc = prepend_esc_if_needed(&mut media_layer_keys, width);
-            let primary_esc = prepend_esc_if_needed(&mut primary_layer_keys, width);
             // How many button-slots a layer shows at once; layers with more
-            // become scrollable (the pinned Esc doesn't count or scroll).
+            // become scrollable (pinned buttons don't count or scroll).
             let visible_buttons = base.visible_buttons.unwrap_or(DEFAULT_VISIBLE_BUTTONS);
             let scroll_loop = base.scroll_loop.unwrap_or(DEFAULT_SCROLL_LOOP);
             let scroll_rubber_band = base
                 .scroll_rubber_band
                 .unwrap_or(DEFAULT_SCROLL_RUBBER_BAND);
-            let media_layer = FunctionLayer::with_config(
-                media_layer_keys,
-                &mut widgets,
-                &mut next_id,
-                default_icon_size,
-                visible_buttons,
-                media_esc as usize,
-                scroll_loop,
-                scroll_rubber_band,
-            );
-            let fkey_layer = FunctionLayer::with_config(
-                primary_layer_keys,
-                &mut widgets,
-                &mut next_id,
-                default_icon_size,
-                visible_buttons,
-                primary_esc as usize,
-                scroll_loop,
-                scroll_rubber_band,
-            );
-            if base
-                .media_layer_default
-                .unwrap_or(DEFAULT_MEDIA_LAYER_DEFAULT)
-            {
-                [media_layer, fkey_layer]
-            } else {
-                [fkey_layer, media_layer]
-            }
+            let pin_scroll = base
+                .pinned_ignore_scroll
+                .unwrap_or(DEFAULT_PINNED_IGNORE_SCROLL);
+            let pin_swipe = base
+                .pinned_ignore_layer_swipe
+                .unwrap_or(DEFAULT_PINNED_IGNORE_LAYER_SWIPE);
+            key_sets
+                .into_iter()
+                .map(|keys| {
+                    FunctionLayer::with_config(
+                        keys,
+                        &mut widgets,
+                        &mut next_id,
+                        default_icon_size,
+                        visible_buttons,
+                        scroll_loop,
+                        scroll_rubber_band,
+                        pin_scroll,
+                        pin_swipe,
+                    )
+                })
+                .collect()
         }
     };
     let cfg = Config {
@@ -620,7 +692,7 @@ impl ConfigManager {
             height,
         }
     }
-    pub fn load_config(&self) -> (Config, [FunctionLayer; 2], Vec<WidgetSpec>) {
+    pub fn load_config(&self) -> (Config, Vec<FunctionLayer>, Vec<WidgetSpec>) {
         load_config(&self.cfg_paths, self.width, self.height)
     }
     /// Add a higher-precedence override layer (and start watching it) after
@@ -636,7 +708,7 @@ impl ConfigManager {
     pub fn update_config(
         &mut self,
         cfg: &mut Config,
-        layers: &mut [FunctionLayer; 2],
+        layers: &mut Vec<FunctionLayer>,
     ) -> Option<Vec<WidgetSpec>> {
         // Pick up directories that did not exist when we last tried to watch
         // them (e.g. the user just created ~/.config/not-quite-tiny-dfr/).
@@ -668,7 +740,7 @@ impl ConfigManager {
     fn handle_events(
         &mut self,
         cfg: &mut Config,
-        layers: &mut [FunctionLayer; 2],
+        layers: &mut Vec<FunctionLayer>,
         evts: Result<Vec<InotifyEvent>, Errno>,
     ) -> Option<Vec<WidgetSpec>> {
         let evts = match evts {
@@ -760,6 +832,29 @@ mod tests {
     }
 
     #[test]
+    fn layers_parse_and_merge() {
+        // JSON-style nested arrays: any number of layers, each a button list.
+        let mut base: ConfigProxy = toml::from_str(
+            "Layers = [\n\
+             \x20   [ { Text = \"A\", Action = \"F1\" }, { Text = \"B\", Action = \"F2\" } ],\n\
+             \x20   [ { Text = \"C\", Action = \"F3\" } ],\n\
+             \x20   [ { Text = \"D\", Action = \"F4\" } ],\n\
+             ]\n",
+        )
+        .unwrap();
+        let sets = base.layers.as_ref().unwrap();
+        assert_eq!(sets.len(), 3);
+        assert_eq!(sets[0].len(), 2);
+        assert_eq!(sets[0][0].text.as_deref(), Some("A"));
+        assert_eq!(sets[2][0].text.as_deref(), Some("D"));
+        // A later config layer replaces the whole list.
+        let over: ConfigProxy =
+            toml::from_str("Layers = [ [ { Text = \"Z\", Action = \"F5\" } ] ]\n").unwrap();
+        base.merge(over);
+        assert_eq!(base.layers.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
     fn layer_swipe_parses_and_merges() {
         let mut base: ConfigProxy = toml::from_str("LayerSwipe = true\n").unwrap();
         assert_eq!(base.layer_swipe, Some(true));
@@ -769,11 +864,53 @@ mod tests {
     }
 
     #[test]
-    fn error_banner_keeps_esc_on_wide_panels() {
-        // Wide panels get the auto Esc key; the error banner must keep it.
-        assert_eq!(error_layer("config error", 2170).buttons.len(), 2); // esc + banner
-                                                                        // Narrow panels have no auto Esc, so just the banner.
-        assert_eq!(error_layer("config error", 1000).buttons.len(), 1);
+    fn error_banner_keeps_esc() {
+        // The banner always carries its own Esc so an error never hides it.
+        assert_eq!(error_layer("config error").buttons.len(), 2); // esc + banner
+    }
+
+    #[test]
+    fn pin_mismatch_is_a_config_error() {
+        let button = |pinned: &str| -> ButtonConfig {
+            toml::from_str(&format!("Text = \"esc\"\nAction = \"Esc\"\n{pinned}")).unwrap()
+        };
+        // Disagreeing layers (1 pinned slot vs 0) are rejected with a banner
+        // message naming the fix.
+        let sets = vec![
+            vec![button("Pinned = true"), button("")],
+            vec![button("Pinned = false"), button("")],
+        ];
+        let err = pin_mismatch_error(&sets).expect("mismatch should be an error");
+        assert!(err.contains("Pinned"));
+        assert!(err.contains("every layer"));
+        // Agreeing layers pass.
+        let sets = vec![
+            vec![button("Pinned = true"), button("")],
+            vec![button("Pinned = true"), button("")],
+        ];
+        assert!(pin_mismatch_error(&sets).is_none());
+        // Stretch counts in slots: a stretch-2 pin vs a plain pin disagrees.
+        let sets = vec![
+            vec![button("Pinned = true\nStretch = 2"), button("")],
+            vec![button("Pinned = true"), button("")],
+        ];
+        assert!(pin_mismatch_error(&sets).is_some());
+    }
+
+    #[test]
+    fn pinned_and_pin_toggles_parse() {
+        let cfg: ButtonConfig =
+            toml::from_str("Text = \"esc\"\nAction = \"Esc\"\nPinned = true\n").unwrap();
+        assert_eq!(cfg.pinned, Some(true));
+        let mut base: ConfigProxy =
+            toml::from_str("PinnedIgnoreScroll = true\nPinnedIgnoreLayerSwipe = true\n").unwrap();
+        let over: ConfigProxy = toml::from_str("PinnedIgnoreLayerSwipe = false\n").unwrap();
+        base.merge(over);
+        assert_eq!(base.pinned_ignore_scroll, Some(true));
+        assert_eq!(base.pinned_ignore_layer_swipe, Some(false));
+        // The stock layers declare their Esc as a pinned button.
+        assert_eq!(default_primary_layer()[0].pinned, Some(true));
+        assert_eq!(default_media_layer()[0].pinned, Some(true));
     }
 
     #[test]
