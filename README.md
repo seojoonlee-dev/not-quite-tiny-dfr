@@ -10,6 +10,119 @@ Config is merged from, in increasing precedence:
 `/usr/share/not-quite-tiny-dfr/config.toml` → `/etc/not-quite-tiny-dfr/config.toml`
 → `~/.config/not-quite-tiny-dfr/config.toml`. All are live-reloaded.
 
+## Configuration options
+
+Every key is optional; unset keys fall back to the defaults below. Top-level
+keys must come before the `[Style]` table. A parse error or invalid config
+shows a red banner on the bar (with Esc still usable) instead of silently
+misbehaving.
+
+### Top-level keys
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `MediaLayerDefault` | bool | `false` | Show the media layer (instead of F-keys) by default. Ignored when `Layers` is set. |
+| `ShowButtonOutlines` | bool | `true` | Draw the filled rounded rectangle behind each button. |
+| `EnablePixelShift` | bool | `false` | Periodically shift the image by a pixel to reduce OLED burn-in. |
+| `FontFamily` | string | `""` | Font family for text labels; `""` uses the system default sans. |
+| `FontBold` | bool | `true` | Render labels in bold. |
+| `AdaptiveBrightness` | bool | `true` | Follow the ambient light sensor for bar brightness. |
+| `ActiveBrightness` | u32 | `128` | Fixed brightness (0–255) when `AdaptiveBrightness = false`. |
+| `DoublePressSwitchLayers` | u32 | `0` | Double-press window in ms for Fn to swap the two layers persistently; `0` disables. |
+| `DimTimeout` | u32 | `30` | Seconds of inactivity before the bar dims; `0` disables dimming. |
+| `OffTimeout` | u32 | `60` | Seconds of inactivity before the bar turns off; `0` disables it. |
+| `VisibleButtons` | int | `0` | Button slots shown at once; layers with more become scrollable. `0` = fit everything, no scrolling. |
+| `ScrollLoop` | bool | `true` | Scrollable layers wrap around like a band instead of stopping at the ends. |
+| `ScrollRubberBand` | bool | `true` | Overscroll stretches and springs back at the ends (when `ScrollLoop = false`). |
+| `LayerSwipe` | bool | `true` | Two-finger horizontal swipe slides between layers. |
+| `PinnedIgnoreScroll` | bool | `true` | Pinned buttons hold still while the rest of the layer scrolls. |
+| `PinnedIgnoreLayerSwipe` | bool | `true` | Pinned buttons hold still during layer swipes. |
+| `PrimaryLayerKeys` | array of buttons | Esc + F1–F12 | The primary layer. Ignored when `Layers` is set. |
+| `MediaLayerKeys` | array of buttons | Esc + media keys | The media layer. Ignored when `Layers` is set. |
+| `Layers` | array of button arrays | unset | Any number of layers; swiping cycles through them in order. When set, wins over `PrimaryLayerKeys`/`MediaLayerKeys`/`MediaLayerDefault`. |
+
+### Button keys
+
+Each entry in `PrimaryLayerKeys`, `MediaLayerKeys`, or `Layers` is a table with:
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `Icon` (alias `Svg`) | string | unset | Icon name, looked up in the config dirs (`~/.config`, `/etc`, `/usr/share`). |
+| `Text` | string | unset | Text label. |
+| `Theme` | string | unset | Icon theme to look the icon up in. |
+| `Time` | string | unset | Make this a clock: a strftime format string, e.g. `"%H:%M"`. |
+| `Locale` | string | unset | Locale used for the `Time` format. |
+| `Battery` | string | unset | Make this a battery indicator; value is the display mode: `"icon"`, `"percentage"`, or `"both"`. |
+| `Action` | string or array | none | Linux key name (`"F1"`, `"VolumeUp"`, `"IllumUp"` = keyboard backlight, …) or internal action `"TouchBarBrightnessUp"`/`"TouchBarBrightnessDown"` (the bar's own brightness, 10 levels, hold to repeat). An array sends a chord. |
+| `Pinned` | bool | `false` | Keep this leading button outside the scrolling band and still during layer swipes. Pinned slots must match across all layers, or the config is rejected. |
+| `Stretch` | int | `1` | How many button slots this button spans. |
+| `IconWidth` / `IconHeight` | int | `IconSize` | Per-button icon size in px. |
+| `Color` | hex string | `ButtonColor` | Per-button idle fill color. |
+| `ColorActive` | hex string | `ButtonColorActive` | Per-button pressed fill color. |
+| `TextColor` | hex string | `TextColor` | Per-button label color. |
+| `Command` | string | unset | Make this a command widget (see [Custom widgets](#custom-widgets)). Takes precedence over `Text`/`Icon`. |
+| `Interval` | float | `2.0` | Seconds between `Command` runs (min 0.1). |
+
+### `Action` values
+
+An `Action` is one of three things:
+
+1. **A Linux input key name.** Any variant name of the `input_linux` crate's
+   [`Key` enum](https://docs.rs/input-linux/0.7.1/input_linux/enum.Key.html) —
+   the kernel's `KEY_*` constants in CamelCase, ~550 in total. The daemon emits
+   the key through uinput like a real keyboard: press on touch-down, release on
+   lift, and holding your finger keeps the key held (autorepeat works). Common
+   names:
+
+   | Category | Examples |
+   | --- | --- |
+   | Function/basics | `Esc`, `F1`–`F24`, `Tab`, `Enter`, `Backspace`, `Space`, `Delete` |
+   | Letters | `A`–`Z` (just the letter) |
+   | Digits | `Num1`–`Num9`, `Num0` |
+   | Modifiers | `LeftCtrl`, `RightCtrl`, `LeftShift`, `LeftAlt`, `LeftMeta`, … |
+   | Media | `PlayPause`, `NextSong`, `PreviousSong`, `StopCd`, `Mute`, `VolumeDown`, `VolumeUp`, `MicMute` |
+   | Display/backlight | `BrightnessDown`/`BrightnessUp` (screen), `IllumDown`/`IllumUp` (keyboard backlight) |
+   | Navigation | `Left`, `Right`, `Up`, `Down`, `Home`, `End`, `PageUp`, `PageDown` |
+   | Misc | `Search`, `Sleep`, `Camera`, `Calc`, `Www`, `Mail`, and hundreds more |
+
+   The docs.rs page above lists every accepted name exactly as it is written in
+   the config. The underlying kernel constants (with the same set of keys) are in
+   [input-event-codes.h](https://github.com/torvalds/linux/blob/master/include/uapi/linux/input-event-codes.h).
+
+2. **A daemon-internal action.** Exactly two exist: `"TouchBarBrightnessUp"`
+   and `"TouchBarBrightnessDown"`. They never leave the daemon — they step the
+   Touch Bar's own backlight through its 10 software dimming levels, and holding
+   repeats.
+
+3. **An array of the above** — e.g. `Action = ["LeftCtrl", "C"]`. All entries
+   are pressed together in listed order on touch-down and released on lift, so
+   the array acts as a chord (list modifiers first).
+
+Omitting `Action` (or `Action = []`) makes the button inert: it draws but sends
+nothing, which is the usual choice for display-only widgets like clocks. A name
+that matches neither a key nor an internal action is a config error — red
+banner on the bar.
+
+### `[Style]` table
+
+Colors are hex strings: `#rgb`, `#rgba`, `#rrggbb`, or `#rrggbbaa`.
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `Background` | color | `#000000` | Bar background color. |
+| `BackgroundImage` | string | unset | PNG background, scaled/center-cropped to the bar (`cover`). Absolute path, or relative to the config dirs. Whichever of `Background`/`BackgroundImage` is declared **later** wins. |
+| `ButtonColor` | color | `#333333` | Idle button fill. Setting it explicitly draws the fill even with `ShowButtonOutlines = false`, so buttons can be tinted over a background image. |
+| `ButtonColorActive` | color | `#666666` | Pressed button fill. |
+| `TextColor` | color | `#ffffff` | Label and icon color. |
+| `ButtonSpacing` | number | `16` | Gap between buttons in px; `0` makes a seamless strip. |
+| `EdgePadding` | number | `0` | Padding between the screen edges and the first/last button, in px. |
+| `CornerRadius` | number | `8` | Button corner radius in px. |
+| `FontSize` | number | `32` | Label font size in px. |
+| `IconSize` | number | `48` | Default icon size in px (per-button `IconWidth`/`IconHeight` override it). |
+| `HeightPercent` | number | `90` | Button height as a percentage (0–100) of the bar height. |
+| `BatteryChargingColor` | color | `#00b300` | Battery indicator color while charging. |
+| `BatteryLowColor` | color | `#b30000` | Battery indicator color when low. |
+
 ## Custom widgets
 
 A widget runs a shell command every `Interval` seconds and shows its output:
@@ -43,6 +156,20 @@ a Python script, a compiled binary.
 
 Event-driven / streaming widgets (a long-lived process that pushes updates
 instantly, rather than polling) are planned but not yet implemented.
+
+### Bundled widget scripts
+
+Scripts shipped with the app are installed to
+`/usr/share/not-quite-tiny-dfr/widgets/`:
+
+- **`cpu_temp.sh`** — prints the CPU/SoC temperature as color-coded JSON:
+  green below 70 °C, yellow from 70 °C, red from 85 °C. It reads the
+  `x86_pkg_temp` thermal zone when present (Intel), and falls back to the
+  hottest thermal zone otherwise (e.g. Apple Silicon). Use it with:
+
+  ```toml
+  { Command = "sh /usr/share/not-quite-tiny-dfr/widgets/cpu_temp.sh", Interval = 2, Stretch = 2 }
+  ```
 
 ## Scrollable layers
 
