@@ -29,3 +29,4 @@ rand = "0.8"
 freedesktop-icons = "0.4.0"
 chrono = { version = "0.4", features = ["unstable-locales"] }
 udev = "0.9"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png"] }

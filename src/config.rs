@@ -1,5 +1,5 @@
 use crate::style::{build_font, Color, Style, StyleProxy};
-use crate::widget::WidgetSpec;
+use crate::widget::Widgets;
 use crate::FunctionLayer;
 use cairo::{Context, Format, ImageSurface};
 use input_linux::Key;
@@ -237,6 +237,26 @@ pub struct ButtonConfig {
     // Text/Icon/etc. when set.
     pub command: Option<String>,
     pub interval: Option<f64>,
+    // A slider widget (get+set required): `slider_get` prints the current
+    // value (0-100, optionally followed by "muted") and is polled every
+    // `interval` seconds; `slider_set` runs with `{}` replaced by the new
+    // value when the slider is moved. `slider_mute` (optional) runs with `{}`
+    // replaced by "toggle" when the expanded slider's icon is tapped, or "0"
+    // when a drag unmutes. Collapsed it shows `icon` at `stretch` slots;
+    // tapping expands it to `slider_stretch` slots until it idles.
+    // `slider_mute_icon` (optional) replaces `icon` while the control is muted;
+    // `slider_low_icon` (optional) replaces `icon` while the value is below 50.
+    pub slider_get: Option<String>,
+    pub slider_set: Option<String>,
+    pub slider_mute: Option<String>,
+    pub slider_mute_icon: Option<String>,
+    pub slider_low_icon: Option<String>,
+    pub slider_stretch: Option<usize>,
+    // A media widget: shows transport controls (previous / play-pause / next)
+    // that, while a player is running, join into a panel backed by the album
+    // cover with the track title and artist. Driven by playerctl (MPRIS); taps
+    // control the active player. Spans `stretch` slots.
+    pub media: Option<bool>,
 }
 
 /// The stock Esc + F1-F12 primary layer, used when the config sets no
@@ -321,6 +341,13 @@ fn esc_button() -> ButtonConfig {
         text_color: None,
         command: None,
         interval: None,
+        slider_get: None,
+        slider_set: None,
+        slider_mute: None,
+        slider_mute_icon: None,
+        slider_low_icon: None,
+        slider_stretch: None,
+        media: None,
     }
 }
 
@@ -358,9 +385,26 @@ fn error_layer(message: &str) -> FunctionLayer {
             text_color: None,
             command: None,
             interval: None,
+            slider_get: None,
+            slider_set: None,
+            slider_mute: None,
+            slider_mute_icon: None,
+            slider_low_icon: None,
+            slider_stretch: None,
+            media: None,
         },
     ];
-    FunctionLayer::with_config(keys, &mut Vec::new(), &mut 0, 48, 0, true, true, true, true)
+    FunctionLayer::with_config(
+        keys,
+        &mut Widgets::default(),
+        &mut 0,
+        48,
+        0,
+        true,
+        true,
+        true,
+        true,
+    )
 }
 
 /// Resolve a background image path: absolute paths are used as-is; relative ones
@@ -453,7 +497,7 @@ fn load_config(
     override_paths: &[PathBuf],
     width: u16,
     height: u16,
-) -> (Config, Vec<FunctionLayer>, Vec<WidgetSpec>) {
+) -> (Config, Vec<FunctionLayer>, Widgets) {
     let mut base = toml::from_str::<ConfigProxy>(&read_to_string(BASE_CFG_PATH).unwrap()).unwrap();
     let mut config_error: Option<String> = None;
     for path in override_paths {
@@ -491,7 +535,7 @@ fn load_config(
     // Default icon size for buttons that don't set their own IconWidth/Height.
     let default_icon_size = style.icon_size.round() as i32;
     // Command widgets found while building the layers, with unique ids.
-    let mut widgets = Vec::new();
+    let mut widgets = Widgets::default();
     let mut next_id = 0;
     // The freeform Layers list wins; PrimaryLayerKeys/MediaLayerKeys
     // (with MediaLayerDefault ordering) are the two-layer fallback.
@@ -668,7 +712,7 @@ impl ConfigManager {
             height,
         }
     }
-    pub fn load_config(&self) -> (Config, Vec<FunctionLayer>, Vec<WidgetSpec>) {
+    pub fn load_config(&self) -> (Config, Vec<FunctionLayer>, Widgets) {
         load_config(&self.cfg_paths, self.width, self.height)
     }
     /// Add a higher-precedence override layer (and start watching it) after
@@ -685,7 +729,7 @@ impl ConfigManager {
         &mut self,
         cfg: &mut Config,
         layers: &mut Vec<FunctionLayer>,
-    ) -> Option<Vec<WidgetSpec>> {
+    ) -> Option<Widgets> {
         // Pick up directories that did not exist when we last tried to watch
         // them (e.g. the user just created ~/.config/not-quite-tiny-dfr/).
         let mut newly_armed = false;
@@ -718,7 +762,7 @@ impl ConfigManager {
         cfg: &mut Config,
         layers: &mut Vec<FunctionLayer>,
         evts: Result<Vec<InotifyEvent>, Errno>,
-    ) -> Option<Vec<WidgetSpec>> {
+    ) -> Option<Widgets> {
         let evts = match evts {
             Ok(evts) => evts,
             Err(_) => return None,

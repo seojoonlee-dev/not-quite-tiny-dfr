@@ -69,6 +69,17 @@
 #     [ { Text = "esc", Action = "Esc", Pinned = true }, { Time = "%H:%M" }, { CpuTemp = "celsius", Stretch = 2 } ],
 # ]
 
+# A slider widget (SliderGet prints 0-100, optionally "NN muted"; SliderSet
+# runs with {} = new value; SliderMute runs with {} = "0" when a drag unmutes;
+# SliderMuteIcon replaces the icon while muted; SliderLowIcon replaces it below
+# 50; tap expands from Stretch to SliderStretch slots):
+# { Icon = "volume_up", SliderGet = "wpctl get-volume @DEFAULT_AUDIO_SINK@ | awk '{print int($2*100) ($3==\"[MUTED]\" ? \" muted\" : \"\")}'", SliderSet = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ {}%", SliderMute = "wpctl set-mute @DEFAULT_AUDIO_SINK@ {}", SliderMuteIcon = "volume_off", SliderLowIcon = "volume_down", SliderStretch = 2 },
+
+# A media widget (playerctl/MPRIS): transport controls that, while a player is
+# running, join into a panel backed by the album cover with the track title and
+# artist. Taps control the active player. Spans Stretch slots:
+# { Media = true, Stretch = 6 },
+
 # [Style]
 # Background = "#000000"
 # BackgroundImage = ""

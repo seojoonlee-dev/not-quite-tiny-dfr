@@ -47,6 +47,7 @@ use udev::MonitorBuilder;
 mod backlight;
 mod config;
 mod display;
+mod media;
 mod pixel_shift;
 mod style;
 mod user;
@@ -57,12 +58,82 @@ use backlight::BacklightManager;
 use config::{ButtonAction, ButtonConfig, Config};
 use display::DrmBackend;
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_HEIGHT_PX, PIXEL_SHIFT_WIDTH_PX};
+use media::{MediaStatus, MEDIA_STATE};
 use style::Color;
-use widget::{WidgetRuntime, WidgetSpec};
+use widget::{SliderSpec, WidgetRuntime, WidgetSpec, Widgets};
 
 const DEFAULT_ICON_SIZE: i32 = 48;
 /// Gap in px between the battery icon and its percentage text ("both" mode).
 const BATTERY_ICON_TEXT_GAP: f64 = 8.0;
+/// How long an expanded slider sits untouched before collapsing back.
+const SLIDER_COLLAPSE: Duration = Duration::from_secs(3);
+/// Horizontal padding inside a slider button (around the icon and track), and
+/// the track's height/corner rounding.
+const SLIDER_PAD: f64 = 14.0;
+/// Extra breathing room at the expanded slider's outer left/right edges, so the
+/// icon and track don't hug the button edges.
+const SLIDER_EDGE_PAD: f64 = 16.0;
+/// Media widget: outer edge padding, and the padding around each transport icon
+/// inside its tap zone.
+const MEDIA_PAD: f64 = 16.0;
+const MEDIA_ICON_PAD: f64 = 10.0;
+/// How much the album cover is darkened (black overlay alpha) so the white
+/// icons and track text stay legible on top.
+const MEDIA_COVER_DARKEN: f64 = 0.45;
+/// Vertical padding kept above the title and below the artist, so the track
+/// text never touches the panel's top/bottom edges. The title and artist are
+/// then sized to fill the remaining band height.
+const MEDIA_TEXT_VPAD: f64 = 3.0;
+/// Extra space between the title and artist lines (added to their natural line
+/// boxes; negative tightens them).
+const MEDIA_TEXT_GAP: f64 = -1.0;
+const SLIDER_TRACK_HEIGHT: f64 = 6.0;
+/// Radius of the slider's drag handle.
+const SLIDER_KNOB_RADIUS: f64 = 10.0;
+/// Slots an expanded slider spans when the config sets no SliderStretch.
+const DEFAULT_SLIDER_STRETCH: usize = 2;
+/// Below this value a slider shows its `low_icon` (if configured) instead of
+/// its default icon.
+const SLIDER_LOW_THRESHOLD: i32 = 50;
+/// Duration of the expand/collapse width animation. Matches Caelestia's
+/// `expressiveDefaultSpatial` motion token (500 ms).
+const SLIDER_ANIM: Duration = Duration::from_millis(500);
+
+/// Caelestia's `expressiveDefaultSpatial` easing, as a CSS cubic Bézier: an
+/// exaggerated spring that overshoots the target (control-point y of 1.21)
+/// before settling. The expanding slider springs well past its width, then
+/// relaxes back.
+fn ease_expand(t: f64) -> f64 {
+    cubic_bezier(t, 0.38, 1.21, 0.22, 1.0)
+}
+
+/// Evaluate a CSS-style cubic Bézier easing curve at time `t` (0..1). The
+/// control points are (x1,y1) and (x2,y2) with endpoints fixed at (0,0) and
+/// (1,1); Newton's method inverts x(u) = t, then y(u) is read off.
+fn cubic_bezier(t: f64, x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
+    // Bézier coordinate with p0 = 0, p3 = 1, and its derivative in u.
+    let value = |a1: f64, a2: f64, u: f64| {
+        let v = 1.0 - u;
+        3.0 * v * v * u * a1 + 3.0 * v * u * u * a2 + u * u * u
+    };
+    let slope = |a1: f64, a2: f64, u: f64| {
+        let v = 1.0 - u;
+        3.0 * v * v * a1 + 6.0 * v * u * (a2 - a1) + 3.0 * u * u * (1.0 - a2)
+    };
+    let mut u = t;
+    for _ in 0..8 {
+        let dx = value(x1, x2, u) - t;
+        if dx.abs() < 1e-6 {
+            break;
+        }
+        let d = slope(x1, x2, u);
+        if d.abs() < 1e-6 {
+            break;
+        }
+        u -= dx / d;
+    }
+    value(y1, y2, u)
+}
 
 /// The user's `~/.config/not-quite-tiny-dfr` directory, if a target user was resolved.
 /// Icons named in the config are looked up here first. Set once — either at
@@ -181,6 +252,9 @@ enum TouchState {
         last_t_us: u64,
         velocity: f64,
     },
+    /// Dragging an expanded slider: the finger owns the gesture (no scroll or
+    /// swipe can start from it) and its x maps straight to the value.
+    SliderDrag { layer: usize, btn: usize },
 }
 
 impl TouchState {
@@ -191,6 +265,7 @@ impl TouchState {
             TouchState::Pending { .. } => "pending",
             TouchState::Scroll { .. } => "scroll",
             TouchState::LayerSwipe { .. } => "swipe",
+            TouchState::SliderDrag { .. } => "slider",
         }
     }
 }
@@ -241,6 +316,59 @@ impl BatteryIconMode {
     }
 }
 
+/// State of an interactive slider button. Collapsed it is an icon; tapping it
+/// expands it into a draggable track until it idles (see SLIDER_COLLAPSE).
+struct SliderState {
+    /// Id shared with the widget runtime: the get command's poll results
+    /// arrive under it, and set commands are queued against it.
+    id: usize,
+    icon: Option<Handle>,
+    /// Icon shown in place of `icon` while `muted`; falls back to `icon`.
+    muted_icon: Option<Handle>,
+    /// Icon shown in place of `icon` while the value is below
+    /// `SLIDER_LOW_THRESHOLD`; falls back to `icon`.
+    low_icon: Option<Handle>,
+    /// Current value, 0-100.
+    value: i32,
+    /// Whether the backing control reports itself muted (swaps in the mute
+    /// icon).
+    muted: bool,
+    /// Whether a SliderMute command is configured (enables the drag-unmute and
+    /// auto-mute-at-0 behaviors).
+    has_mute: bool,
+    expanded: bool,
+    /// Slots occupied collapsed (the config's Stretch) and expanded.
+    base_stretch: usize,
+    expanded_stretch: usize,
+    /// Last expand/drag, for the auto-collapse timer.
+    last_interaction: Instant,
+    /// Start of the width animation toward the current `expanded` state;
+    /// `None` once settled. The layout switches instantly (hit testing uses
+    /// the target); this only drives the drawn width's transition.
+    anim: Option<Instant>,
+}
+
+impl SliderState {
+    /// Eased expand progress: 0 fully collapsed, 1 fully expanded. Shares the
+    /// clock and curve of `slider_anim` so the icon glides between its
+    /// collapsed (centered) and expanded (left-cap) positions in step with the
+    /// width, instead of teleporting when the animation ends.
+    fn expand_progress(&self) -> f64 {
+        let settled = if self.expanded { 1.0 } else { 0.0 };
+        let Some(t0) = self.anim else { return settled };
+        let t = t0.elapsed().as_secs_f64() / SLIDER_ANIM.as_secs_f64();
+        if t >= 1.0 {
+            return settled;
+        }
+        let eased = ease_expand(t);
+        if self.expanded {
+            eased
+        } else {
+            1.0 - eased
+        }
+    }
+}
+
 enum ButtonImage {
     Text(String),
     Svg(Handle),
@@ -248,6 +376,8 @@ enum ButtonImage {
     Time(Vec<ChronoItem<'static>>, Locale),
     Battery(BatteryIconMode, BatteryImages),
     CpuTemp(CpuTempUnit),
+    Slider(SliderState),
+    Media(MediaState),
     /// A command widget: `text`/`color` are updated from its script's output.
     Command {
         id: usize,
@@ -255,6 +385,38 @@ enum ButtonImage {
         color: Option<Color>,
     },
     Spacer,
+}
+
+/// The three transport controls of a Media widget, left to right. Also the
+/// tap-zone identity: the widget's width is split into three equal columns.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MediaZone {
+    Prev,
+    PlayPause,
+    Next,
+}
+
+impl MediaZone {
+    /// The playerctl verb this control runs.
+    fn verb(self) -> &'static str {
+        match self {
+            MediaZone::Prev => "previous",
+            MediaZone::PlayPause => "play-pause",
+            MediaZone::Next => "next",
+        }
+    }
+}
+
+/// A media widget: its own transport icons, plus a press highlight. The live
+/// playback status, track text, and album art come from the global
+/// `MEDIA_STATE` (see the `media` module), not from here.
+struct MediaState {
+    prev_icon: Option<Handle>,
+    play_icon: Option<Handle>,
+    pause_icon: Option<Handle>,
+    next_icon: Option<Handle>,
+    /// The zone under a finger right now, drawn brighter for tap feedback.
+    pressed: Option<MediaZone>,
 }
 
 struct Button {
@@ -272,20 +434,45 @@ struct Button {
 
 /// Copy the latest widget outputs into their buttons, marking changed ones for
 /// redraw. Cheap enough to call every loop iteration (the results map is small).
-fn apply_widget_results(layers: &mut [FunctionLayer], rt: &WidgetRuntime) {
+/// `dragging` lists slider widget ids a finger currently owns; their polled
+/// values are skipped so a stale get result can't fight the finger.
+fn apply_widget_results(layers: &mut [FunctionLayer], rt: &WidgetRuntime, dragging: &[usize]) {
     let map = rt.results();
     for layer in layers.iter_mut() {
         for (_, button) in layer.buttons.iter_mut() {
-            if let ButtonImage::Command { id, text, color } = &mut button.image {
-                match map.get(id) {
+            match &mut button.image {
+                ButtonImage::Command { id, text, color } => match map.get(id) {
                     Some(out) if *text != out.text || *color != out.color => {
                         *text = out.text.clone();
                         *color = out.color;
                     }
                     _ => continue,
+                },
+                ButtonImage::Slider(s) => {
+                    // Skip while a finger owns the value, and for a beat after
+                    // a set: an in-flight poll may still carry the pre-set
+                    // reading, and applying it would snap the fill backwards.
+                    if dragging.contains(&s.id) || rt.recently_set(s.id) {
+                        continue;
+                    }
+                    // Protocol: a number 0-100, optionally followed by the
+                    // word "muted" (e.g. "45 muted").
+                    let Some(out) = map.get(&s.id) else { continue };
+                    let mut parts = out.text.split_whitespace();
+                    let value = parts
+                        .next()
+                        .and_then(|t| t.parse::<f64>().ok())
+                        .map(|v| (v.round() as i32).clamp(0, 100));
+                    let muted = parts.next().is_some_and(|t| t.eq_ignore_ascii_case("muted"));
+                    match value {
+                        Some(v) if v != s.value || muted != s.muted => {
+                            s.value = v;
+                            s.muted = muted;
+                        }
+                        _ => continue,
+                    }
                 }
-            } else {
-                continue;
+                _ => continue,
             }
             button.changed = true;
         }
@@ -307,6 +494,28 @@ fn set_background_source(c: &Context, style: &style::Style, shift: (f64, f64)) {
     } else {
         style.background.set_source(c);
     }
+}
+
+/// Fill a horizontal capsule (a rectangle with fully rounded ends).
+fn capsule(c: &Context, x: f64, y: f64, w: f64, h: f64) {
+    let r = (h / 2.0).min(w / 2.0);
+    c.new_sub_path();
+    c.arc(x + w - r, y + r, r, (-90.0f64).to_radians(), (90.0f64).to_radians());
+    c.arc(x + r, y + r, r, (90.0f64).to_radians(), (270.0f64).to_radians());
+    c.close_path();
+    c.fill().unwrap();
+}
+
+/// The track region of a slider button, given the button's on-screen rect:
+/// everything right of the icon cap, inset by the slider padding.
+fn slider_track_rect(button: &Button, left: f64, width: f64) -> (f64, f64) {
+    let cap = match &button.image {
+        ButtonImage::Slider(s) if s.icon.is_some() => {
+            SLIDER_EDGE_PAD + SLIDER_PAD + button.icon_width + SLIDER_PAD
+        }
+        _ => SLIDER_EDGE_PAD + SLIDER_PAD,
+    };
+    (left + cap, width - cap - SLIDER_PAD - SLIDER_EDGE_PAD)
 }
 
 /// Lay `text` out in the bar font. Pango shapes with per-glyph font fallback
@@ -690,6 +899,67 @@ impl Button {
         }
     }
 
+    fn new_slider(
+        id: usize,
+        icon: Option<&str>,
+        muted_icon: Option<&str>,
+        low_icon: Option<&str>,
+        theme: Option<impl AsRef<str>>,
+        base_stretch: usize,
+        expanded_stretch: usize,
+        icon_size: i32,
+        has_mute: bool,
+    ) -> Button {
+        let icon = icon.map(|i| Self::load_battery_image(i, theme.as_ref()));
+        let muted_icon = muted_icon.map(|i| Self::load_battery_image(i, theme.as_ref()));
+        let low_icon = low_icon.map(|i| Self::load_battery_image(i, theme.as_ref()));
+        Button {
+            action: vec![],
+            active: false,
+            changed: false,
+            image: ButtonImage::Slider(SliderState {
+                id,
+                icon,
+                muted_icon,
+                low_icon,
+                value: 0,
+                muted: false,
+                has_mute,
+                expanded: false,
+                base_stretch,
+                expanded_stretch: expanded_stretch.max(base_stretch),
+                last_interaction: Instant::now(),
+                anim: None,
+            }),
+            icon_width: icon_size as f64,
+            icon_height: icon_size as f64,
+            bg_color: None,
+            bg_color_active: None,
+            text_color: None,
+        }
+    }
+
+    fn new_media(theme: Option<impl AsRef<str>>, icon_size: i32) -> Button {
+        let load = |name| Some(Self::load_battery_image(name, theme.as_ref()));
+        Button {
+            action: vec![],
+            active: false,
+            changed: false,
+            image: ButtonImage::Media(MediaState {
+                prev_icon: load("fast_rewind"),
+                play_icon: load("play_arrow"),
+                pause_icon: load("pause"),
+                next_icon: load("fast_forward"),
+                pressed: None,
+            }),
+            icon_width: icon_size as f64,
+            icon_height: icon_size as f64,
+            bg_color: None,
+            bg_color_active: None,
+            text_color: None,
+        }
+    }
+
     fn new_cpu_temp(action: Vec<ButtonAction>, unit: &str) -> Button {
         // An unknown unit is only worth a journal line, not a daemon abort:
         // this also runs on live config reloads.
@@ -859,10 +1129,95 @@ impl Button {
                 let layout = text_layout(c, style, &cpu_temp_text(*unit));
                 show_layout_centered(c, &layout, height, button_left_edge, button_width, y_shift);
             }
+            ButtonImage::Slider(s) => {
+                let color = self.text_color.unwrap_or(style.text_color);
+                // The icon reflects the control's state: the mute symbol while
+                // muted, the low symbol below the threshold, else the default.
+                // Each falls back to the default icon when not configured.
+                let icon = if s.muted {
+                    s.muted_icon.as_ref().or(s.icon.as_ref())
+                } else if s.value < SLIDER_LOW_THRESHOLD {
+                    s.low_icon.as_ref().or(s.icon.as_ref())
+                } else {
+                    s.icon.as_ref()
+                };
+                // Icon x glides between centered (collapsed) and the left cap
+                // (expanded) with the expand progress, so it tracks the width
+                // instead of snapping when the animation ends.
+                let p = s.expand_progress();
+                let centered = button_left_edge + (button_width as f64 - self.icon_width) / 2.0;
+                let capped = button_left_edge + SLIDER_EDGE_PAD + SLIDER_PAD;
+                let icon_x = (centered + (capped - centered) * p).round();
+                let icon_y = y_shift + ((height as f64 - self.icon_height) / 2.0).round();
+                let draw_icon = |c: &Context| {
+                    if let Some(svg) = icon {
+                        svg.render_document(
+                            c,
+                            &Rectangle::new(icon_x, icon_y, self.icon_width, self.icon_height),
+                        )
+                        .unwrap();
+                    }
+                };
+                // The expanded look also plays through the collapse animation,
+                // so the track shrinks shut instead of vanishing.
+                if !s.expanded && s.anim.is_none() {
+                    // Collapsed: just the icon (a plain button look).
+                    draw_icon(c);
+                    return;
+                }
+                // Expanded: icon cap on the left, then the track with its
+                // fill and handle at the current value.
+                draw_icon(c);
+                let (track_left, track_width) =
+                    slider_track_rect(self, button_left_edge, button_width as f64);
+                if track_width <= 0.0 {
+                    return;
+                }
+                let track_y = y_shift + ((height as f64 - SLIDER_TRACK_HEIGHT) / 2.0).round();
+                // The track (but not the icon) fades out as the slider closes,
+                // so the bar dissolves instead of just shrinking; opening stays
+                // fully opaque.
+                let track_alpha = if s.expanded { 1.0 } else { p };
+                Color {
+                    a: color.a * 0.25 * track_alpha,
+                    ..color
+                }
+                .set_source(c);
+                capsule(c, track_left, track_y, track_width, SLIDER_TRACK_HEIGHT);
+                Color {
+                    a: color.a * track_alpha,
+                    ..color
+                }
+                .set_source(c);
+                if track_width <= 2.0 * SLIDER_KNOB_RADIUS {
+                    return; // too narrow (mid-animation) for a handle yet
+                }
+                // Handle centered on the value, kept inside the track; the
+                // fill runs up to it.
+                let cx = (track_left + track_width * s.value as f64 / 100.0).clamp(
+                    track_left + SLIDER_KNOB_RADIUS,
+                    track_left + track_width - SLIDER_KNOB_RADIUS,
+                );
+                let fill = cx - track_left;
+                if fill > 0.0 {
+                    capsule(c, track_left, track_y, fill, SLIDER_TRACK_HEIGHT);
+                }
+                c.arc(
+                    cx,
+                    y_shift + height as f64 / 2.0,
+                    SLIDER_KNOB_RADIUS,
+                    0.0,
+                    (360.0f64).to_radians(),
+                );
+                c.fill().unwrap();
+            }
             ButtonImage::Command { text, .. } => {
                 let layout = text_layout(c, style, text);
                 show_layout_centered(c, &layout, height, button_left_edge, button_width, y_shift);
             }
+            // The media widget is painted in full by paint_media (it needs the
+            // rounded-rect geometry), so it never reaches this content pass.
+            ButtonImage::Media(_) => (),
             ButtonImage::Spacer => (),
         }
     }
@@ -941,6 +1296,222 @@ impl Button {
     }
 }
 
+/// Append a rounded-rectangle sub-path spanning `[left_edge, left_edge+width]`
+/// across the button band `[bot, top]`. The corner centers are inset by the
+/// radius so the rounding stays inside the short panel.
+fn rounded_rect_path(c: &Context, left_edge: f64, width: f64, radius: f64, bot: f64, top: f64) {
+    c.new_sub_path();
+    let left = left_edge + radius;
+    let right = (left_edge + width.ceil()) - radius;
+    let cy_top = bot + radius;
+    let cy_bot = top - radius;
+    c.arc(right, cy_top, radius, (-90.0f64).to_radians(), 0.0);
+    c.arc(right, cy_bot, radius, 0.0, (90.0f64).to_radians());
+    c.arc(left, cy_bot, radius, (90.0f64).to_radians(), (180.0f64).to_radians());
+    c.arc(left, cy_top, radius, (180.0f64).to_radians(), (270.0f64).to_radians());
+    c.close_path();
+}
+
+/// The transport-control layout for a media panel: `(first_zone_left,
+/// zone_width)`. Active (now-playing) clusters the three controls on the right
+/// so the album text has the left; idle spreads them across the full width.
+/// Shared by rendering and hit-testing so taps land on the drawn icons.
+fn media_zone_geom(active: bool, left_edge: f64, button_width: f64, icon_w: f64) -> (f64, f64) {
+    if active {
+        let zone_w = icon_w + MEDIA_ICON_PAD * 2.0;
+        let cluster = (zone_w * 3.0).min(button_width);
+        (left_edge + button_width - cluster - MEDIA_PAD, cluster / 3.0)
+    } else {
+        (left_edge, button_width / 3.0)
+    }
+}
+
+/// Which transport zone a touch at panel-relative x falls in, or `None` for the
+/// inert text area of an active panel.
+fn media_zone_at(active: bool, x: f64, left_edge: f64, button_width: f64, icon_w: f64) -> Option<MediaZone> {
+    let (first, zone_w) = media_zone_geom(active, left_edge, button_width, icon_w);
+    if zone_w <= 0.0 || x < first || x >= first + zone_w * 3.0 {
+        return None;
+    }
+    Some(match ((x - first) / zone_w) as usize {
+        0 => MediaZone::Prev,
+        1 => MediaZone::PlayPause,
+        _ => MediaZone::Next,
+    })
+}
+
+/// Build (and thread-locally cache) the cairo surface for the current album
+/// art. Cairo surfaces are not `Send`, so the raw bytes are published by the
+/// poller and wrapped here on the render thread, rebuilt only when the media
+/// generation moves.
+fn media_art_surface(info: &media::MediaInfo) -> Option<ImageSurface> {
+    thread_local! {
+        static CACHE: std::cell::RefCell<Option<(u64, Option<ImageSurface>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache.as_ref().map(|(g, _)| *g) != Some(info.generation) {
+            let built = info.art.as_ref().and_then(|a| {
+                ImageSurface::create_for_data(a.data.clone(), Format::ARgb32, a.width, a.height, a.stride).ok()
+            });
+            *cache = Some((info.generation, built));
+        }
+        cache.as_ref().and_then(|(_, s)| s.clone())
+    })
+}
+
+/// Paint the media widget across its full span: a now-playing panel (album
+/// cover, darkened, with the track text and transport controls) while a player
+/// is active, or an idle transport row otherwise.
+#[allow(clippy::too_many_arguments)]
+fn paint_media(
+    c: &Context,
+    m: &MediaState,
+    style: &style::Style,
+    text_color: Color,
+    icon_w: f64,
+    left_edge: f64,
+    button_width: f64,
+    radius: f64,
+    bot: f64,
+    top: f64,
+    height: i32,
+    y_shift: f64,
+) {
+    let info = MEDIA_STATE.lock().unwrap();
+    let active = info.is_active();
+
+    if active {
+        // Panel background: a neutral dark base, the album cover on top
+        // (cover-fit, clipped), and -- only when there IS art -- a darkening
+        // pass so the white text/icons stay legible. Without art (e.g. a
+        // browser that publishes no thumbnail) the base is left as a plain
+        // dark-gray panel rather than being darkened to near-black.
+        c.save().unwrap();
+        rounded_rect_path(c, left_edge, button_width, radius, bot, top);
+        c.clip();
+        Color { r: 0.14, g: 0.14, b: 0.14, a: 1.0 }.set_source(c);
+        c.paint().unwrap();
+        let has_art = if let Some(surface) = media_art_surface(&info) {
+            let (iw, ih) = (surface.width() as f64, surface.height() as f64);
+            let (pw, ph) = (button_width, top - bot);
+            let scale = (pw / iw).max(ph / ih);
+            c.save().unwrap();
+            c.translate(left_edge + pw / 2.0, bot + ph / 2.0);
+            c.scale(scale, scale);
+            c.set_source_surface(&surface, -iw / 2.0, -ih / 2.0).unwrap();
+            c.source().set_extend(cairo::Extend::Pad);
+            c.paint().unwrap();
+            c.restore().unwrap();
+            true
+        } else {
+            false
+        };
+        if has_art {
+            Color { r: 0.0, g: 0.0, b: 0.0, a: MEDIA_COVER_DARKEN }.set_source(c);
+            c.paint().unwrap();
+        }
+        c.restore().unwrap();
+
+        // Track text on the left, up to the control cluster.
+        let (first, zone_w) = media_zone_geom(true, left_edge, button_width, icon_w);
+        let text_left = left_edge + MEDIA_PAD;
+        let text_width = (first - text_left - MEDIA_PAD).max(0.0);
+        if text_width > 8.0 {
+            draw_media_text(c, style, text_color, &info.title, &info.artist, text_left, text_width, bot, top);
+        }
+        draw_media_icons(c, m, &info, icon_w, first, zone_w, height, y_shift);
+    } else {
+        // Idle: three transport buttons spread across the full width.
+        let (first, zone_w) = media_zone_geom(false, left_edge, button_width, icon_w);
+        for (k, zone) in [MediaZone::Prev, MediaZone::PlayPause, MediaZone::Next].into_iter().enumerate() {
+            let zleft = first + zone_w * k as f64;
+            let inset = MEDIA_ICON_PAD.min(zone_w / 4.0);
+            let fill = if m.pressed == Some(zone) {
+                style.button_color_active
+            } else {
+                style.button_color
+            };
+            fill.set_source(c);
+            rounded_rect_path(c, zleft + inset, zone_w - inset * 2.0, radius, bot, top);
+            c.fill().unwrap();
+        }
+        draw_media_icons(c, m, &info, icon_w, first, zone_w, height, y_shift);
+    }
+}
+
+/// Draw the three transport icons centered in their zones, play/pause tracking
+/// the live status.
+#[allow(clippy::too_many_arguments)]
+fn draw_media_icons(
+    c: &Context,
+    m: &MediaState,
+    info: &media::MediaInfo,
+    icon_w: f64,
+    first_zone_left: f64,
+    zone_w: f64,
+    height: i32,
+    y_shift: f64,
+) {
+    let play = if info.status == MediaStatus::Playing {
+        m.pause_icon.as_ref()
+    } else {
+        m.play_icon.as_ref()
+    };
+    let icons = [m.prev_icon.as_ref(), play, m.next_icon.as_ref()];
+    for (k, svg) in icons.into_iter().enumerate() {
+        let Some(svg) = svg else { continue };
+        let center = first_zone_left + zone_w * (k as f64 + 0.5);
+        let x = (center - icon_w / 2.0).round();
+        let y = (y_shift + (height as f64 - icon_w) / 2.0).round();
+        svg.render_document(c, &Rectangle::new(x, y, icon_w, icon_w)).unwrap();
+    }
+}
+
+/// Draw the two-line title/artist block, left-aligned and ellipsized to fit.
+/// The lines are sized to the band height (inside `MEDIA_TEXT_VPAD`), so they
+/// stay clear of the top/bottom edges regardless of the configured FontSize.
+#[allow(clippy::too_many_arguments)]
+fn draw_media_text(
+    c: &Context,
+    style: &style::Style,
+    color: Color,
+    title: &str,
+    artist: &str,
+    left: f64,
+    width: f64,
+    bot: f64,
+    top: f64,
+) {
+    let avail = (top - bot - MEDIA_TEXT_VPAD * 2.0).max(1.0);
+    let make = |text: &str, px: f64, bold: bool| {
+        let layout = pangocairo::functions::create_layout(c);
+        let mut font = style.font.clone();
+        font.set_absolute_size(px * pango::SCALE as f64);
+        font.set_weight(if bold { pango::Weight::Bold } else { pango::Weight::Normal });
+        layout.set_font_description(Some(&font));
+        layout.set_text(text);
+        layout.set_ellipsize(pango::EllipsizeMode::End);
+        layout.set_width((width * pango::SCALE as f64) as i32);
+        layout
+    };
+    let title_layout = make(title, avail * 0.50, true);
+    let artist_layout = make(artist, avail * 0.38, false);
+    let (_, th) = title_layout.pixel_size();
+    let (_, ah) = artist_layout.pixel_size();
+    let total = th as f64 + MEDIA_TEXT_GAP + ah as f64;
+    // Center the block in the band, but never above the top padding.
+    let mut y = ((bot + top) / 2.0 - total / 2.0).max(bot + MEDIA_TEXT_VPAD);
+    color.set_source(c);
+    c.move_to(left, y);
+    pangocairo::functions::show_layout(c, &title_layout);
+    y += th as f64 + MEDIA_TEXT_GAP;
+    Color { a: color.a * 0.8, ..color }.set_source(c);
+    c.move_to(left, y);
+    pangocairo::functions::show_layout(c, &artist_layout);
+}
+
 /// Paint one button (rounded-rect fill plus label/icon) at the given geometry.
 /// `radius` must already be capped against the button size.
 #[allow(clippy::too_many_arguments)]
@@ -957,6 +1528,25 @@ fn paint_button(
     height: i32,
     y_shift: f64,
 ) {
+    // The media widget draws its whole span (cover panel or idle row) itself,
+    // so it needs the full rounded-rect geometry rather than a single fill.
+    if let ButtonImage::Media(m) = &button.image {
+        paint_media(
+            c,
+            m,
+            style,
+            button.effective_text_color(style),
+            button.icon_width,
+            left_edge,
+            button_width,
+            radius,
+            bot,
+            top,
+            height,
+            y_shift,
+        );
+        return;
+    }
     let fill = if matches!(button.image, ButtonImage::Spacer) {
         None
     } else {
@@ -964,45 +1554,7 @@ fn paint_button(
     };
     if let Some(fill) = fill {
         fill.set_source(c);
-        // draw box with rounded corners
-        c.new_sub_path();
-        let left = left_edge + radius;
-        let right = (left_edge + button_width.ceil()) - radius;
-        // Inset the corner centers by the radius so the rounding stays
-        // inside the button band [bot, top]. Centering them on bot/top
-        // makes the corners overhang past the band -- off the top/bottom
-        // of the short panel -- leaving only the straight edges visible.
-        let cy_top = bot + radius;
-        let cy_bot = top - radius;
-        c.arc(
-            right,
-            cy_top,
-            radius,
-            (-90.0f64).to_radians(),
-            (0.0f64).to_radians(),
-        );
-        c.arc(
-            right,
-            cy_bot,
-            radius,
-            (0.0f64).to_radians(),
-            (90.0f64).to_radians(),
-        );
-        c.arc(
-            left,
-            cy_bot,
-            radius,
-            (90.0f64).to_radians(),
-            (180.0f64).to_radians(),
-        );
-        c.arc(
-            left,
-            cy_top,
-            radius,
-            (180.0f64).to_radians(),
-            (270.0f64).to_radians(),
-        );
-        c.close_path();
+        rounded_rect_path(c, left_edge, button_width, radius, bot, top);
         c.fill().unwrap();
     }
     button.effective_text_color(style).set_source(c);
@@ -1014,6 +1566,7 @@ pub struct FunctionLayer {
     displays_time: bool,
     displays_battery: bool,
     displays_cpu_temp: bool,
+    displays_media: bool,
     buttons: Vec<(usize, Button)>,
     virtual_button_count: usize,
     faster_refresh: bool,
@@ -1084,7 +1637,8 @@ fn rotate_touch_layers<K>(touches: &mut HashMap<K, TouchState>, n: usize, left: 
         match state {
             TouchState::Held { layer, .. }
             | TouchState::Pending { layer, .. }
-            | TouchState::Scroll { layer, .. } => {
+            | TouchState::Scroll { layer, .. }
+            | TouchState::SliderDrag { layer, .. } => {
                 *layer = if left {
                     (*layer + n - 1) % n
                 } else {
@@ -1196,6 +1750,193 @@ impl FunctionLayer {
         (width - edge - guard) + spacing
     }
 
+    /// Recompute the virtual slot indices after a slider expanded or
+    /// collapsed. Non-slider stretches are recovered from the current indices
+    /// (they never change); each slider contributes its current width.
+    fn relayout(&mut self) {
+        let old_count = self.virtual_button_count;
+        let stretches: Vec<usize> = (0..self.buttons.len())
+            .map(|i| {
+                let next = if i + 1 < self.buttons.len() {
+                    self.buttons[i + 1].0
+                } else {
+                    old_count
+                };
+                match &self.buttons[i].1.image {
+                    ButtonImage::Slider(s) if s.expanded => s.expanded_stretch,
+                    ButtonImage::Slider(s) => s.base_stretch,
+                    _ => next - self.buttons[i].0,
+                }
+            })
+            .collect();
+        let mut acc = 0;
+        for (i, (idx, _)) in self.buttons.iter_mut().enumerate() {
+            *idx = acc;
+            acc += stretches[i];
+        }
+        self.virtual_button_count = acc;
+        self.pinned_slots = if self.pinned_count == 0 {
+            0
+        } else if self.pinned_count < self.buttons.len() {
+            self.buttons[self.pinned_count].0
+        } else {
+            acc
+        };
+    }
+
+    /// Expand or collapse a slider button, returning whether anything changed
+    /// (the caller then forces a complete redraw: the layout shifted).
+    fn set_slider_expanded(&mut self, btn: usize, expanded: bool) -> bool {
+        let Some((_, button)) = self.buttons.get_mut(btn) else {
+            return false;
+        };
+        let ButtonImage::Slider(s) = &mut button.image else {
+            return false;
+        };
+        if s.expanded == expanded {
+            return false;
+        }
+        s.expanded = expanded;
+        s.last_interaction = Instant::now();
+        s.anim = Some(Instant::now());
+        button.changed = true;
+        self.relayout();
+        true
+    }
+
+    /// The in-flight expand/collapse animation, as (button index, how many
+    /// slots the drawn width lags behind the laid-out width). Positive while
+    /// expanding (drawn narrower than the layout), negative while collapsing;
+    /// the overshoot makes it dip past zero before settling.
+    fn slider_anim(&self) -> Option<(usize, f64)> {
+        for (i, (_, b)) in self.buttons.iter().enumerate() {
+            if let ButtonImage::Slider(s) = &b.image {
+                let Some(t0) = s.anim else { continue };
+                let t = t0.elapsed().as_secs_f64() / SLIDER_ANIM.as_secs_f64();
+                if t >= 1.0 {
+                    continue; // settled; the main loop clears `anim`
+                }
+                let delta = (s.expanded_stretch - s.base_stretch) as f64;
+                let remaining = delta * (1.0 - ease_expand(t));
+                return Some((i, if s.expanded { remaining } else { -remaining }));
+            }
+        }
+        None
+    }
+
+    fn slider_expanded(&self, btn: usize) -> bool {
+        match self.buttons.get(btn) {
+            Some((_, b)) => matches!(&b.image, ButtonImage::Slider(s) if s.expanded),
+            None => false,
+        }
+    }
+
+    /// On-screen left edge and width of button `i`, mirroring the renderer's
+    /// geometry (including the band's current scroll offset).
+    fn button_screen_rect(&self, i: usize, bar_width: f64, style: &style::Style) -> Option<(f64, f64)> {
+        let start = self.buttons.get(i)?.0;
+        let end = if i + 1 < self.buttons.len() {
+            self.buttons[i + 1].0
+        } else {
+            self.virtual_button_count
+        };
+        let slots = (end - start) as f64;
+        if let Some(geo) = self.scroll_geometry(bar_width, style) {
+            let w = slots * geo.pitch - (geo.pitch - geo.slot_width);
+            if start < self.pinned_slots {
+                Some((style.edge_padding + start as f64 * geo.pitch, w))
+            } else {
+                let pos = (start - self.pinned_slots) as f64 * geo.pitch - self.scroll_offset;
+                let pos = if self.scroll_loop {
+                    pos.rem_euclid(geo.period)
+                } else {
+                    pos
+                };
+                Some((geo.region_left + pos, w))
+            }
+        } else {
+            let spacing = style.button_spacing;
+            let usable = bar_width - 2.0 * style.edge_padding;
+            let vbw = (usable - spacing * (self.virtual_button_count - 1) as f64)
+                / self.virtual_button_count as f64;
+            let w = slots * vbw + (slots - 1.0) * spacing;
+            Some((style.edge_padding + start as f64 * (vbw + spacing), w))
+        }
+    }
+
+    /// Map a touch x on slider `btn` to a value, or `None` while the finger is
+    /// over the icon cap left of the track (so a tap there changes nothing).
+    /// Map a touch x to a slider value. Past the right end clamps to 100. Left
+    /// of the track is the icon cap: a drag (`clamp_low`) runs it down to 0 --
+    /// mirroring how the right end reaches 100 -- while a plain touch there
+    /// stays inert (`None`) so tapping the icon changes nothing.
+    fn slider_value_from_x(
+        &self,
+        btn: usize,
+        x: f64,
+        bar_width: f64,
+        style: &style::Style,
+        clamp_low: bool,
+    ) -> Option<i32> {
+        let (left, width) = self.button_screen_rect(btn, bar_width, style)?;
+        let (_, button) = self.buttons.get(btn)?;
+        let (track_left, track_width) = slider_track_rect(button, left, width);
+        if track_width <= 0.0 {
+            return None;
+        }
+        if x < track_left {
+            return clamp_low.then_some(0);
+        }
+        Some((((x - track_left) / track_width) * 100.0).round().clamp(0.0, 100.0) as i32)
+    }
+
+    /// Apply a dragged slider value, returning the widget id whose set command
+    /// should run when the value actually moved, along with the mute-command
+    /// arg the move implies: `"1"` when reaching 0 auto-mutes, `"0"` when
+    /// leaving 0 unmutes, or `None` when mute state is unchanged (or there is
+    /// no mute command to keep honest).
+    fn apply_slider_value(
+        &mut self,
+        btn: usize,
+        value: i32,
+    ) -> Option<(usize, Option<&'static str>)> {
+        let (_, button) = self.buttons.get_mut(btn)?;
+        let ButtonImage::Slider(s) = &mut button.image else {
+            return None;
+        };
+        s.last_interaction = Instant::now();
+        if s.value == value {
+            return None;
+        }
+        s.value = value;
+        let mute_arg = if !s.has_mute {
+            // Without a mute command the drag can't move the backend's mute, so
+            // the dimmed look must stay honest: never flip `muted` here.
+            None
+        } else if value == 0 && !s.muted {
+            // Sliding to 0 auto-mutes.
+            s.muted = true;
+            Some("1")
+        } else if value > 0 && s.muted {
+            // Sliding back up unmutes.
+            s.muted = false;
+            Some("0")
+        } else {
+            None
+        };
+        button.changed = true;
+        Some((s.id, mute_arg))
+    }
+
+    /// Refresh a slider's idle timer (a finger lifted off it).
+    fn touch_slider(&mut self, btn: usize) {
+        if let Some((_, button)) = self.buttons.get_mut(btn) {
+            if let ButtonImage::Slider(s) = &mut button.image {
+                s.last_interaction = Instant::now();
+            }
+        }
+    }
+
     /// The scroll layout for this layer, or `None` when it doesn't scroll
     /// (scrolling disabled, or all the buttons already fit).
     fn scroll_geometry(&self, width: f64, style: &style::Style) -> Option<ScrollGeometry> {
@@ -1297,7 +2038,7 @@ impl FunctionLayer {
     #[allow(clippy::too_many_arguments)]
     fn with_config(
         cfg: Vec<ButtonConfig>,
-        widgets: &mut Vec<WidgetSpec>,
+        widgets: &mut Widgets,
         next_id: &mut usize,
         default_icon_size: i32,
         visible_buttons: usize,
@@ -1319,6 +2060,7 @@ impl FunctionLayer {
         let displays_time = cfg.iter().any(|cfg| cfg.time.is_some());
         let displays_battery = cfg.iter().any(|cfg| cfg.battery.is_some());
         let displays_cpu_temp = cfg.iter().any(|cfg| cfg.cpu_temp.is_some());
+        let displays_media = cfg.iter().any(|cfg| cfg.media == Some(true));
         let buttons = cfg
             .into_iter()
             .scan(&mut virtual_button_count, |state, mut cfg| {
@@ -1329,10 +2071,36 @@ impl FunctionLayer {
                     stretch = 1;
                 }
                 **state += stretch;
-                let button = if let Some(command) = cfg.command.take() {
+                let button = if let (Some(get), Some(set)) =
+                    (cfg.slider_get.take(), cfg.slider_set.take())
+                {
                     let id = *next_id;
                     *next_id += 1;
-                    widgets.push(WidgetSpec {
+                    let has_mute = cfg.slider_mute.is_some();
+                    widgets.sliders.push(SliderSpec {
+                        id,
+                        get_command: get,
+                        set_command: set,
+                        mute_command: cfg.slider_mute.take(),
+                        interval: WidgetSpec::interval_from_secs(cfg.interval),
+                    });
+                    Button::new_slider(
+                        id,
+                        cfg.icon.as_deref(),
+                        cfg.slider_mute_icon.as_deref(),
+                        cfg.slider_low_icon.as_deref(),
+                        cfg.theme.as_ref(),
+                        stretch,
+                        cfg.slider_stretch.unwrap_or(DEFAULT_SLIDER_STRETCH),
+                        cfg.icon_width.unwrap_or(default_icon_size),
+                        has_mute,
+                    )
+                } else if cfg.media == Some(true) {
+                    Button::new_media(cfg.theme.as_ref(), cfg.icon_width.unwrap_or(default_icon_size))
+                } else if let Some(command) = cfg.command.take() {
+                    let id = *next_id;
+                    *next_id += 1;
+                    widgets.commands.push(WidgetSpec {
                         id,
                         command,
                         interval: WidgetSpec::interval_from_secs(cfg.interval),
@@ -1356,6 +2124,7 @@ impl FunctionLayer {
             displays_time,
             displays_battery,
             displays_cpu_temp,
+            displays_media,
             buttons,
             virtual_button_count,
             faster_refresh,
@@ -1430,6 +2199,10 @@ impl FunctionLayer {
         // arcs overlap into a degenerate shape that stops responding to changes.
         let radius = style.corner_radius.clamp(0.0, (top - bot) / 2.0);
         let (pixel_shift_x, pixel_shift_y) = pixel_shift;
+        // Mid expand/collapse, the slider draws narrower/wider than its slots
+        // and everything right of it rides along (in slot units; scaled by
+        // each path's pitch below).
+        let anim = self.slider_anim();
 
         if let Some(geo) = self.scroll_geometry(effective_width, style) {
             // Band movement (scroll/fling/snap) arrives as complete_redraw --
@@ -1538,9 +2311,18 @@ impl FunctionLayer {
                     continue;
                 }
                 let span = (end - *start) as f64;
-                let button_width = span * geo.slot_width + (span - 1.0) * spacing;
+                let mut button_width = span * geo.slot_width + (span - 1.0) * spacing;
+                let mut anim_shift = 0.0;
+                if let Some((ai, rem)) = anim {
+                    let lag = rem * geo.pitch;
+                    if i == ai {
+                        button_width -= lag;
+                    } else if i > ai {
+                        anim_shift = -lag;
+                    }
+                }
                 let radius = radius.min(button_width / 2.0);
-                let strip_x = (*start - self.pinned_slots) as f64 * geo.pitch;
+                let strip_x = (*start - self.pinned_slots) as f64 * geo.pitch + anim_shift;
                 let x0 = if self.scroll_loop {
                     (strip_x - self.scroll_offset).rem_euclid(geo.period)
                 } else {
@@ -1645,13 +2427,21 @@ impl FunctionLayer {
                 continue;
             };
 
-            let left_edge = (start as f64 * (virtual_button_width + spacing)).floor()
+            let mut left_edge = (start as f64 * (virtual_button_width + spacing)).floor()
                 + edge
                 + pixel_shift_x
                 + (pixel_shift_width / 2) as f64;
 
-            let button_width = virtual_button_width
+            let mut button_width = virtual_button_width
                 + ((end - start - 1) as f64 * (virtual_button_width + spacing)).floor();
+            if let Some((ai, rem)) = anim {
+                let lag = rem * (virtual_button_width + spacing);
+                if i == ai {
+                    button_width -= lag;
+                } else if i > ai {
+                    left_edge -= lag;
+                }
+            }
             // Also cap against the button width so narrow buttons stay valid.
             let radius = radius.min(button_width / 2.0);
 
@@ -1867,6 +2657,13 @@ fn drop_privileges(user: &str, groups: &[&str]) {
         .group_list(groups)
         .apply()
         .unwrap_or_else(|e| panic!("Failed to drop privileges: {}", e));
+    // Give child processes (widget and slider commands) the user's session
+    // environment: PipeWire tools (wpctl) locate the session via
+    // XDG_RUNTIME_DIR, and scripts expect ~ to be the user's home, not root's.
+    if let Ok(Some(u)) = nix::unistd::User::from_name(user) {
+        std::env::set_var("HOME", &u.dir);
+        std::env::set_var("XDG_RUNTIME_DIR", format!("/run/user/{}", u.uid.as_raw()));
+    }
 }
 
 /// Set up the virtual keyboard. Created in main(), before the panic boundary:
@@ -2053,6 +2850,9 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
     let mut last_battery_drawn = *BATTERY_STATE.lock().unwrap();
     // Same, for CpuTemp buttons.
     let mut last_cpu_temp_drawn = *CPU_TEMP_STATE.lock().unwrap();
+    // The media generation currently on screen; the Media widget redraws when
+    // the poller publishes a new status / track / album art.
+    let mut last_media_gen = MEDIA_STATE.lock().unwrap().generation;
 
     // If we already know the user, drop to them now. Otherwise stay root and
     // defer the drop until someone logs in (handled at the top of the loop).
@@ -2117,11 +2917,14 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
             });
         }
     }
+    // Now-playing media polling (playerctl / MPRIS): same wake-pipe pattern as
+    // the battery/CPU pollers. Harmless when there is no player (reports Idle).
+    media::spawn_poller(wake_write.clone());
     let mut widget_rt = WidgetRuntime::new(
         if privileges_dropped {
             initial_widgets
         } else {
-            Vec::new()
+            Widgets::default()
         },
         wake_write.clone(),
     );
@@ -2209,7 +3012,19 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         }
         // Pull in any widget script output and clear the wake pipe.
         widget::drain(wake_read.as_raw_fd());
-        apply_widget_results(&mut layers, &widget_rt);
+        let dragging: Vec<usize> = touches
+            .values()
+            .filter_map(|t| match *t {
+                TouchState::SliderDrag { layer, btn } => {
+                    match &layers.get(layer)?.buttons.get(btn)?.1.image {
+                        ButtonImage::Slider(s) => Some(s.id),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect();
+        apply_widget_results(&mut layers, &widget_rt, &dragging);
 
         // Promote stationary touches on a scrollable band into real key holds
         // once they have sat still long enough to be a hold rather than a tap
@@ -2244,6 +3059,63 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 button.emit_keys(uinput, true);
             }
             *state = TouchState::Held { layer, btn };
+        }
+
+        // Collapse expanded sliders once they have idled (a finger still on
+        // one keeps it open), and note how soon the next one is due so the
+        // loop wakes in time.
+        let mut slider_wait_ms: Option<u64> = None;
+        // Whether a slider width animation is mid-flight on the visible
+        // layer: feeds frame_pending below, exactly like scroll_animating --
+        // without it the animation only advances when something else happens
+        // to wake the loop.
+        let mut slider_animating = false;
+        {
+            let fingered: Vec<(usize, usize)> = touches
+                .values()
+                .filter_map(|t| match *t {
+                    TouchState::SliderDrag { layer, btn } => Some((layer, btn)),
+                    _ => None,
+                })
+                .collect();
+            for (li, layer) in layers.iter_mut().enumerate() {
+                let mut collapse: Vec<usize> = Vec::new();
+                let mut animating = false;
+                for (bi, (_, button)) in layer.buttons.iter_mut().enumerate() {
+                    let ButtonImage::Slider(s) = &mut button.image else {
+                        continue;
+                    };
+                    // Tick the width animation: keep frames coming while it
+                    // plays (including one settle frame at the exact layout).
+                    if let Some(t0) = s.anim {
+                        if t0.elapsed() >= SLIDER_ANIM {
+                            s.anim = None;
+                            button.changed = true;
+                        }
+                        animating = true;
+                    }
+                    if !s.expanded || fingered.contains(&(li, bi)) {
+                        continue;
+                    }
+                    let elapsed = s.last_interaction.elapsed();
+                    if elapsed >= SLIDER_COLLAPSE {
+                        collapse.push(bi);
+                    } else {
+                        let wait = (SLIDER_COLLAPSE - elapsed).as_millis() as u64;
+                        slider_wait_ms = Some(slider_wait_ms.map_or(wait, |w| w.min(wait)));
+                    }
+                }
+                if animating && li == active_layer {
+                    needs_complete_redraw = true;
+                    slider_animating = true;
+                }
+                for bi in collapse {
+                    if layer.set_slider_expanded(bi, false) && li == active_layer {
+                        needs_complete_redraw = true;
+                        slider_animating = true;
+                    }
+                }
+            }
         }
 
         // Advance scroll animations, wrapping around the band: first fling
@@ -2314,7 +3186,8 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 let finger_on_layer = touches.values().any(|t| match *t {
                     TouchState::Held { layer, .. }
                     | TouchState::Pending { layer, .. }
-                    | TouchState::Scroll { layer, .. } => layer == i,
+                    | TouchState::Scroll { layer, .. }
+                    | TouchState::SliderDrag { layer, .. } => layer == i,
                     // A layer swipe holds the slide, not any band stretch.
                     TouchState::LayerSwipe { .. } => false,
                 });
@@ -2443,6 +3316,10 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         if let Some(wait) = hold_wait_ms {
             next_timeout_ms = min(next_timeout_ms, wait.max(1) as i32);
         }
+        // ... and to collapse an idle slider.
+        if let Some(wait) = slider_wait_ms {
+            next_timeout_ms = min(next_timeout_ms, wait.max(1) as i32);
+        }
 
         let current_ts = if layers[active_layer].faster_refresh {
             Local::now().second()
@@ -2473,6 +3350,17 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 last_cpu_temp_drawn = reading;
                 for button in &mut layers[active_layer].buttons {
                     if let ButtonImage::CpuTemp(_) = button.1.image {
+                        button.1.changed = true;
+                    }
+                }
+            }
+        }
+        if layers[active_layer].displays_media {
+            let generation = MEDIA_STATE.lock().unwrap().generation;
+            if generation != last_media_gen {
+                last_media_gen = generation;
+                for button in &mut layers[active_layer].buttons {
+                    if let ButtonImage::Media(_) = button.1.image {
                         button.1.changed = true;
                     }
                 }
@@ -2641,6 +3529,7 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         // draw (still-marked changes), or an animation that keeps producing
         // motion. The timerfd fires at the deadline with sub-ms precision.
         let frame_pending = scroll_animating
+            || slider_animating
             || needs_complete_redraw
             || backlight.soft_dim_animating()
             || backlight::dim_held()
@@ -2809,6 +3698,50 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                             layer.scroll_snap = None;
                             let geo = layer.scroll_geometry(width as f64, &cfg.style);
                             match layer.hit(&cfg.style, width, height, x, y, None) {
+                                // A slider owns its touches: collapsed, a tap
+                                // expands it; expanded, touch-down jumps the
+                                // value to the position and starts a drag that
+                                // no scroll or swipe can take over.
+                                Some(btn)
+                                    if !was_flinging
+                                        && matches!(
+                                            layer.buttons[btn].1.image,
+                                            ButtonImage::Slider(_)
+                                        ) =>
+                                {
+                                    if layer.slider_expanded(btn) {
+                                        if let Some(v) = layer.slider_value_from_x(
+                                            btn,
+                                            x,
+                                            width as f64,
+                                            &cfg.style,
+                                            false,
+                                        ) {
+                                            if let Some((id, mute_arg)) =
+                                                layer.apply_slider_value(btn, v)
+                                            {
+                                                if let Some(arg) = mute_arg {
+                                                    widget_rt.set_slider_mute(id, arg);
+                                                }
+                                                widget_rt.set_slider(id, v);
+                                            }
+                                        } else {
+                                            // On the icon cap: keep it open,
+                                            // change nothing. Mute is reflected
+                                            // from the system, not toggled here.
+                                            layer.touch_slider(btn);
+                                        }
+                                        touches.insert(
+                                            dn.seat_slot(),
+                                            TouchState::SliderDrag {
+                                                layer: active_layer,
+                                                btn,
+                                            },
+                                        );
+                                    } else if layer.set_slider_expanded(btn, true) {
+                                        needs_complete_redraw = true;
+                                    }
+                                }
                                 // Band buttons (and, with layer swipe on, any
                                 // unpinned button) wait out the tap/hold/scroll/
                                 // swipe ambiguity before pressing anything, but
@@ -2819,6 +3752,27 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                 {
                                     if !was_flinging {
                                         layer.buttons[btn].1.set_visual_active(true);
+                                        // A media widget highlights the specific
+                                        // transport zone under the finger.
+                                        if matches!(
+                                            layer.buttons[btn].1.image,
+                                            ButtonImage::Media(_)
+                                        ) {
+                                            let active =
+                                                MEDIA_STATE.lock().unwrap().is_active();
+                                            let icon_w = layer.buttons[btn].1.icon_width;
+                                            let zone = layer
+                                                .button_screen_rect(btn, width as f64, &cfg.style)
+                                                .and_then(|(left, w)| {
+                                                    media_zone_at(active, x, left, w, icon_w)
+                                                });
+                                            if let ButtonImage::Media(m) =
+                                                &mut layer.buttons[btn].1.image
+                                            {
+                                                m.pressed = zone;
+                                            }
+                                            layer.buttons[btn].1.changed = true;
+                                        }
                                     }
                                     touches.insert(
                                         dn.seat_slot(),
@@ -2869,9 +3823,16 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                             // this touch's state: a horizontal drag with a
                             // second (non-held) finger down is a layer swipe,
                             // and only one finger drives the slide at a time.
+                            // Fingers holding buttons or dragging sliders are
+                            // spoken for and don't count toward a swipe.
                             let multi = touches
                                 .values()
-                                .filter(|t| !matches!(t, TouchState::Held { .. }))
+                                .filter(|t| {
+                                    !matches!(
+                                        t,
+                                        TouchState::Held { .. } | TouchState::SliderDrag { .. }
+                                    )
+                                })
                                 .count()
                                 >= 2;
                             let has_swipe = touches
@@ -2924,9 +3885,11 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                         // candidate button is off the hook.
                                         if let Some(btn) = btn {
                                             if btn < layers[layer].buttons.len() {
-                                                layers[layer].buttons[btn]
-                                                    .1
-                                                    .set_visual_active(false);
+                                                let button = &mut layers[layer].buttons[btn].1;
+                                                button.set_visual_active(false);
+                                                if let ButtonImage::Media(m) = &mut button.image {
+                                                    m.pressed = None;
+                                                }
                                             }
                                         }
                                     }
@@ -3041,6 +4004,19 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                         needs_complete_redraw = true;
                                     }
                                 }
+                                TouchState::SliderDrag { layer, btn } => {
+                                    let l = &mut layers[layer];
+                                    if let Some(v) =
+                                        l.slider_value_from_x(btn, x, width as f64, &cfg.style, true)
+                                    {
+                                        if let Some((id, mute_arg)) = l.apply_slider_value(btn, v) {
+                                            if let Some(arg) = mute_arg {
+                                                widget_rt.set_slider_mute(id, arg);
+                                            }
+                                            widget_rt.set_slider(id, v);
+                                        }
+                                    }
+                                }
                             }
                         }
                         TouchEvent::Up(up) => {
@@ -3065,16 +4041,47 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                 TouchState::Pending {
                                     layer,
                                     btn: Some(btn),
+                                    start_x,
                                     ..
                                 } => {
                                     if btn < layers[layer].buttons.len() {
-                                        let button = &mut layers[layer].buttons[btn].1;
-                                        button.emit_keys(uinput, true);
-                                        button.emit_keys(uinput, false);
-                                        button.set_visual_active(false);
+                                        if matches!(
+                                            layers[layer].buttons[btn].1.image,
+                                            ButtonImage::Media(_)
+                                        ) {
+                                            // Media tap: run the playerctl verb
+                                            // for the zone under the touch-down.
+                                            let active =
+                                                MEDIA_STATE.lock().unwrap().is_active();
+                                            let icon_w = layers[layer].buttons[btn].1.icon_width;
+                                            if let Some(zone) = layers[layer]
+                                                .button_screen_rect(btn, width as f64, &cfg.style)
+                                                .and_then(|(left, w)| {
+                                                    media_zone_at(active, start_x, left, w, icon_w)
+                                                })
+                                            {
+                                                media::control(zone.verb());
+                                            }
+                                            let button = &mut layers[layer].buttons[btn].1;
+                                            if let ButtonImage::Media(m) = &mut button.image {
+                                                m.pressed = None;
+                                            }
+                                            button.set_visual_active(false);
+                                            button.changed = true;
+                                        } else {
+                                            let button = &mut layers[layer].buttons[btn].1;
+                                            button.emit_keys(uinput, true);
+                                            button.emit_keys(uinput, false);
+                                            button.set_visual_active(false);
+                                        }
                                     }
                                 }
                                 TouchState::Pending { .. } => {}
+                                // Lifting off a slider restarts its idle
+                                // countdown from now.
+                                TouchState::SliderDrag { layer, btn } => {
+                                    layers[layer].touch_slider(btn);
+                                }
                                 TouchState::Scroll {
                                     layer,
                                     last_t_us,
@@ -3213,7 +4220,7 @@ mod tests {
             .collect();
         FunctionLayer::with_config(
             keys,
-            &mut Vec::new(),
+            &mut Widgets::default(),
             &mut 0,
             48,
             visible,
@@ -3260,6 +4267,135 @@ mod tests {
         assert!((geo.period - 13.0 * pitch).abs() < 1e-9);
     }
 
+    /// esc + slider (SliderStretch 4) + one text button, non-scrolling.
+    fn slider_layer() -> FunctionLayer {
+        let keys = vec![
+            ButtonConfig {
+                text: Some("esc".into()),
+                pinned: Some(true),
+                ..Default::default()
+            },
+            ButtonConfig {
+                slider_get: Some("echo 50".into()),
+                slider_set: Some("true {}".into()),
+                slider_stretch: Some(4),
+                ..Default::default()
+            },
+            ButtonConfig {
+                text: Some("A".into()),
+                ..Default::default()
+            },
+        ];
+        FunctionLayer::with_config(
+            keys,
+            &mut Widgets::default(),
+            &mut 0,
+            48,
+            0,
+            true,
+            true,
+            true,
+            true,
+        )
+    }
+
+    #[test]
+    fn ease_expand_overshoots_then_settles() {
+        assert!(ease_expand(0.0).abs() < 1e-9);
+        assert!((ease_expand(1.0) - 1.0).abs() < 1e-9);
+        let peak = (0..=100)
+            .map(|i| ease_expand(i as f64 / 100.0))
+            .fold(f64::MIN, f64::max);
+        assert!(peak > 1.0 && peak < 1.1); // gentle overshoot, not a bounce
+    }
+
+    #[test]
+    fn slider_expand_relayouts_and_collapses() {
+        let mut layer = slider_layer();
+        assert_eq!(layer.virtual_button_count, 3);
+        assert_eq!(layer.buttons[2].0, 2);
+        assert!(layer.set_slider_expanded(1, true));
+        assert_eq!(layer.virtual_button_count, 6); // slider grew 1 -> 4 slots
+        assert_eq!(layer.buttons[2].0, 5); // the text button moved right
+        assert_eq!(layer.pinned_slots, 1); // pinned prefix untouched
+        assert!(!layer.set_slider_expanded(1, true)); // no-op when already open
+        assert!(layer.set_slider_expanded(1, false));
+        assert_eq!(layer.virtual_button_count, 3);
+        assert_eq!(layer.buttons[2].0, 2);
+    }
+
+    #[test]
+    fn slider_value_maps_track_position() {
+        let style = Style::default();
+        let mut layer = slider_layer();
+        layer.set_slider_expanded(1, true);
+        let (left, width) = layer.button_screen_rect(1, W as f64, &style).unwrap();
+        let (track_left, track_width) = slider_track_rect(&layer.buttons[1].1, left, width);
+        // Left edge of the track = 0, right edge = 100, middle = 50.
+        assert_eq!(
+            layer.slider_value_from_x(1, track_left, W as f64, &style, false),
+            Some(0)
+        );
+        assert_eq!(
+            layer.slider_value_from_x(1, track_left + track_width, W as f64, &style, false),
+            Some(100)
+        );
+        assert_eq!(
+            layer.slider_value_from_x(1, track_left + track_width / 2.0, W as f64, &style, false),
+            Some(50)
+        );
+        // Left of the track (the icon cap): inert on a tap, but a drag runs it
+        // down to 0, mirroring how the right end reaches 100.
+        assert_eq!(
+            layer.slider_value_from_x(1, track_left - 1.0, W as f64, &style, false),
+            None
+        );
+        assert_eq!(
+            layer.slider_value_from_x(1, track_left - 1.0, W as f64, &style, true),
+            Some(0)
+        );
+        // Applying a new value reports the widget id once, then coalesces. This
+        // slider has no mute command, so the mute arg is always None.
+        assert_eq!(layer.apply_slider_value(1, 30), Some((0, None)));
+        assert_eq!(layer.apply_slider_value(1, 30), None);
+    }
+
+    #[test]
+    fn slider_auto_mutes_at_zero_and_unmutes_above() {
+        let keys = vec![ButtonConfig {
+            slider_get: Some("echo 50".into()),
+            slider_set: Some("true {}".into()),
+            slider_mute: Some("true {}".into()),
+            ..Default::default()
+        }];
+        let mut layer = FunctionLayer::with_config(
+            keys,
+            &mut Widgets::default(),
+            &mut 0,
+            48,
+            0,
+            true,
+            true,
+            true,
+            true,
+        );
+        let muted = |layer: &FunctionLayer| match &layer.buttons[0].1.image {
+            ButtonImage::Slider(s) => s.muted,
+            _ => unreachable!(),
+        };
+        // Off 0, unmuted, no mute command runs.
+        assert_eq!(layer.apply_slider_value(0, 50), Some((0, None)));
+        assert!(!muted(&layer));
+        // Sliding to 0 auto-mutes (runs the mute command with "1").
+        assert_eq!(layer.apply_slider_value(0, 0), Some((0, Some("1"))));
+        assert!(muted(&layer));
+        // Sliding back up unmutes ("0").
+        assert_eq!(layer.apply_slider_value(0, 20), Some((0, Some("0"))));
+        assert!(!muted(&layer));
+        // A move that neither reaches nor leaves 0 touches mute at all.
+        assert_eq!(layer.apply_slider_value(0, 40), Some((0, None)));
+    }
+
     /// Like `text_layer`, but with an explicit stretch per button.
     fn stretched_layer(stretches: &[usize], pinned: usize, visible: usize) -> FunctionLayer {
         let keys = stretches
@@ -3274,7 +4410,7 @@ mod tests {
             .collect();
         FunctionLayer::with_config(
             keys,
-            &mut Vec::new(),
+            &mut Widgets::default(),
             &mut 0,
             48,
             visible,
@@ -3303,7 +4439,7 @@ mod tests {
             .collect();
         let layer = FunctionLayer::with_config(
             keys,
-            &mut Vec::new(),
+            &mut Widgets::default(),
             &mut 0,
             48,
             6,
@@ -3325,7 +4461,7 @@ mod tests {
             .collect();
         let layer = FunctionLayer::with_config(
             keys,
-            &mut Vec::new(),
+            &mut Widgets::default(),
             &mut 0,
             48,
             6,
