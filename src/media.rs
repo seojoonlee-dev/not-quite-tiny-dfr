@@ -22,6 +22,15 @@ const POLL: Duration = Duration::from_millis(700);
 /// How often the poller re-derives the current lyric line (cheap arithmetic
 /// off the metadata cadence, so the highlighted line tracks the song closely).
 const LYRIC_TICK: Duration = Duration::from_millis(100);
+/// How long a lyric gap must last (in playback seconds) before the widget
+/// switches from the lyrics to the controls/title. Short gaps between lines
+/// would otherwise flap the view; only a real break (intro / instrumental)
+/// should surface the controls.
+const GAP_DEBOUNCE: f64 = 1.0;
+/// A backward position jump larger than this (seconds) is treated as a real
+/// seek; anything smaller is playerctl re-anchor jitter and is ignored, so the
+/// highlighted lyric never bounces back a line mid-transition.
+const SEEK_BACK_THRESHOLD: f64 = 2.0;
 /// Album art is downscaled so its longest side is at most this many pixels:
 /// plenty for the short bar panel while keeping the buffer small.
 const ART_MAX: u32 = 256;
@@ -98,6 +107,10 @@ pub struct LyricsInfo {
     pub lines: Vec<(f64, String)>,
     /// Index of the line active at the current playback position.
     pub current: usize,
+    /// Whether the playback position currently sits in a lyric gap -- before the
+    /// first line, or on a blank line (instrumental breaks / bridges are marked
+    /// with empty lines in LRC). The widget shows the controls/title then.
+    pub in_gap: bool,
     /// Bumped whenever the display should change (lines loaded, line advanced).
     pub generation: u64,
 }
@@ -113,6 +126,7 @@ pub static LYRICS_STATE: Mutex<LyricsInfo> = Mutex::new(LyricsInfo {
     status: LyricsStatus::None,
     lines: Vec::new(),
     current: 0,
+    in_gap: false,
     generation: 0,
 });
 
@@ -146,6 +160,22 @@ fn index_for_time(lines: &[(f64, String)], time: f64) -> Option<usize> {
     Some(lo.saturating_sub(1))
 }
 
+/// Whether `time` sits in a lyric gap: before the first line begins, or on a
+/// line whose text is blank. LRC marks instrumental breaks / bridges with empty
+/// lines, so this catches the intro and mid-song gaps the vocals drop out for.
+fn gap_at(lines: &[(f64, String)], time: f64) -> bool {
+    let Some(first) = lines.first() else {
+        return true;
+    };
+    if time + 0.2 < first.0 {
+        return true; // still in the intro, before any lyric
+    }
+    match index_for_time(lines, time) {
+        Some(i) => lines.get(i).map_or(true, |l| l.1.trim().is_empty()),
+        None => true,
+    }
+}
+
 /// Parse LRC synced lyrics into `(start_seconds, text)` pairs, sorted by time.
 /// A line may carry several timestamps (`[t1][t2]text`); each yields an entry.
 fn parse_lrc(text: &str) -> Vec<(f64, String)> {
@@ -171,12 +201,35 @@ fn parse_lrc(text: &str) -> Vec<(f64, String)> {
             continue;
         }
         let lyric = rest.trim().to_string();
+        // Drop leading credit/metadata lines (NetEase prefixes its LRC with
+        // "作词 : X" / "Lyricist: X" and the like) -- shown as lyrics they read
+        // as noise.
+        let first = times.iter().cloned().fold(f64::INFINITY, f64::min);
+        if first < 20.0 && is_credit_line(&lyric) {
+            continue;
+        }
         for t in times {
             out.push((t, lyric.clone()));
         }
     }
     out.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
     out
+}
+
+/// A leading credit/metadata line (composer, lyricist, etc.) rather than an
+/// actual sung lyric. NetEase prefixes its LRC with these, and they read as
+/// noise if surfaced as lyrics.
+fn is_credit_line(s: &str) -> bool {
+    const KEYWORDS: [&str; 14] = [
+        "作词", "作曲", "编曲", "制作", "收录", "演奏", "词：", "曲：", "Lyricist",
+        "Composer", "Arranger", "Producer", "Mixing", "Mastering",
+    ];
+    let lower = s.to_lowercase();
+    let has_kw = KEYWORDS
+        .iter()
+        // ASCII keywords match case-insensitively; CJK ones as-is.
+        .any(|k| if k.is_ascii() { lower.contains(&k.to_lowercase()) } else { s.contains(k) });
+    has_kw && (s.contains(':') || s.contains('：') || s.chars().count() < 25)
 }
 
 /// Parse an LRC timestamp `mm:ss(.xx)` into seconds; `None` for a non-time tag.
@@ -229,9 +282,59 @@ fn synced_from_object(v: &Value) -> Option<String> {
     (!s.is_empty()).then(|| s.to_string())
 }
 
-/// Fetch synced lyrics from lrclib. The exact `/api/get` and the looser
-/// `/api/search` fallback are issued concurrently so the fallback adds no extra
-/// round-trip; the exact result wins when it has synced lyrics.
+/// GET a NetEase (music.163.com) endpoint as text. NetEase rejects the default
+/// User-Agent, so it needs a browser UA and a matching Referer.
+fn netease_get(url: &str) -> Option<String> {
+    let out = Command::new("curl")
+        .args([
+            "-sfL",
+            "--connect-timeout",
+            "5",
+            "--max-time",
+            "10",
+            "-A",
+            "Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0",
+            "-e",
+            "https://music.163.com/",
+            url,
+        ])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// Fetch synced lyrics from NetEase, the fallback for tracks lrclib doesn't
+/// cover (its catalog is large, especially for non-English music). Searches by
+/// "title artist", picks the first song whose artist matches ours
+/// case-insensitively (either direction, mirroring the lrclib guard), then
+/// fetches that song's LRC.
+fn fetch_netease(title: &str, artist: &str) -> Option<String> {
+    let query = urlencode(&format!("{title} {artist}"));
+    let search = format!("https://music.163.com/api/search/get?s={query}&type=1&limit=5");
+    let results: Value = serde_json::from_str(&netease_get(&search)?).ok()?;
+    let songs = results.get("result")?.get("songs")?.as_array()?;
+
+    let artist_lc = artist.to_lowercase();
+    let id = songs.iter().find_map(|s| {
+        let name = s.get("artists")?.as_array()?.first()?.get("name")?.as_str()?;
+        let name_lc = name.to_lowercase();
+        let matches = artist_lc.contains(&name_lc) || name_lc.contains(&artist_lc);
+        matches.then(|| s.get("id")?.as_i64()).flatten()
+    })?;
+
+    let lyric_url = format!("https://music.163.com/api/song/lyric?id={id}&lv=1&kv=1&tv=-1");
+    let doc: Value = serde_json::from_str(&netease_get(&lyric_url)?).ok()?;
+    let lrc = doc.get("lrc")?.get("lyric")?.as_str()?;
+    (!lrc.is_empty()).then(|| lrc.to_string())
+}
+
+/// Fetch synced lyrics, trying lrclib first, then NetEase. Within lrclib the
+/// exact `/api/get` and the looser `/api/search` fallback are issued
+/// concurrently so the fallback adds no extra round-trip; the exact result wins
+/// when it has synced lyrics. NetEase (a separate provider with wide coverage)
+/// is only consulted when lrclib has nothing.
 fn fetch_lrc(title: &str, artist: &str, album: &str, duration: f64) -> Option<String> {
     let mut get = format!(
         "https://lrclib.net/api/get?track_name={}&artist_name={}",
@@ -261,9 +364,18 @@ fn fetch_lrc(title: &str, artist: &str, album: &str, duration: f64) -> Option<St
     {
         return Some(lrc);
     }
-    let body = search_handle.join().ok().flatten()?;
-    let results: Value = serde_json::from_str(&body).ok()?;
-    results.as_array()?.iter().find_map(synced_from_object)
+    if let Some(body) = search_handle.join().ok().flatten() {
+        if let Some(lrc) = serde_json::from_str::<Value>(&body)
+            .ok()
+            .as_ref()
+            .and_then(Value::as_array)
+            .and_then(|arr| arr.iter().find_map(synced_from_object))
+        {
+            return Some(lrc);
+        }
+    }
+    // Nothing on lrclib -- fall back to NetEase.
+    fetch_netease(title, artist)
 }
 
 /// Spawn a background fetch of lyrics for `track_key`, publishing the parsed
@@ -289,8 +401,15 @@ fn fetch_lyrics(
         } else {
             LyricsStatus::Synced
         };
+        // Seed the display at the line matching the current playback position,
+        // not line 0 -- otherwise the view flashes the first line and then
+        // immediately slides to the real one when the sync thread catches up.
+        let pos = derived_position().unwrap_or(0.0);
+        ly.current = index_for_time(&lines, pos).unwrap_or(0);
+        // Start out of a gap; the sync thread applies the debounce from here so
+        // a load mid-break doesn't jump straight to the controls.
+        ly.in_gap = false;
         ly.lines = lines;
-        ly.current = 0;
         ly.generation = ly.generation.wrapping_add(1);
         notify(&wake);
     });
@@ -300,6 +419,16 @@ fn fetch_lyrics(
 /// by the metadata thread; read by the lyric-sync thread to derive the current
 /// position without another playerctl call.
 static ANCHOR: Mutex<Option<(f64, Instant, bool)>> = Mutex::new(None);
+
+/// Current playback position derived from the anchor, in seconds; `None` when no
+/// anchor has been set yet. Extrapolates while playing.
+fn derived_position() -> Option<f64> {
+    match *ANCHOR.lock().unwrap() {
+        Some((pos, at, true)) => Some(pos + at.elapsed().as_secs_f64()),
+        Some((pos, _, false)) => Some(pos),
+        None => None,
+    }
+}
 
 /// Spawn the media threads. `wake` is the write end of the loop's wake pipe.
 ///
@@ -388,6 +517,7 @@ fn spawn_metadata_thread(wake: Arc<OwnedFd>) {
                     ly.track_key = track_key.clone();
                     ly.lines.clear();
                     ly.current = 0;
+                    ly.in_gap = false;
                     ly.status = if real {
                         LyricsStatus::Loading
                     } else {
@@ -413,26 +543,63 @@ fn spawn_metadata_thread(wake: Arc<OwnedFd>) {
 }
 
 fn spawn_lyric_sync_thread(wake: Arc<OwnedFd>) {
-    thread::spawn(move || loop {
-        // Derive the current position from the anchor (no playerctl here).
-        let derived = match *ANCHOR.lock().unwrap() {
-            Some((pos, at, true)) => pos + at.elapsed().as_secs_f64(),
-            Some((pos, _, false)) => pos,
-            None => -1.0,
-        };
-        if derived >= 0.0 {
-            let mut ly = LYRICS_STATE.lock().unwrap();
-            if ly.has_lyrics() {
-                if let Some(idx) = index_for_time(&ly.lines, derived) {
-                    if ly.current != idx {
-                        ly.current = idx;
+    thread::spawn(move || {
+        // Playback position at which the current gap began, so a gap only flips
+        // the view once it has lasted `GAP_DEBOUNCE` seconds of playback. Reset
+        // on a backward jump (a seek, or a new track starting near 0) so each
+        // gap is timed from its own start rather than the previous one's.
+        let mut gap_start: Option<f64> = None;
+        // Monotonic playback position. playerctl re-anchors can report a spot
+        // slightly behind the extrapolated one; a backward dip across a line
+        // boundary would bounce the highlighted line (b -> a -> b). Hold the
+        // position against small backward jitter; only a large drop (a real
+        // seek, or a new track) moves it back.
+        let mut mono_pos: Option<f64> = None;
+        loop {
+            // Derive the current position from the anchor (no playerctl here).
+            if let Some(derived) = derived_position() {
+                let pos = match mono_pos {
+                    Some(prev) if derived + SEEK_BACK_THRESHOLD >= prev => derived.max(prev),
+                    _ => derived, // first read, or a real backward seek
+                };
+                mono_pos = Some(pos);
+                let mut ly = LYRICS_STATE.lock().unwrap();
+                if ly.has_lyrics() {
+                    let mut changed = false;
+                    if let Some(idx) = index_for_time(&ly.lines, pos) {
+                        if ly.current != idx {
+                            ly.current = idx;
+                            changed = true;
+                        }
+                    }
+                    // Debounce the gap: report it only once the position has sat
+                    // in a break for `GAP_DEBOUNCE` seconds; clear it at once
+                    // when a lyric becomes active again.
+                    let gap = if gap_at(&ly.lines, pos) {
+                        let start = match gap_start {
+                            Some(s) if pos >= s => s, // same gap, still running
+                            _ => {
+                                gap_start = Some(pos); // new gap (or seeked back)
+                                pos
+                            }
+                        };
+                        pos - start >= GAP_DEBOUNCE
+                    } else {
+                        gap_start = None;
+                        false
+                    };
+                    if ly.in_gap != gap {
+                        ly.in_gap = gap;
+                        changed = true;
+                    }
+                    if changed {
                         ly.generation = ly.generation.wrapping_add(1);
                         notify(&wake);
                     }
                 }
             }
+            thread::sleep(LYRIC_TICK);
         }
-        thread::sleep(LYRIC_TICK);
     });
 }
 

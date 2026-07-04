@@ -86,7 +86,7 @@ const MEDIA_VIEW_ANIM: Duration = Duration::from_millis(300);
 const MEDIA_LYRIC_ANIM: Duration = Duration::from_millis(450);
 /// How long the transport row stays up after a tap before auto-returning to
 /// the lyrics (only while playing with lyrics available).
-const MEDIA_CONTROLS_IDLE: Duration = Duration::from_secs(2);
+const MEDIA_CONTROLS_IDLE: Duration = Duration::from_secs(3);
 /// Vertical padding kept above the title and below the artist, so the track
 /// text never touches the panel's top/bottom edges. The title and artist are
 /// then sized to fill the remaining band height.
@@ -428,6 +428,11 @@ struct MediaState {
     /// When lyrics are available, whether to show them (vs the transport row).
     /// Reset to true for each new track (`lyrics_track`); tapping toggles it.
     show_lyrics: bool,
+    /// Whether there is no lyric to show right now: no lyrics for the track, or
+    /// the playback position sits in a gap (intro / blank instrumental line).
+    /// Forces the controls/title view regardless of `show_lyrics`, cross-fading
+    /// through `view_anim` like the manual toggle.
+    lyric_gap: bool,
     /// The track (title) `show_lyrics` was last reset for.
     lyrics_track: String,
     /// Start of the lyrics/controls cross-fade; `None` once settled.
@@ -445,7 +450,10 @@ impl MediaState {
     /// How much the transport row is shown vs the lyrics: 0 = lyrics, 1 =
     /// controls, cross-fading across `MEDIA_VIEW_ANIM`.
     fn controls_alpha(&self) -> f64 {
-        let settled = if self.show_lyrics { 0.0 } else { 1.0 };
+        // The controls win when the user has toggled to them OR there is no
+        // lyric to show right now (no lyrics / a gap).
+        let want_controls = !self.show_lyrics || self.lyric_gap;
+        let settled = if want_controls { 1.0 } else { 0.0 };
         let Some(t0) = self.view_anim else {
             return settled;
         };
@@ -455,10 +463,10 @@ impl MediaState {
         }
         // Ease and travel from the opposite end toward the settled value.
         let eased = ease_expand(t.clamp(0.0, 1.0)).clamp(0.0, 1.0);
-        if self.show_lyrics {
-            1.0 - eased
-        } else {
+        if want_controls {
             eased
+        } else {
+            1.0 - eased
         }
     }
 
@@ -1004,6 +1012,7 @@ impl Button {
                 next_icon: load("fast_forward"),
                 pressed: None,
                 show_lyrics: true,
+                lyric_gap: false,
                 lyrics_track: String::new(),
                 view_anim: None,
                 last_interaction: Instant::now(),
@@ -1473,43 +1482,42 @@ fn paint_media(
         }
         c.restore().unwrap();
 
-        // The currently-active lyric line to show, if lyrics are available.
-        let current_lyric: Option<String> = {
+        // The currently-active lyric line (empty during a gap), if the track
+        // has lyrics at all.
+        let (has_lyrics, current_line) = {
             let ly = LYRICS_STATE.lock().unwrap();
-            ly.has_lyrics().then(|| {
+            if ly.has_lyrics() {
                 let i = ly.current.min(ly.lines.len() - 1);
-                ly.lines.get(i).map(|l| l.1.clone()).unwrap_or_default()
-            })
-        };
-        // Cross-fade the lyrics (0) and transport row (1). No lyrics -> the row.
-        let controls_alpha = if current_lyric.is_some() {
-            m.controls_alpha()
-        } else {
-            1.0
-        };
-
-        if let Some(line) = &current_lyric {
-            if controls_alpha < 1.0 {
-                c.save().unwrap();
-                rounded_rect_path(c, left_edge, button_width, radius, bot, top);
-                c.clip();
-                c.push_group();
-                draw_media_lyrics(
-                    c,
-                    style,
-                    text_color,
-                    line,
-                    &m.prev_lyric,
-                    m.lyric_progress(),
-                    left_edge,
-                    button_width,
-                    bot,
-                    top,
-                );
-                c.pop_group_to_source().unwrap();
-                c.paint_with_alpha(1.0 - controls_alpha).unwrap();
-                c.restore().unwrap();
+                (true, ly.lines.get(i).map(|l| l.1.clone()).unwrap_or_default())
+            } else {
+                (false, String::new())
             }
+        };
+        // Cross-fade the lyrics (0) and transport row (1). The `lyric_gap` state
+        // (set from the poller) already folds "no lyrics" and "in a gap" into
+        // `controls_alpha`, so the row wins in those cases.
+        let controls_alpha = m.controls_alpha();
+
+        if has_lyrics && controls_alpha < 1.0 {
+            c.save().unwrap();
+            rounded_rect_path(c, left_edge, button_width, radius, bot, top);
+            c.clip();
+            c.push_group();
+            draw_media_lyrics(
+                c,
+                style,
+                text_color,
+                &current_line,
+                &m.prev_lyric,
+                m.lyric_progress(),
+                left_edge,
+                button_width,
+                bot,
+                top,
+            );
+            c.pop_group_to_source().unwrap();
+            c.paint_with_alpha(1.0 - controls_alpha).unwrap();
+            c.restore().unwrap();
         }
         if controls_alpha > 0.0 {
             c.save().unwrap();
@@ -1657,11 +1665,23 @@ fn draw_media_lyrics(
         font.set_absolute_size(max_px * pango::SCALE as f64);
         layout.set_font_description(Some(&font));
         let (natural_w, _) = layout.pixel_size();
-        let px = if natural_w as f64 > width {
-            (max_px * width / natural_w as f64).max(min_px)
-        } else {
-            max_px
-        };
+        let mut px = max_px;
+        if natural_w as f64 > width {
+            // Shrink to fit the width. Glyph advance isn't perfectly linear in
+            // font size (hinting/rounding), so a single linear estimate can
+            // still overflow and ellipsize -- refine by re-measuring until it
+            // fits (or bottoms out at the floor, after which it ellipsizes).
+            px = (max_px * width / natural_w as f64).max(min_px);
+            for _ in 0..3 {
+                font.set_absolute_size(px * pango::SCALE as f64);
+                layout.set_font_description(Some(&font));
+                let (w, _) = layout.pixel_size();
+                if w as f64 <= width || px <= min_px {
+                    break;
+                }
+                px = (px * width / w as f64).max(min_px);
+            }
+        }
         font.set_absolute_size(px * pango::SCALE as f64);
         layout.set_font_description(Some(&font));
         layout.set_ellipsize(pango::EllipsizeMode::End);
@@ -3309,6 +3329,9 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
             let ly = LYRICS_STATE.lock().unwrap();
             let has_lyrics = ly.has_lyrics();
             let cur_line = has_lyrics.then(|| ly.current.min(ly.lines.len() - 1));
+            // Whether there's nothing to show right now: no lyrics for the track,
+            // or the position sits in a gap (intro / blank instrumental line).
+            let want_gap = !has_lyrics || ly.in_gap;
             for (_, button) in layers[active_layer].buttons.iter_mut() {
                 let ButtonImage::Media(m) = &mut button.image else {
                     continue;
@@ -3316,23 +3339,28 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 if m.lyrics_track != cur_title {
                     m.lyrics_track = cur_title.clone();
                     m.show_lyrics = true;
+                    m.lyric_gap = want_gap;
                     m.view_anim = None;
                     m.lyric_idx = usize::MAX;
                     m.lyric_anim = None;
                     button.changed = true;
                 }
                 // The highlighted line advanced: start a vertical slide, keeping
-                // the outgoing line to animate out.
+                // the outgoing line to animate out. Skip the slide when the new
+                // line reads identically to the one on screen -- LRC encodes a
+                // repeated chorus as one line with several timestamps (which the
+                // parser expands into separate entries), and sliding the same
+                // text out and back in just looks like a stutter.
                 if let Some(i) = cur_line {
                     if m.lyric_idx != i {
-                        m.prev_lyric = ly
-                            .lines
-                            .get(m.lyric_idx)
-                            .map(|l| l.1.clone())
-                            .unwrap_or_default();
+                        let old_text = ly.lines.get(m.lyric_idx).map(|l| l.1.as_str()).unwrap_or("");
+                        let new_text = ly.lines.get(i).map(|l| l.1.as_str()).unwrap_or("");
+                        if new_text != old_text {
+                            m.prev_lyric = old_text.to_string();
+                            m.lyric_anim = Some(Instant::now());
+                            button.changed = true;
+                        }
                         m.lyric_idx = i;
-                        m.lyric_anim = Some(Instant::now());
-                        button.changed = true;
                     }
                 }
                 if let Some(t0) = m.lyric_anim {
@@ -3350,6 +3378,14 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                     } else {
                         media_animating = true;
                     }
+                }
+                // Lyric availability changed (entered/left a gap, or lyrics just
+                // loaded): cross-fade between the lyrics and the controls/title.
+                if m.lyric_gap != want_gap {
+                    m.lyric_gap = want_gap;
+                    m.view_anim = Some(Instant::now());
+                    button.changed = true;
+                    media_animating = true;
                 }
                 if has_lyrics && !playing && m.show_lyrics {
                     // Paused: stay in the transport row (so play is at hand).
@@ -4334,12 +4370,18 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                             if let ButtonImage::Media(m) = &mut button.image {
                                                 let now = Instant::now();
                                                 m.last_interaction = now;
-                                                if active && has_lyrics && m.show_lyrics {
+                                                // Are lyrics actually on screen? During a
+                                                // gap the controls show even though
+                                                // `show_lyrics` is set, so a tap there must
+                                                // run the control, not toggle the view.
+                                                let showing_lyrics =
+                                                    active && has_lyrics && m.show_lyrics && !m.lyric_gap;
+                                                if showing_lyrics {
                                                     m.show_lyrics = false;
                                                     m.view_anim = Some(now);
                                                 } else if let Some(z) = zone {
                                                     media::control(z.verb());
-                                                } else if active && has_lyrics {
+                                                } else if active && has_lyrics && !m.show_lyrics {
                                                     m.show_lyrics = true;
                                                     m.view_anim = Some(now);
                                                 }
