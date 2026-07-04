@@ -58,7 +58,7 @@ use backlight::BacklightManager;
 use config::{ButtonAction, ButtonConfig, Config};
 use display::DrmBackend;
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_HEIGHT_PX, PIXEL_SHIFT_WIDTH_PX};
-use media::{MediaStatus, MEDIA_STATE};
+use media::{MediaStatus, LYRICS_STATE, MEDIA_STATE};
 use style::Color;
 use widget::{SliderSpec, WidgetRuntime, WidgetSpec, Widgets};
 
@@ -80,6 +80,13 @@ const MEDIA_ICON_PAD: f64 = 10.0;
 /// How much the album cover is darkened (black overlay alpha) so the white
 /// icons and track text stay legible on top.
 const MEDIA_COVER_DARKEN: f64 = 0.45;
+/// Duration of the lyrics/transport-row cross-fade.
+const MEDIA_VIEW_ANIM: Duration = Duration::from_millis(300);
+/// Duration of the vertical slide when the highlighted lyric line advances.
+const MEDIA_LYRIC_ANIM: Duration = Duration::from_millis(450);
+/// How long the transport row stays up after a tap before auto-returning to
+/// the lyrics (only while playing with lyrics available).
+const MEDIA_CONTROLS_IDLE: Duration = Duration::from_secs(2);
 /// Vertical padding kept above the title and below the artist, so the track
 /// text never touches the panel's top/bottom edges. The title and artist are
 /// then sized to fill the remaining band height.
@@ -409,7 +416,8 @@ impl MediaZone {
 
 /// A media widget: its own transport icons, plus a press highlight. The live
 /// playback status, track text, and album art come from the global
-/// `MEDIA_STATE` (see the `media` module), not from here.
+/// `MEDIA_STATE`, and timed lyrics from `LYRICS_STATE` (see the `media`
+/// module), not from here.
 struct MediaState {
     prev_icon: Option<Handle>,
     play_icon: Option<Handle>,
@@ -417,6 +425,50 @@ struct MediaState {
     next_icon: Option<Handle>,
     /// The zone under a finger right now, drawn brighter for tap feedback.
     pressed: Option<MediaZone>,
+    /// When lyrics are available, whether to show them (vs the transport row).
+    /// Reset to true for each new track (`lyrics_track`); tapping toggles it.
+    show_lyrics: bool,
+    /// The track (title) `show_lyrics` was last reset for.
+    lyrics_track: String,
+    /// Start of the lyrics/controls cross-fade; `None` once settled.
+    view_anim: Option<Instant>,
+    /// Last tap, for auto-returning from the transport row to the lyrics.
+    last_interaction: Instant,
+    /// The lyric line index currently displayed, and the outgoing line and
+    /// start of the vertical slide when it advances (`None` once settled).
+    lyric_idx: usize,
+    prev_lyric: String,
+    lyric_anim: Option<Instant>,
+}
+
+impl MediaState {
+    /// How much the transport row is shown vs the lyrics: 0 = lyrics, 1 =
+    /// controls, cross-fading across `MEDIA_VIEW_ANIM`.
+    fn controls_alpha(&self) -> f64 {
+        let settled = if self.show_lyrics { 0.0 } else { 1.0 };
+        let Some(t0) = self.view_anim else {
+            return settled;
+        };
+        let t = t0.elapsed().as_secs_f64() / MEDIA_VIEW_ANIM.as_secs_f64();
+        if t >= 1.0 {
+            return settled;
+        }
+        // Ease and travel from the opposite end toward the settled value.
+        let eased = ease_expand(t.clamp(0.0, 1.0)).clamp(0.0, 1.0);
+        if self.show_lyrics {
+            1.0 - eased
+        } else {
+            eased
+        }
+    }
+
+    /// Progress of the lyric-line slide, 0 (just changed) to 1 (settled).
+    fn lyric_progress(&self) -> f64 {
+        let Some(t0) = self.lyric_anim else {
+            return 1.0;
+        };
+        (t0.elapsed().as_secs_f64() / MEDIA_LYRIC_ANIM.as_secs_f64()).clamp(0.0, 1.0)
+    }
 }
 
 struct Button {
@@ -951,6 +1003,13 @@ impl Button {
                 pause_icon: load("pause"),
                 next_icon: load("fast_forward"),
                 pressed: None,
+                show_lyrics: true,
+                lyrics_track: String::new(),
+                view_anim: None,
+                last_interaction: Instant::now(),
+                lyric_idx: usize::MAX,
+                prev_lyric: String::new(),
+                lyric_anim: None,
             }),
             icon_width: icon_size as f64,
             icon_height: icon_size as f64,
@@ -1414,14 +1473,61 @@ fn paint_media(
         }
         c.restore().unwrap();
 
-        // Track text on the left, up to the control cluster.
-        let (first, zone_w) = media_zone_geom(true, left_edge, button_width, icon_w);
-        let text_left = left_edge + MEDIA_PAD;
-        let text_width = (first - text_left - MEDIA_PAD).max(0.0);
-        if text_width > 8.0 {
-            draw_media_text(c, style, text_color, &info.title, &info.artist, text_left, text_width, bot, top);
+        // The currently-active lyric line to show, if lyrics are available.
+        let current_lyric: Option<String> = {
+            let ly = LYRICS_STATE.lock().unwrap();
+            ly.has_lyrics().then(|| {
+                let i = ly.current.min(ly.lines.len() - 1);
+                ly.lines.get(i).map(|l| l.1.clone()).unwrap_or_default()
+            })
+        };
+        // Cross-fade the lyrics (0) and transport row (1). No lyrics -> the row.
+        let controls_alpha = if current_lyric.is_some() {
+            m.controls_alpha()
+        } else {
+            1.0
+        };
+
+        if let Some(line) = &current_lyric {
+            if controls_alpha < 1.0 {
+                c.save().unwrap();
+                rounded_rect_path(c, left_edge, button_width, radius, bot, top);
+                c.clip();
+                c.push_group();
+                draw_media_lyrics(
+                    c,
+                    style,
+                    text_color,
+                    line,
+                    &m.prev_lyric,
+                    m.lyric_progress(),
+                    left_edge,
+                    button_width,
+                    bot,
+                    top,
+                );
+                c.pop_group_to_source().unwrap();
+                c.paint_with_alpha(1.0 - controls_alpha).unwrap();
+                c.restore().unwrap();
+            }
         }
-        draw_media_icons(c, m, &info, icon_w, first, zone_w, height, y_shift);
+        if controls_alpha > 0.0 {
+            c.save().unwrap();
+            rounded_rect_path(c, left_edge, button_width, radius, bot, top);
+            c.clip();
+            c.push_group();
+            // Track text on the left, up to the control cluster.
+            let (first, zone_w) = media_zone_geom(true, left_edge, button_width, icon_w);
+            let text_left = left_edge + MEDIA_PAD;
+            let text_width = (first - text_left - MEDIA_PAD).max(0.0);
+            if text_width > 8.0 {
+                draw_media_text(c, style, text_color, &info.title, &info.artist, text_left, text_width, bot, top);
+            }
+            draw_media_icons(c, m, &info, icon_w, first, zone_w, height, y_shift);
+            c.pop_group_to_source().unwrap();
+            c.paint_with_alpha(controls_alpha).unwrap();
+            c.restore().unwrap();
+        }
     } else {
         // Idle: three transport buttons spread across the full width.
         let (first, zone_w) = media_zone_geom(false, left_edge, button_width, icon_w);
@@ -1510,6 +1616,75 @@ fn draw_media_text(
     Color { a: color.a * 0.8, ..color }.set_source(c);
     c.move_to(left, y);
     pangocairo::functions::show_layout(c, &artist_layout);
+}
+
+/// Draw the synced-lyric view: the currently-active line, centered and sized up
+/// to fill the panel width. As the line advances it slides upward -- the
+/// outgoing (`prev`) line moving up and out while the current one rises from
+/// below into the centre -- with `progress` 0 (just changed) to 1 (settled).
+#[allow(clippy::too_many_arguments)]
+fn draw_media_lyrics(
+    c: &Context,
+    style: &style::Style,
+    color: Color,
+    line: &str,
+    prev: &str,
+    progress: f64,
+    left_edge: f64,
+    button_width: f64,
+    bot: f64,
+    top: f64,
+) {
+    let band = top - bot;
+    let mid_y = (bot + top) / 2.0;
+    let left = left_edge + MEDIA_PAD;
+    let width = (button_width - MEDIA_PAD * 2.0).max(1.0);
+    // Smoothstep the travel; the lines move up by a full band height.
+    let p = progress * progress * (3.0 - 2.0 * progress);
+    let step = band;
+
+    // Lay a line out at a font size that fills the band height, shrunk so a long
+    // line fits the width (down to a floor, after which it ellipsizes).
+    let draw = |text: &str, center_y: f64, alpha: f64| {
+        if text.is_empty() || alpha <= 0.0 {
+            return;
+        }
+        let layout = pangocairo::functions::create_layout(c);
+        let mut font = style.font.clone();
+        layout.set_text(text);
+        let max_px = (band * 0.62).max(1.0);
+        let min_px = band * 0.34;
+        font.set_absolute_size(max_px * pango::SCALE as f64);
+        layout.set_font_description(Some(&font));
+        let (natural_w, _) = layout.pixel_size();
+        let px = if natural_w as f64 > width {
+            (max_px * width / natural_w as f64).max(min_px)
+        } else {
+            max_px
+        };
+        font.set_absolute_size(px * pango::SCALE as f64);
+        layout.set_font_description(Some(&font));
+        layout.set_ellipsize(pango::EllipsizeMode::End);
+        layout.set_width((width * pango::SCALE as f64) as i32);
+        layout.set_alignment(pango::Alignment::Center);
+        let (_, h) = layout.pixel_size();
+        Color {
+            a: color.a * alpha,
+            ..color
+        }
+        .set_source(c);
+        c.move_to(left, center_y - h as f64 / 2.0);
+        pangocairo::functions::show_layout(c, &layout);
+    };
+
+    if progress < 1.0 {
+        // Outgoing line rising up and out, fading.
+        draw(prev, mid_y - p * step, 1.0 - p);
+        // Current line rising from below into the centre, fading in.
+        draw(line, mid_y + (1.0 - p) * step, p);
+    } else {
+        draw(line, mid_y, 1.0);
+    }
 }
 
 /// Paint one button (rounded-rect fill plus label/icon) at the given geometry.
@@ -2853,6 +3028,8 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
     // The media generation currently on screen; the Media widget redraws when
     // the poller publishes a new status / track / album art.
     let mut last_media_gen = MEDIA_STATE.lock().unwrap().generation;
+    // Same, for lyrics (loaded lines and the advancing highlighted line).
+    let mut last_lyrics_gen = LYRICS_STATE.lock().unwrap().generation;
 
     // If we already know the user, drop to them now. Otherwise stay root and
     // defer the drop until someone logs in (handled at the top of the loop).
@@ -3118,6 +3295,88 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
             }
         }
 
+        // Advance the Media widget's lyrics/transport view: default to lyrics
+        // on a new track, slide the highlighted line as it advances, tick the
+        // cross-fade, and auto-return to the lyrics once the transport row has
+        // idled.
+        let mut media_animating = false;
+        let mut media_wait_ms: Option<u64> = None;
+        if layers[active_layer].displays_media {
+            let (cur_title, playing) = {
+                let s = MEDIA_STATE.lock().unwrap();
+                (s.title.clone(), s.status == MediaStatus::Playing)
+            };
+            let ly = LYRICS_STATE.lock().unwrap();
+            let has_lyrics = ly.has_lyrics();
+            let cur_line = has_lyrics.then(|| ly.current.min(ly.lines.len() - 1));
+            for (_, button) in layers[active_layer].buttons.iter_mut() {
+                let ButtonImage::Media(m) = &mut button.image else {
+                    continue;
+                };
+                if m.lyrics_track != cur_title {
+                    m.lyrics_track = cur_title.clone();
+                    m.show_lyrics = true;
+                    m.view_anim = None;
+                    m.lyric_idx = usize::MAX;
+                    m.lyric_anim = None;
+                    button.changed = true;
+                }
+                // The highlighted line advanced: start a vertical slide, keeping
+                // the outgoing line to animate out.
+                if let Some(i) = cur_line {
+                    if m.lyric_idx != i {
+                        m.prev_lyric = ly
+                            .lines
+                            .get(m.lyric_idx)
+                            .map(|l| l.1.clone())
+                            .unwrap_or_default();
+                        m.lyric_idx = i;
+                        m.lyric_anim = Some(Instant::now());
+                        button.changed = true;
+                    }
+                }
+                if let Some(t0) = m.lyric_anim {
+                    if t0.elapsed() >= MEDIA_LYRIC_ANIM {
+                        m.lyric_anim = None;
+                        button.changed = true;
+                    } else {
+                        media_animating = true;
+                    }
+                }
+                if let Some(t0) = m.view_anim {
+                    if t0.elapsed() >= MEDIA_VIEW_ANIM {
+                        m.view_anim = None;
+                        button.changed = true;
+                    } else {
+                        media_animating = true;
+                    }
+                }
+                if has_lyrics && !playing && m.show_lyrics {
+                    // Paused: stay in the transport row (so play is at hand).
+                    m.show_lyrics = false;
+                    m.view_anim = Some(Instant::now());
+                    button.changed = true;
+                    media_animating = true;
+                } else if has_lyrics && playing && !m.show_lyrics {
+                    // Playing again: return to the lyrics after the idle cooldown.
+                    let elapsed = m.last_interaction.elapsed();
+                    if elapsed >= MEDIA_CONTROLS_IDLE {
+                        m.show_lyrics = true;
+                        m.view_anim = Some(Instant::now());
+                        button.changed = true;
+                        media_animating = true;
+                    } else {
+                        let wait = (MEDIA_CONTROLS_IDLE - elapsed).as_millis() as u64;
+                        media_wait_ms = Some(media_wait_ms.map_or(wait, |w| w.min(wait)));
+                    }
+                }
+            }
+            drop(ly);
+            if media_animating {
+                needs_complete_redraw = true;
+            }
+        }
+
         // Advance scroll animations, wrapping around the band: first fling
         // momentum (exponential friction), then a smooth snap glide so the
         // band never rests with a button cut off mid-slot. Inactive layers
@@ -3320,6 +3579,10 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         if let Some(wait) = slider_wait_ms {
             next_timeout_ms = min(next_timeout_ms, wait.max(1) as i32);
         }
+        // ... and to auto-return the media widget to its lyrics.
+        if let Some(wait) = media_wait_ms {
+            next_timeout_ms = min(next_timeout_ms, wait.max(1) as i32);
+        }
 
         let current_ts = if layers[active_layer].faster_refresh {
             Local::now().second()
@@ -3357,8 +3620,10 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         }
         if layers[active_layer].displays_media {
             let generation = MEDIA_STATE.lock().unwrap().generation;
-            if generation != last_media_gen {
+            let lyrics_gen = LYRICS_STATE.lock().unwrap().generation;
+            if generation != last_media_gen || lyrics_gen != last_lyrics_gen {
                 last_media_gen = generation;
+                last_lyrics_gen = lyrics_gen;
                 for button in &mut layers[active_layer].buttons {
                     if let ButtonImage::Media(_) = button.1.image {
                         button.1.changed = true;
@@ -3530,6 +3795,7 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         // motion. The timerfd fires at the deadline with sub-ms precision.
         let frame_pending = scroll_animating
             || slider_animating
+            || media_animating
             || needs_complete_redraw
             || backlight.soft_dim_animating()
             || backlight::dim_held()
@@ -4049,21 +4315,34 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                             layers[layer].buttons[btn].1.image,
                                             ButtonImage::Media(_)
                                         ) {
-                                            // Media tap: run the playerctl verb
-                                            // for the zone under the touch-down.
+                                            // Media tap. In the lyrics view any
+                                            // tap reveals the transport row; in
+                                            // the transport view a tap on a
+                                            // control runs it, and a tap
+                                            // elsewhere returns to the lyrics.
                                             let active =
                                                 MEDIA_STATE.lock().unwrap().is_active();
+                                            let has_lyrics =
+                                                LYRICS_STATE.lock().unwrap().has_lyrics();
                                             let icon_w = layers[layer].buttons[btn].1.icon_width;
-                                            if let Some(zone) = layers[layer]
+                                            let zone = layers[layer]
                                                 .button_screen_rect(btn, width as f64, &cfg.style)
                                                 .and_then(|(left, w)| {
                                                     media_zone_at(active, start_x, left, w, icon_w)
-                                                })
-                                            {
-                                                media::control(zone.verb());
-                                            }
+                                                });
                                             let button = &mut layers[layer].buttons[btn].1;
                                             if let ButtonImage::Media(m) = &mut button.image {
+                                                let now = Instant::now();
+                                                m.last_interaction = now;
+                                                if active && has_lyrics && m.show_lyrics {
+                                                    m.show_lyrics = false;
+                                                    m.view_anim = Some(now);
+                                                } else if let Some(z) = zone {
+                                                    media::control(z.verb());
+                                                } else if active && has_lyrics {
+                                                    m.show_lyrics = true;
+                                                    m.view_anim = Some(now);
+                                                }
                                                 m.pressed = None;
                                             }
                                             button.set_visual_active(false);
