@@ -62,7 +62,10 @@ Each entry in `PrimaryLayerKeys`, `MediaLayerKeys`, or `Layers` is a table with:
 | `ColorActive` | hex string | `ButtonColorActive` | Per-button pressed fill color. |
 | `TextColor` | hex string | `TextColor` | Per-button label color. |
 | `Command` | string | unset | Make this a command widget (see [Custom widgets](#custom-widgets)). Takes precedence over `Text`/`Icon`. |
-| `Interval` | float | `2.0` | Seconds between `Command` runs (min 0.1). |
+| `Interval` | float | `2.0` | Seconds between `Command` (or `SliderGet`) runs (min 0.1). |
+| `SliderGet` / `SliderSet` | string | unset | Make this a slider widget (see [Slider widgets](#slider-widgets)): `SliderGet` prints the value 0–100 (optionally followed by `muted`), `SliderSet` runs with `{}` replaced by the new value. Both required. |
+| `SliderMute` | string | unset | Mute command for a slider: runs with `{}` replaced by `toggle` (tapping the expanded slider's icon) or `0` (a drag unmutes). |
+| `SliderStretch` | int | `2` | Slots the slider expands to when tapped (collapsed it uses `Stretch`). |
 
 ### `Action` values
 
@@ -182,6 +185,35 @@ Scripts shipped with the app are installed to
   Text is rendered with pango, which falls back across system fonts per
   glyph — color emoji (and `-w`'s wind arrows) render as long as an emoji
   font (e.g. `noto-fonts-emoji`) is installed system-wide.
+
+## Slider widgets
+
+A slider is an interactive widget that reads and writes a 0–100 value through
+shell commands — volume being the classic use:
+
+```toml
+{ Icon = "volume_up", SliderGet = "wpctl get-volume @DEFAULT_AUDIO_SINK@ | awk '{print int($2*100) ($3==\"[MUTED]\" ? \" muted\" : \"\")}'", SliderSet = "wpctl set-volume -l 1.0 @DEFAULT_AUDIO_SINK@ {}%", SliderMute = "wpctl set-mute @DEFAULT_AUDIO_SINK@ {}", SliderStretch = 2 }
+```
+
+Collapsed, it sits at its normal `Stretch` width showing just the icon.
+**Tapping it expands** it to `SliderStretch` slots — a springy ease-out that
+slightly overshoots — revealing a track with a round drag handle at the
+current value; **dragging (or tapping) the track moves the handle and sets
+the value**, and after ~3 seconds without interaction it slides shut again.
+While a finger is on the slider, band scrolling and layer swipes stay out of
+its way.
+
+`SliderGet` is polled every `Interval` seconds (its stdout is parsed as a
+number, optionally followed by the word `muted`), so changes made elsewhere —
+volume keys, a mixer — show up on the bar. `SliderSet` runs with `{}` replaced
+by the integer value; rapid drags coalesce so only the latest value runs,
+never a backlog. Anything with a get/set command pair works: screen brightness
+(`brightnessctl`), keyboard backlight, media position.
+
+With `SliderMute` set, **tapping the expanded slider's icon toggles mute**
+(the fill and handle dim while muted), and **dragging the track unmutes**
+before applying the new volume — moving the slider always makes sound
+changes audible.
 
 ## CPU temperature widget
 
