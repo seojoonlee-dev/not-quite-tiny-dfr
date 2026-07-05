@@ -301,10 +301,60 @@ enum CpuTempUnit {
     Fahrenheit,
 }
 
+/// An SVG icon together with a cache of its rasterization. librsvg's
+/// `render_document` re-parses and re-rasterizes the SVG on every call, which is
+/// the dominant per-frame cost of a full-bar redraw while scrolling or rubber-
+/// banding (each frame re-rasterizes every visible icon). Icons never change
+/// during the daemon's lifetime, so each is rasterized once per size and the
+/// bitmap is blitted thereafter.
+struct CachedSvg {
+    handle: Handle,
+    raster: std::cell::RefCell<Option<(i32, i32, ImageSurface)>>,
+}
+
+impl CachedSvg {
+    fn new(handle: Handle) -> CachedSvg {
+        CachedSvg {
+            handle,
+            raster: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Blit the icon at `(x, y)` sized `w`x`h`, rasterizing (and caching) it the
+    /// first time each size is requested. Positions are already rounded by
+    /// callers, so blits stay crisp.
+    fn render(&self, c: &Context, x: f64, y: f64, w: f64, h: f64) {
+        let (kw, kh) = (w.round() as i32, h.round() as i32);
+        if kw <= 0 || kh <= 0 {
+            return;
+        }
+        let mut raster = self.raster.borrow_mut();
+        if !matches!(raster.as_ref(), Some((cw, ch, _)) if *cw == kw && *ch == kh) {
+            let surf = ImageSurface::create(Format::ARgb32, kw, kh).unwrap();
+            {
+                let cc = Context::new(&surf).unwrap();
+                self.handle
+                    .render_document(&cc, &Rectangle::new(0.0, 0.0, kw as f64, kh as f64))
+                    .unwrap();
+            }
+            *raster = Some((kw, kh, surf));
+        }
+        let surf = &raster.as_ref().unwrap().2;
+        // save/restore so the blit does not leave the icon bitmap as the cairo
+        // source: callers (e.g. the battery widget) draw text right after the
+        // icon relying on the text color still being set.
+        c.save().unwrap();
+        c.set_source_surface(surf, x, y).unwrap();
+        c.rectangle(x, y, kw as f64, kh as f64);
+        c.fill().unwrap();
+        c.restore().unwrap();
+    }
+}
+
 struct BatteryImages {
-    plain: Vec<Handle>,
-    charging: Vec<Handle>,
-    bolt: Handle,
+    plain: Vec<CachedSvg>,
+    charging: Vec<CachedSvg>,
+    bolt: CachedSvg,
 }
 
 #[derive(Eq, PartialEq, Copy, Clone)]
@@ -329,12 +379,12 @@ struct SliderState {
     /// Id shared with the widget runtime: the get command's poll results
     /// arrive under it, and set commands are queued against it.
     id: usize,
-    icon: Option<Handle>,
+    icon: Option<CachedSvg>,
     /// Icon shown in place of `icon` while `muted`; falls back to `icon`.
-    muted_icon: Option<Handle>,
+    muted_icon: Option<CachedSvg>,
     /// Icon shown in place of `icon` while the value is below
     /// `SLIDER_LOW_THRESHOLD`; falls back to `icon`.
-    low_icon: Option<Handle>,
+    low_icon: Option<CachedSvg>,
     /// Current value, 0-100.
     value: i32,
     /// Whether the backing control reports itself muted (swaps in the mute
@@ -378,7 +428,7 @@ impl SliderState {
 
 enum ButtonImage {
     Text(String),
-    Svg(Handle),
+    Svg(CachedSvg),
     Bitmap(ImageSurface),
     Time(Vec<ChronoItem<'static>>, Locale),
     Battery(BatteryIconMode, BatteryImages),
@@ -419,10 +469,10 @@ impl MediaZone {
 /// `MEDIA_STATE`, and timed lyrics from `LYRICS_STATE` (see the `media`
 /// module), not from here.
 struct MediaState {
-    prev_icon: Option<Handle>,
-    play_icon: Option<Handle>,
-    pause_icon: Option<Handle>,
-    next_icon: Option<Handle>,
+    prev_icon: Option<CachedSvg>,
+    play_icon: Option<CachedSvg>,
+    pause_icon: Option<CachedSvg>,
+    next_icon: Option<CachedSvg>,
     /// The zone under a finger right now, drawn brighter for tap feedback.
     pressed: Option<MediaZone>,
     /// When lyrics are available, whether to show them (vs the transport row).
@@ -606,9 +656,9 @@ fn show_layout_centered(
 }
 
 fn try_load_svg(path: &str) -> Result<ButtonImage> {
-    Ok(ButtonImage::Svg(
+    Ok(ButtonImage::Svg(CachedSvg::new(
         Handle::from_file(path).map_err(|_| anyhow!("failed to load image"))?,
-    ))
+    )))
 }
 
 fn try_load_png(path: impl AsRef<Path>, icon_width: i32, icon_height: i32) -> Result<ButtonImage> {
@@ -894,7 +944,7 @@ impl Button {
             text_color: None,
         }
     }
-    fn load_battery_image(icon: &str, theme: Option<impl AsRef<str>>) -> Handle {
+    fn load_battery_image(icon: &str, theme: Option<impl AsRef<str>>) -> CachedSvg {
         if let ButtonImage::Svg(svg) =
             try_load_image(icon, theme, DEFAULT_ICON_SIZE, DEFAULT_ICON_SIZE).unwrap()
         {
@@ -1114,8 +1164,7 @@ impl Button {
                     button_left_edge + (button_width as f64 / 2.0 - self.icon_width / 2.0).round();
                 let y = y_shift + ((height as f64 - self.icon_height) / 2.0).round();
 
-                svg.render_document(c, &Rectangle::new(x, y, self.icon_width, self.icon_height))
-                    .unwrap();
+                svg.render(c, x, y, self.icon_width, self.icon_height);
             }
             ButtonImage::Bitmap(surf) => {
                 let x =
@@ -1178,11 +1227,7 @@ impl Button {
                     let x = button_left_edge + (button_width as f64 / 2.0 - width / 2.0).round();
                     let y = y_shift + ((height as f64 - DEFAULT_ICON_SIZE as f64) / 2.0).round();
 
-                    svg.render_document(
-                        c,
-                        &Rectangle::new(x, y, DEFAULT_ICON_SIZE as f64, DEFAULT_ICON_SIZE as f64),
-                    )
-                    .unwrap();
+                    svg.render(c, x, y, DEFAULT_ICON_SIZE as f64, DEFAULT_ICON_SIZE as f64);
                 }
                 if battery_mode.should_draw_text() {
                     c.move_to(
@@ -1219,11 +1264,7 @@ impl Button {
                 let icon_y = y_shift + ((height as f64 - self.icon_height) / 2.0).round();
                 let draw_icon = |c: &Context| {
                     if let Some(svg) = icon {
-                        svg.render_document(
-                            c,
-                            &Rectangle::new(icon_x, icon_y, self.icon_width, self.icon_height),
-                        )
-                        .unwrap();
+                        svg.render(c, icon_x, icon_y, self.icon_width, self.icon_height);
                     }
                 };
                 // The expanded look also plays through the collapse animation,
@@ -1579,7 +1620,7 @@ fn draw_media_icons(
         let center = first_zone_left + zone_w * (k as f64 + 0.5);
         let x = (center - icon_w / 2.0).round();
         let y = (y_shift + (height as f64 - icon_w) / 2.0).round();
-        svg.render_document(c, &Rectangle::new(x, y, icon_w, icon_w)).unwrap();
+        svg.render(c, x, y, icon_w, icon_w);
     }
 }
 
