@@ -200,6 +200,16 @@ const FLUSH_STALL_MIN: Duration = Duration::from_millis(200);
 const FLUSH_COOLDOWN_BASE: Duration = Duration::from_secs(2);
 /// Cap on the cool-down doubling (2 s * 2^4 = 32 s between probes at worst).
 const FLUSH_STALL_MAX_DOUBLINGS: u32 = 4;
+/// Keep-warm heartbeat. Measured on T2: a flush to a display that has been idle
+/// more than ~700 ms stalls ~half the time (the appletbdrm/T2 stream goes cold
+/// and the wake times out into a -110 desync), while a flush to a warm stream
+/// (last flush < ~200 ms ago) almost never does. So whenever the bar is lit but
+/// nothing else is drawing, we poke it with a 1 px flush this often to keep the
+/// stream warm -- the same thing a playing media widget does incidentally. This
+/// sidesteps the cold-flush wedge without a kernel change. Set inside the warm
+/// band (measured near-zero stalls under ~200 ms) rather than at the ~700 ms
+/// cliff, for margin; can be relaxed once it is confirmed on hardware.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(150);
 /// Time constant of the post-scroll snap glide (to the nearest slot boundary).
 const SNAP_TAU: f64 = 0.08;
 /// The snap glide is finished once within this many px of its target.
@@ -3075,6 +3085,9 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
     // the previous frame started (only for the frame log's period readout).
     let mut next_frame = Instant::now();
     let mut last_frame_start = Instant::now();
+    // When the display was last actually flushed (any real dirty, including a
+    // keep-warm heartbeat). Drives HEARTBEAT_INTERVAL so the T2 never goes cold.
+    let mut last_flush = Instant::now();
     // Consecutive stalled flushes (see the cool-down at the flush site).
     let mut flush_stalls: u32 = 0;
     // NQTD_FRAME_LOG=1 prints per-frame timings to the journal, for chasing
@@ -3709,6 +3722,20 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
             }
         }
 
+        // Measured on T2: appletbdrm stalls ~100% of the time on a partial
+        // single-widget dirty rect of certain heights (e.g. a 204 px-tall widget
+        // rect) and desyncs the stream, whereas a full-bar flush is safe and even
+        // resyncs a stalled stream. The widget rect height is the slot width, so
+        // this is config-dependent (VisibleButtons / stretches) -- which is why
+        // some layouts froze and others did not. Sidestep it entirely: promote
+        // any widget change to a full-bar redraw so we never emit a toxic partial
+        // clip. Full-bar draw is cheap (~4 ms with the SVG cache), and widget
+        // ticks are seconds apart. (The 1 px keep-warm heartbeat never stalls in
+        // the logs, so tiny clips are fine -- only widget-sized ones are toxic.)
+        if !needs_complete_redraw && layers[active_layer].buttons.iter().any(|b| b.1.changed) {
+            needs_complete_redraw = true;
+        }
+
         // VRR-style pacing: render at most one frame per FRAME_PERIOD, on
         // absolute deadlines -- next_frame advances by exactly one period per
         // frame, so timer rounding and wake-up latency never accumulate into
@@ -3790,6 +3817,19 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 // rects; flushing zero clips is EINVAL (this crashed the daemon),
                 // so skip the frame entirely.
                 if !clips.is_empty() {
+                    // Diagnostic (NQTD_FRAME_LOG): flag any malformed dirty rect
+                    // -- zero/inverted area -- a suspect for the appletbdrm "size
+                    // mismatch" desync that then stalls every flush.
+                    if frame_log {
+                        let bad: Vec<(u16, u16, u16, u16)> = clips
+                            .iter()
+                            .filter(|c| c.x2() <= c.x1() || c.y2() <= c.y1())
+                            .map(|c| (c.x1(), c.y1(), c.x2(), c.y2()))
+                            .collect();
+                        if !bad.is_empty() {
+                            println!("SUSPECT dirty rect(s): {bad:?}");
+                        }
+                    }
                     let data = surface.data().unwrap();
                     {
                         let mut map = drm.map().unwrap();
@@ -3819,16 +3859,22 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                         // traffic onto a panel that needs the opposite.
                         println!("dirty flush failed: {err}");
                     }
+                    last_flush = Instant::now();
                 }
                 needs_complete_redraw = false;
                 if frame_log {
+                    let dims: Vec<(u16, u16)> = clips
+                        .iter()
+                        .map(|c| (c.x2().saturating_sub(c.x1()), c.y2().saturating_sub(c.y1())))
+                        .collect();
                     println!(
-                        "frame: period={:.1}ms draw={:.1}ms flush={:.1}ms complete={} clips={}",
+                        "frame: period={:.1}ms draw={:.1}ms flush={:.1}ms complete={} clips={} dims(w×h)={:?}",
                         period_us as f64 / 1000.0,
                         (draw_done - now).as_secs_f64() * 1000.0,
                         draw_done.elapsed().as_secs_f64() * 1000.0,
                         was_complete,
                         clips.len(),
+                        dims,
                     );
                 }
                 // The flush is a synchronous request/response with the T2
@@ -3889,6 +3935,40 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         } else if frame_timer_armed {
             let _ = frame_timer.unset();
             frame_timer_armed = false;
+        }
+
+        // Keep-warm heartbeat (see HEARTBEAT_INTERVAL): while the bar is lit,
+        // healthy, and otherwise idle, poke the T2 with a 1 px flush every
+        // interval so the stream does not sit cold -- a flush to a long-idle T2
+        // is much more likely to TRIP the appletbdrm protocol desync (kernel
+        // "size mismatch") that then stalls every flush. This is PREVENTION
+        // only. It is suppressed during a stall cool-down (next_frame in the
+        // future): once a desync is active, every flush -- even this 1 px one --
+        // stalls ~1 s, so poking merely feeds it; the stream needs quiet to
+        // resync. When frames are actually flushing (animation) last_flush stays
+        // fresh so the heartbeat self-suppresses. Wake is capped to the interval.
+        if backlight.current_bl() > 0 && !frame_pending && Instant::now() >= next_frame {
+            if last_flush.elapsed() >= HEARTBEAT_INTERVAL {
+                let t0 = Instant::now();
+                let _ = drm.dirty(&[ClipRect::new(0, 0, 1, 1)]);
+                last_flush = Instant::now();
+                if last_flush - t0 >= FLUSH_STALL_MIN {
+                    // Even the tiny poke stalled: a desync is active. Fold into
+                    // the frame cool-down so we go quiet instead of feeding it.
+                    let cooldown = FLUSH_COOLDOWN_BASE
+                        * (1 << flush_stalls.min(FLUSH_STALL_MAX_DOUBLINGS));
+                    flush_stalls += 1;
+                    next_frame = last_flush + cooldown;
+                    println!(
+                        "heartbeat stalled ({} ms): cooling down {} s (stall #{})",
+                        (last_flush - t0).as_millis(),
+                        cooldown.as_secs(),
+                        flush_stalls,
+                    );
+                }
+            }
+            let until = HEARTBEAT_INTERVAL.saturating_sub(last_flush.elapsed());
+            next_timeout_ms = min(next_timeout_ms, until.as_millis().max(1) as i32);
         }
 
         match epoll.wait(
