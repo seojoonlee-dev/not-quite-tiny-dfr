@@ -797,7 +797,12 @@ fn get_battery_state(battery: &str) -> (u32, BatteryState) {
                 .ok()
                 .and_then(|s| s.trim().parse::<f64>().ok());
             match (charge_now, charge_full) {
-                (Some(now), Some(full)) if full > 0.0 => ((now / full) * 100.0).round() as u32,
+                // charge_now can exceed charge_full (which lags/degrades and can
+                // be below charge_now just after a full charge), which would
+                // otherwise report e.g. 110%. Clamp to a sane 0-100.
+                (Some(now), Some(full)) if full > 0.0 => {
+                    ((now / full) * 100.0).round().clamp(0.0, 100.0) as u32
+                }
                 _ => 100,
             }
         }
@@ -807,6 +812,7 @@ fn get_battery_state(battery: &str) -> (u32, BatteryState) {
             fs::read_to_string(&capacity_path)
                 .ok()
                 .and_then(|s| s.trim().parse::<u32>().ok())
+                .map(|c| c.min(100))
                 .unwrap_or(100)
         }
     };
