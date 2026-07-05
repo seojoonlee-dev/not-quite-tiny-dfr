@@ -272,3 +272,31 @@ On a scrollable layer, a quick **tap** presses a button, **holding** your
 finger still for a moment holds the key down (key repeat for volume/brightness
 still works), and a horizontal **drag** scrolls. Layers that fit within
 `VisibleButtons` behave exactly as before.
+
+## Performance and T2 reliability
+
+This fork adds scrolling, momentum, rubber-band overscroll, and layer-swipe
+animations that [tiny-dfr](https://github.com/AsahiLinux/tiny-dfr) does not have.
+Those recomposite the whole bar every frame at 60 Hz, so a couple of caches keep
+each full-bar frame cheap:
+
+- **Rasterized SVG icons are cached.** librsvg's `render_document` re-rasterizes
+  an icon from scratch on every call; under scrolling that would re-rasterize
+  every visible icon 60×/s. Each icon is instead rasterized once per size and the
+  bitmap is blitted thereafter (icons never change at runtime), keeping full-bar
+  draw time to a few milliseconds.
+
+- **Album art is cached** into a cairo surface once per track, rather than being
+  rebuilt from raw bytes every frame.
+
+**Full-bar redraws (Apple T2).** On T2 Macs the `appletbdrm` display stream
+desyncs and stalls — ~1 s per flush, occasionally wedging until reboot — when it
+is sent a *partial single-widget* dirty rectangle of certain sizes. The size that
+trips it depends on the slot width, i.e. on the layout, which is why some configs
+froze and others did not. To avoid it, a widget update repaints the **whole bar**
+instead of emitting a partial clip; full-bar flushes are the safe path (and the
+SVG cache above is what makes doing so on every widget tick cheap).
+
+Set `NQTD_FRAME_LOG=1` in the daemon's environment to log per-frame
+`draw`/`flush`/`period` timings to the journal; `NQTD_TOUCH_LOG=1` logs touch
+events.
