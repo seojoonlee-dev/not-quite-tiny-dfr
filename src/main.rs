@@ -3267,6 +3267,15 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
             if (x - start_x).abs() > SCROLL_SLOP_PX {
                 continue;
             }
+            // A slider has no key to hold down: keep it Pending so a finger held
+            // still still resolves to expand-on-tap (see the Up handler) rather
+            // than a dead Held state that swallows the tap.
+            if matches!(
+                layers.get(layer).and_then(|l| l.buttons.get(btn)),
+                Some((_, b)) if matches!(b.image, ButtonImage::Slider(_))
+            ) {
+                continue;
+            }
             let elapsed = at.elapsed().as_millis() as u64;
             if elapsed < HOLD_ACTIVATE_MS {
                 let wait = HOLD_ACTIVATE_MS - elapsed;
@@ -4093,10 +4102,14 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                             layer.scroll_snap = None;
                             let geo = layer.scroll_geometry(width as f64, &cfg.style);
                             match layer.hit(&cfg.style, width, height, x, y, None) {
-                                // A slider owns its touches: collapsed, a tap
-                                // expands it; expanded, touch-down jumps the
-                                // value to the position and starts a drag that
-                                // no scroll or swipe can take over.
+                                // A slider owns its touches. Expanded: touch-down
+                                // jumps the value to the position and starts a
+                                // drag that no scroll or swipe can take over.
+                                // Collapsed: it is treated exactly like a band
+                                // button -- it lights up and waits out the tap /
+                                // scroll ambiguity, expanding only on a clean tap
+                                // (see the Up handler). So a scroll that happens
+                                // to start on the slider no longer pops it open.
                                 Some(btn)
                                     if !was_flinging
                                         && matches!(
@@ -4133,8 +4146,18 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                                 btn,
                                             },
                                         );
-                                    } else if layer.set_slider_expanded(btn, true) {
-                                        needs_complete_redraw = true;
+                                    } else {
+                                        layer.buttons[btn].1.set_visual_active(true);
+                                        touches.insert(
+                                            dn.seat_slot(),
+                                            TouchState::Pending {
+                                                layer: active_layer,
+                                                btn: Some(btn),
+                                                start_x: x,
+                                                x,
+                                                at: Instant::now(),
+                                            },
+                                        );
                                     }
                                 }
                                 // Band buttons (and, with layer swipe on, any
@@ -4482,6 +4505,16 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                             }
                                             button.set_visual_active(false);
                                             button.changed = true;
+                                        } else if matches!(
+                                            layers[layer].buttons[btn].1.image,
+                                            ButtonImage::Slider(_)
+                                        ) {
+                                            // A clean tap on a collapsed slider
+                                            // opens it (a slider emits no keys).
+                                            layers[layer].buttons[btn].1.set_visual_active(false);
+                                            if layers[layer].set_slider_expanded(btn, true) {
+                                                needs_complete_redraw = true;
+                                            }
                                         } else {
                                             let button = &mut layers[layer].buttons[btn].1;
                                             button.emit_keys(uinput, true);
