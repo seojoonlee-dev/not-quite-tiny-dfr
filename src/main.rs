@@ -798,29 +798,29 @@ fn get_battery_state(battery: &str) -> (u32, BatteryState) {
     let status_path = format!("/sys/class/power_supply/{}/status", battery);
     let status = fs::read_to_string(&status_path).unwrap_or_else(|_| "Unknown".to_string());
 
-    let capacity = {
-        #[cfg(target_arch = "x86_64")]
-        {
-            let charge_now_path = format!("/sys/class/power_supply/{}/charge_now", battery);
-            let charge_full_path = format!("/sys/class/power_supply/{}/charge_full", battery);
-            let charge_now = fs::read_to_string(&charge_now_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<f64>().ok());
-            let charge_full = fs::read_to_string(&charge_full_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<f64>().ok());
-            match (charge_now, charge_full) {
-                // charge_now can exceed charge_full (which lags/degrades and can
-                // be below charge_now just after a full charge), which would
-                // otherwise report e.g. 110%. Clamp to a sane 0-100.
-                (Some(now), Some(full)) if full > 0.0 => {
-                    ((now / full) * 100.0).round().clamp(0.0, 100.0) as u32
-                }
-                _ => 100,
-            }
+    // Prefer charge_now/charge_full, but mirror UPower's recalibration: on T2
+    // Macs (and degraded batteries generally) the SMC's `charge_full` is a bad
+    // learned value that lags and can sit *below* charge_now just after a full
+    // charge (e.g. now=5627000, full=4240000). The kernel's own `capacity` is
+    // no help here -- on this hardware it is computed against charge_full_design
+    // (the pristine design capacity), so a battery degraded to ~77% health caps
+    // out near 77% and never reads full even when it is. Treat the effective
+    // full as max(charge_full, charge_now) so a stale-low charge_full snaps up
+    // to charge_now and reports 100% at full charge, matching UPower/caelestia.
+    // Fall back to `capacity` only when charge_now/charge_full aren't exposed
+    // (e.g. Apple Silicon, which reports capacity directly).
+    let read_uah = |attr: &str| {
+        let path = format!("/sys/class/power_supply/{}/{}", battery, attr);
+        fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+    };
+    let capacity = match (read_uah("charge_now"), read_uah("charge_full")) {
+        (Some(now), Some(full)) if now > 0.0 => {
+            let effective_full = full.max(now);
+            ((now / effective_full) * 100.0).round().clamp(0.0, 100.0) as u32
         }
-        #[cfg(not(target_arch = "x86_64"))]
-        {
+        _ => {
             let capacity_path = format!("/sys/class/power_supply/{}/capacity", battery);
             fs::read_to_string(&capacity_path)
                 .ok()
