@@ -2225,52 +2225,18 @@ impl FunctionLayer {
         }
     }
 
-    /// The offset the band should come to rest at, nearest to `offset`: a
-    /// position where neither window edge cuts through a button. Plain slot
-    /// alignment isn't enough -- a button stretched across several slots must
-    /// not straddle an edge either, so only offsets whose left AND right edges
-    /// land on real button boundaries qualify. A button wider than the whole
-    /// window can never fit, so left-aligning it is accepted for that one.
+    /// The offset the band should come to rest at, nearest to `offset`: the
+    /// nearest single-slot boundary. Stretched (multi-slot) widgets snap by slot
+    /// like everything else -- they are not kept whole in the window, so a wide
+    /// widget can come to rest partly scrolled off an edge rather than the band
+    /// jumping to keep it fully in view.
     fn snap_target(&self, geo: &ScrollGeometry, offset: f64) -> f64 {
-        let scroll_slots = self.virtual_button_count - self.pinned_slots;
-        // Band buttons' start slots, strip-relative and sorted.
-        let starts: Vec<usize> = self.buttons[self.pinned_count..]
-            .iter()
-            .map(|(start, _)| start - self.pinned_slots)
-            .collect();
-        let is_start = |slot: usize| starts.binary_search(&(slot % scroll_slots)).is_ok();
-        // Fallback only for degenerate layouts with no valid position at all.
-        let mut best = (offset / geo.pitch).round() * geo.pitch;
-        if !self.scroll_loop {
-            best = best.clamp(0.0, geo.max_offset);
+        let snapped = (offset / geo.pitch).round() * geo.pitch;
+        if self.scroll_loop {
+            snapped
+        } else {
+            snapped.clamp(0.0, geo.max_offset)
         }
-        let mut best_dist = f64::INFINITY;
-        for (j, &s) in starts.iter().enumerate() {
-            let end = starts.get(j + 1).copied().unwrap_or(scroll_slots);
-            if !is_start(s + self.visible_slots) && end - s < self.visible_slots {
-                continue;
-            }
-            let cand = s as f64 * geo.pitch;
-            if !self.scroll_loop && cand > geo.max_offset + 0.5 {
-                // Without looping the window cannot rest past the last button.
-                continue;
-            }
-            // When looping, also compare against the candidate's wrapped
-            // copies, so "nearest" works across the band seam.
-            let copies = if self.scroll_loop {
-                [cand - geo.period, cand, cand + geo.period]
-            } else {
-                [cand, f64::INFINITY, f64::INFINITY]
-            };
-            for c in copies {
-                let d = (offset - c).abs();
-                if d < best_dist {
-                    best_dist = d;
-                    best = c;
-                }
-            }
-        }
-        best
     }
 
     /// The index in `buttons` of the button covering virtual slot `slot`.
@@ -5049,7 +5015,7 @@ mod tests {
     }
 
     #[test]
-    fn snap_avoids_cutting_stretched_buttons() {
+    fn snap_by_slot_ignores_stretched_buttons() {
         let style = Style::default();
         // Esc + 12 band buttons, one spanning two slots -> 13 band slots.
         // Band start slots: 0,1,2,3,4,5,6,8,... (the wide button covers 6-7).
@@ -5057,13 +5023,12 @@ mod tests {
         stretches[7] = 2; // overall button 7 = band button 6, slots 6-7
         let layer = stretched_layer(&stretches, 1, 6);
         let geo = layer.scroll_geometry(W as f64, &style).unwrap();
-        // Resting at slot 1 would put the window's right edge at slot 7,
-        // slicing the wide button; the nearest clean position is slot 0.
-        assert!(layer.snap_target(&geo, 0.9 * geo.pitch).abs() < 1e-9);
-        // Slot 2 is fine (right edge at slot 8, a real boundary).
+        // Snapping is purely to the nearest slot boundary. Resting at slot 1
+        // puts the window's right edge through the wide button (slots 6-7); that
+        // is allowed now -- stretched buttons are not kept whole in the window.
+        assert!((layer.snap_target(&geo, 0.9 * geo.pitch) - geo.pitch).abs() < 1e-9);
         assert!((layer.snap_target(&geo, 2.1 * geo.pitch) - 2.0 * geo.pitch).abs() < 1e-9);
-        // Mid-button offsets can't be resting positions either: 6.4 pitch sits
-        // inside the wide button, so it settles at its start (slot 6).
+        // Even an offset inside the wide button snaps to the nearest slot.
         assert!((layer.snap_target(&geo, 6.4 * geo.pitch) - 6.0 * geo.pitch).abs() < 1e-9);
     }
 
