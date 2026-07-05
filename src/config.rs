@@ -215,9 +215,13 @@ pub struct ButtonConfig {
     pub theme: Option<String>,
     pub time: Option<String>,
     pub battery: Option<String>,
-    // Built-in CPU temperature widget; the value is the unit ("celsius" or
-    // "fahrenheit").
-    pub cpu_temp: Option<String>,
+    // Built-in CPU widget. The value is a space-separated list of what to show,
+    // any of "celsius", "fahrenheit", "watts" (e.g. "celsius watts"). `CpuTemp`
+    // is kept as an alias for the old name.
+    #[serde(alias = "CpuTemp")]
+    pub cpu: Option<String>,
+    // Whether the CPU widget shows the "CPU" label prefix (default true).
+    pub cpu_label: Option<bool>,
     pub locale: Option<String>,
     #[serde(deserialize_with = "array_or_single", default)]
     pub action: Vec<ButtonAction>,
@@ -333,7 +337,8 @@ fn esc_button() -> ButtonConfig {
         time: None,
         locale: None,
         battery: None,
-        cpu_temp: None,
+        cpu: None,
+        cpu_label: None,
         icon_width: None,
         icon_height: None,
         color: None,
@@ -377,7 +382,8 @@ fn error_layer(message: &str) -> FunctionLayer {
             time: None,
             locale: None,
             battery: None,
-            cpu_temp: None,
+            cpu: None,
+            cpu_label: None,
             icon_width: None,
             icon_height: None,
             color: None,
@@ -884,10 +890,15 @@ mod tests {
     }
 
     #[test]
-    fn cpu_temp_button_parses() {
-        let cfg: ButtonConfig = toml::from_str("CpuTemp = \"celsius\"\nStretch = 2\n").unwrap();
-        assert_eq!(cfg.cpu_temp.as_deref(), Some("celsius"));
+    fn cpu_button_parses() {
+        let cfg: ButtonConfig =
+            toml::from_str("Cpu = \"celsius watts\"\nCpuLabel = false\nStretch = 2\n").unwrap();
+        assert_eq!(cfg.cpu.as_deref(), Some("celsius watts"));
+        assert_eq!(cfg.cpu_label, Some(false));
         assert_eq!(cfg.stretch, Some(2));
+        // The old `CpuTemp` key still works via the serde alias.
+        let old: ButtonConfig = toml::from_str("CpuTemp = \"celsius\"\n").unwrap();
+        assert_eq!(old.cpu.as_deref(), Some("celsius"));
     }
 
     #[test]

@@ -172,7 +172,7 @@ const FLING_STALE_US: u64 = 80_000;
 const BATTERY_POLL: Duration = Duration::from_secs(1);
 /// How often the CPU temperature poller thread re-reads sysfs.
 const CPU_TEMP_POLL: Duration = Duration::from_secs(2);
-/// CpuTemp widget color thresholds, in °C.
+/// Cpu widget temperature color thresholds, in °C.
 const CPU_TEMP_WARM_C: i32 = 70;
 const CPU_TEMP_HOT_C: i32 = 85;
 /// A fling decelerating below this (px/s) stops.
@@ -304,11 +304,24 @@ static BATTERY_STATE: Mutex<(u32, BatteryState)> = Mutex::new((100, BatteryState
 /// never-read-sysfs-on-the-render-path rule as BATTERY_STATE). `None` means no
 /// readable thermal zone.
 static CPU_TEMP_STATE: Mutex<Option<i32>> = Mutex::new(None);
+/// Latest CPU package power draw in whole watts, derived from the RAPL energy
+/// counter by a poller thread. `None` means no readable RAPL counter.
+static CPU_POWER_STATE: Mutex<Option<i32>> = Mutex::new(None);
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum CpuTempUnit {
     Celsius,
     Fahrenheit,
+}
+
+/// What a `Cpu` widget shows: an optional temperature (in some unit) and/or the
+/// package power draw, with an optional "CPU" label prefix. Selected by the
+/// `Cpu` config value (e.g. "celsius watts") and `CpuLabel`.
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct CpuDisplay {
+    temp: Option<CpuTempUnit>,
+    watts: bool,
+    label: bool,
 }
 
 /// An SVG icon together with a cache of its rasterization. librsvg's
@@ -442,7 +455,7 @@ enum ButtonImage {
     Bitmap(ImageSurface),
     Time(Vec<ChronoItem<'static>>, Locale),
     Battery(BatteryIconMode, BatteryImages),
-    CpuTemp(CpuTempUnit),
+    Cpu(CpuDisplay),
     Slider(SliderState),
     Media(MediaState),
     /// A command widget: `text`/`color` are updated from its script's output.
@@ -825,6 +838,37 @@ fn get_battery_state(battery: &str) -> (u32, BatteryState) {
     (capacity, status)
 }
 
+/// Open the Intel RAPL package energy counter. `energy_uj` is root-only (a
+/// power side-channel mitigation), so this must be called *before* the daemon
+/// drops privileges -- the poller then reads the already-open fd, since DAC is
+/// checked at open() not per read. Returns the open file and the counter's
+/// wrap-around range in µJ. CPU package power is the delta of this over time.
+fn open_cpu_power_source() -> Option<(File, u64)> {
+    for entry in fs::read_dir("/sys/class/powercap").ok()?.flatten() {
+        let path = entry.path();
+        if !fs::read_to_string(path.join("name")).is_ok_and(|n| n.trim() == "package-0") {
+            continue;
+        }
+        let file = File::open(path.join("energy_uj")).ok()?;
+        let max = fs::read_to_string(path.join("max_energy_range_uj"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        return Some((file, max));
+    }
+    None
+}
+
+/// Read the current µJ value from an already-open RAPL `energy_uj` fd. sysfs
+/// regenerates the value on each read from offset 0, so seek back first.
+fn read_energy_uj(file: &mut File) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut buf = String::new();
+    file.read_to_string(&mut buf).ok()?;
+    buf.trim().parse().ok()
+}
+
 /// The `temp` file of the x86 package-temperature thermal zone, when one
 /// exists. Its absence selects the hottest-zone fallback in `read_cpu_temp`.
 fn find_cpu_temp_zone() -> Option<PathBuf> {
@@ -854,15 +898,32 @@ fn read_cpu_temp(zone: Option<&Path>) -> Option<i32> {
     Some((millideg / 1000) as i32)
 }
 
-/// The CpuTemp widget's label for the current cached reading.
-fn cpu_temp_text(unit: CpuTempUnit) -> String {
-    match *CPU_TEMP_STATE.lock().unwrap() {
-        Some(c) => match unit {
-            CpuTempUnit::Celsius => format!("CPU {c}\u{00b0}C"),
-            CpuTempUnit::Fahrenheit => format!("CPU {}\u{00b0}F", c * 9 / 5 + 32),
-        },
-        None => "CPU n/a".to_string(),
+/// The CPU widget's label for the current cached readings.
+fn cpu_text(d: &CpuDisplay) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if d.label {
+        parts.push("CPU".to_string());
     }
+    if let Some(unit) = d.temp {
+        parts.push(match *CPU_TEMP_STATE.lock().unwrap() {
+            Some(c) => match unit {
+                CpuTempUnit::Celsius => format!("{c}\u{00b0}C"),
+                CpuTempUnit::Fahrenheit => format!("{}\u{00b0}F", c * 9 / 5 + 32),
+            },
+            None => "n/a".to_string(),
+        });
+    }
+    if d.watts {
+        parts.push(match *CPU_POWER_STATE.lock().unwrap() {
+            Some(w) => format!("{w}W"),
+            None => "n/a".to_string(),
+        });
+    }
+    // A spec that selects nothing and hides the label still shows a bare "CPU".
+    if parts.is_empty() {
+        return "CPU".to_string();
+    }
+    parts.join(" ")
 }
 
 impl Button {
@@ -886,8 +947,8 @@ impl Button {
             } else {
                 Button::new_text("Battery N/A".to_string(), cfg.action)
             }
-        } else if let Some(unit) = cfg.cpu_temp {
-            Button::new_cpu_temp(cfg.action, &unit)
+        } else if let Some(spec) = cfg.cpu {
+            Button::new_cpu(cfg.action, &spec, cfg.cpu_label.unwrap_or(true))
         } else {
             Button::new_spacer()
         };
@@ -1094,22 +1155,31 @@ impl Button {
         }
     }
 
-    fn new_cpu_temp(action: Vec<ButtonAction>, unit: &str) -> Button {
-        // An unknown unit is only worth a journal line, not a daemon abort:
-        // this also runs on live config reloads.
-        let unit = match unit {
-            "celsius" => CpuTempUnit::Celsius,
-            "fahrenheit" => CpuTempUnit::Fahrenheit,
-            other => {
-                eprintln!("not-quite-tiny-dfr: unknown CpuTemp unit {other:?}, using \"celsius\"");
-                CpuTempUnit::Celsius
+    fn new_cpu(action: Vec<ButtonAction>, spec: &str, label: bool) -> Button {
+        // A space-separated list of what to show. Unknown tokens are only worth
+        // a journal line, not a daemon abort (this also runs on live reloads).
+        let mut temp = None;
+        let mut watts = false;
+        let mut any = false;
+        for tok in spec.split_whitespace() {
+            match tok {
+                "celsius" => (temp, any) = (Some(CpuTempUnit::Celsius), true),
+                "fahrenheit" => (temp, any) = (Some(CpuTempUnit::Fahrenheit), true),
+                "watts" | "power" => (watts, any) = (true, true),
+                other => {
+                    eprintln!("not-quite-tiny-dfr: unknown Cpu component {other:?}, ignoring");
+                }
             }
-        };
+        }
+        // An empty or all-unknown spec falls back to temperature in celsius.
+        if !any {
+            temp = Some(CpuTempUnit::Celsius);
+        }
         Button {
             action,
             active: false,
             changed: false,
-            image: ButtonImage::CpuTemp(unit),
+            image: ButtonImage::Cpu(CpuDisplay { temp, watts, label }),
             icon_width: 0.0,
             icon_height: 0.0,
             bg_color: None,
@@ -1254,8 +1324,8 @@ impl Button {
                     pangocairo::functions::show_layout(c, &layout);
                 }
             }
-            ButtonImage::CpuTemp(unit) => {
-                let layout = text_layout(c, style, &cpu_temp_text(*unit));
+            ButtonImage::Cpu(d) => {
+                let layout = text_layout(c, style, &cpu_text(d));
                 show_layout_centered(c, &layout, height, button_left_edge, button_width, y_shift);
             }
             ButtonImage::Slider(s) => {
@@ -1347,7 +1417,7 @@ impl Button {
         }
     }
     /// The color to draw this button's text in, letting a command widget's own
-    /// JSON `color` -- or a CpuTemp widget's cool/warm/hot coding -- override
+    /// JSON `color` -- or a Cpu widget's cool/warm/hot coding -- override
     /// the configured/default text color.
     fn effective_text_color(&self, style: &style::Style) -> Color {
         if let ButtonImage::Command {
@@ -1356,15 +1426,20 @@ impl Button {
         {
             return *color;
         }
-        if let ButtonImage::CpuTemp(_) = &self.image {
-            match *CPU_TEMP_STATE.lock().unwrap() {
-                Some(c) if c >= CPU_TEMP_HOT_C => return style.cpu_temp_hot_color,
-                Some(c) if c >= CPU_TEMP_WARM_C => return style.cpu_temp_warm_color,
-                Some(_) => {
-                    return self.text_color.unwrap_or(style.cpu_temp_cool_color);
+        // Temperature is heat-coded; the watts mode isn't, so it falls through
+        // to the ordinary text color below.
+        if let ButtonImage::Cpu(d) = &self.image {
+            // Only temperature is heat-coded; a watts-only widget isn't.
+            if d.temp.is_some() {
+                match *CPU_TEMP_STATE.lock().unwrap() {
+                    Some(c) if c >= CPU_TEMP_HOT_C => return style.cpu_temp_hot_color,
+                    Some(c) if c >= CPU_TEMP_WARM_C => return style.cpu_temp_warm_color,
+                    Some(_) => {
+                        return self.text_color.unwrap_or(style.cpu_temp_cool_color);
+                    }
+                    // No sensor: "CPU n/a" in the ordinary text color.
+                    None => {}
                 }
-                // No sensor: "CPU n/a" in the ordinary text color.
-                None => {}
             }
         }
         self.text_color.unwrap_or(style.text_color)
@@ -1817,7 +1892,7 @@ fn paint_button(
 pub struct FunctionLayer {
     displays_time: bool,
     displays_battery: bool,
-    displays_cpu_temp: bool,
+    displays_cpu: bool,
     displays_media: bool,
     buttons: Vec<(usize, Button)>,
     virtual_button_count: usize,
@@ -2277,7 +2352,7 @@ impl FunctionLayer {
         let mut virtual_button_count = 0;
         let displays_time = cfg.iter().any(|cfg| cfg.time.is_some());
         let displays_battery = cfg.iter().any(|cfg| cfg.battery.is_some());
-        let displays_cpu_temp = cfg.iter().any(|cfg| cfg.cpu_temp.is_some());
+        let displays_cpu = cfg.iter().any(|cfg| cfg.cpu.is_some());
         let displays_media = cfg.iter().any(|cfg| cfg.media == Some(true));
         let buttons = cfg
             .into_iter()
@@ -2341,7 +2416,7 @@ impl FunctionLayer {
         FunctionLayer {
             displays_time,
             displays_battery,
-            displays_cpu_temp,
+            displays_cpu,
             displays_media,
             buttons,
             virtual_button_count,
@@ -3069,13 +3144,20 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
     // The battery reading whose rendering is currently on screen; battery
     // buttons only redraw when the poller's cache moves away from this.
     let mut last_battery_drawn = *BATTERY_STATE.lock().unwrap();
-    // Same, for CpuTemp buttons.
+    // Same, for Cpu buttons.
     let mut last_cpu_temp_drawn = *CPU_TEMP_STATE.lock().unwrap();
+    // Same, for the Cpu widget's watts mode.
+    let mut last_cpu_power_drawn = *CPU_POWER_STATE.lock().unwrap();
     // The media generation currently on screen; the Media widget redraws when
     // the poller publishes a new status / track / album art.
     let mut last_media_gen = MEDIA_STATE.lock().unwrap().generation;
     // Same, for lyrics (loaded lines and the advancing highlighted line).
     let mut last_lyrics_gen = LYRICS_STATE.lock().unwrap().generation;
+
+    // CPU package power comes from the root-only RAPL energy counter, so grab a
+    // handle to it now, while we are still root; the poller reads the open fd
+    // after the drop. `None` when RAPL isn't present (the widget shows "n/a").
+    let cpu_power_src = open_cpu_power_source();
 
     // If we already know the user, drop to them now. Otherwise stay root and
     // defer the drop until someone logs in (handled at the top of the loop).
@@ -3139,6 +3221,50 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 thread::sleep(CPU_TEMP_POLL);
             });
         }
+    }
+    // CPU package power poller: watts = delta of the RAPL energy counter over
+    // elapsed time. Needs two samples, and reads the fd opened as root above.
+    if let Some((mut file, max_range)) = cpu_power_src {
+        let wake = wake_write.clone();
+        thread::spawn(move || {
+            let mut last = read_energy_uj(&mut file).map(|e| (e, Instant::now()));
+            loop {
+                thread::sleep(CPU_TEMP_POLL);
+                let Some(cur) = read_energy_uj(&mut file) else {
+                    continue;
+                };
+                let now = Instant::now();
+                if let Some((prev_e, prev_t)) = last {
+                    let dt = (now - prev_t).as_secs_f64();
+                    // The counter wraps at max_range.
+                    let delta = if cur >= prev_e {
+                        cur - prev_e
+                    } else {
+                        max_range - prev_e + cur
+                    };
+                    if dt > 0.0 {
+                        let watts = Some(((delta as f64 / dt) / 1_000_000.0).round() as i32);
+                        let changed = {
+                            let mut shared = CPU_POWER_STATE.lock().unwrap();
+                            let changed = *shared != watts;
+                            *shared = watts;
+                            changed
+                        };
+                        if changed {
+                            let byte = [1u8];
+                            unsafe {
+                                libc::write(
+                                    wake.as_raw_fd(),
+                                    byte.as_ptr() as *const libc::c_void,
+                                    1,
+                                );
+                            }
+                        }
+                    }
+                }
+                last = Some((cur, now));
+            }
+        });
     }
     // Now-playing media polling (playerctl / MPRIS): same wake-pipe pattern as
     // the battery/CPU pollers. Harmless when there is no player (reports Idle).
@@ -3678,12 +3804,14 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 }
             }
         }
-        if layers[active_layer].displays_cpu_temp {
+        if layers[active_layer].displays_cpu {
             let reading = *CPU_TEMP_STATE.lock().unwrap();
-            if reading != last_cpu_temp_drawn {
+            let power = *CPU_POWER_STATE.lock().unwrap();
+            if reading != last_cpu_temp_drawn || power != last_cpu_power_drawn {
                 last_cpu_temp_drawn = reading;
+                last_cpu_power_drawn = power;
                 for button in &mut layers[active_layer].buttons {
-                    if let ButtonImage::CpuTemp(_) = button.1.image {
+                    if let ButtonImage::Cpu(_) = button.1.image {
                         button.1.changed = true;
                     }
                 }

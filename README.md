@@ -53,7 +53,8 @@ Each entry in `PrimaryLayerKeys`, `MediaLayerKeys`, or `Layers` is a table with:
 | `Time` | string | unset | Make this a clock: a strftime format string, e.g. `"%H:%M"`. |
 | `Locale` | string | unset | Locale used for the `Time` format. |
 | `Battery` | string | unset | Make this a battery indicator; value is the display mode: `"icon"`, `"percentage"`, or `"both"`. |
-| `CpuTemp` | string | unset | Make this a CPU temperature indicator; value is the unit: `"celsius"` or `"fahrenheit"`. |
+| `Cpu` (alias `CpuTemp`) | string | unset | Make this a CPU indicator; space-separated list of what to show: `"celsius"`, `"fahrenheit"`, `"watts"` (e.g. `"celsius watts"`). |
+| `CpuLabel` | bool | `true` | Show the leading `CPU` label on a `Cpu` widget. |
 | `Action` | string or array | none | Linux key name (`"F1"`, `"VolumeUp"`, `"IllumUp"` = keyboard backlight, …) or internal action `"TouchBarBrightnessUp"`/`"TouchBarBrightnessDown"` (the bar's own brightness, 10 levels, hold to repeat). An array sends a chord. |
 | `Pinned` | bool | `false` | Keep this leading button outside the scrolling band and still during layer swipes. Pinned slots must match across all layers, or the config is rejected. |
 | `Stretch` | int | `1` | How many button slots this button spans. |
@@ -215,24 +216,32 @@ With `SliderMute` set, **tapping the expanded slider's icon toggles mute**
 before applying the new volume — moving the slider always makes sound
 changes audible.
 
-## CPU temperature widget
+## CPU widget
 
-The CPU temperature indicator is built into the daemon:
+The CPU indicator is built into the daemon:
 
 ```toml
-{ CpuTemp = "celsius", Stretch = 2 }
+{ Cpu = "celsius watts", Stretch = 2 }
 ```
 
-The value picks the unit: `"celsius"` or `"fahrenheit"`. It reads the
-`x86_pkg_temp` thermal zone when present (Intel), and falls back to the hottest
-zone under `/sys/class/thermal` otherwise (e.g. Apple Silicon). A background
-thread polls sysfs every 2 seconds, and the button redraws only when the
-reading changes.
+The `Cpu` value is a **space-separated list** of what to show, any of
+`celsius`, `fahrenheit`, and `watts` (alias `power`) — so `"celsius watts"`
+shows both, e.g. `CPU 62°C 15W`. (`CpuTemp` is still accepted as an alias for
+`Cpu`.) `CpuLabel = false` drops the leading `CPU`. A background thread polls
+every 2 seconds and the button redraws only when a reading changes.
 
-The label (e.g. `CPU 62°C`) is color-coded by temperature:
-`CpuTempCoolColor` below 70 °C, `CpuTempWarmColor` from 70 °C, and
-`CpuTempHotColor` from 85 °C (see the `[Style]` table). If no thermal zone is
-readable the button shows `CPU n/a`.
+- **Temperature** (`celsius`/`fahrenheit`) reads the `x86_pkg_temp` thermal zone
+  when present (Intel), else the hottest zone under `/sys/class/thermal` (e.g.
+  Apple Silicon). It is color-coded by temperature: `CpuTempCoolColor` below
+  70 °C, `CpuTempWarmColor` from 70 °C, and `CpuTempHotColor` from 85 °C (see
+  the `[Style]` table).
+
+- **Power** (`watts`) shows CPU package draw (e.g. `15W`), derived from the
+  Intel RAPL energy counter. That counter is root-only, so the daemon opens it
+  while it still has privileges at startup; if RAPL isn't present it shows
+  `n/a`. Uncolored (no heat coding).
+
+Any component that can't be read shows `n/a` in its place.
 
 ## Battery widget
 
