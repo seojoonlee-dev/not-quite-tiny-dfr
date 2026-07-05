@@ -23,12 +23,26 @@ while getopts eHw opt; do
 done
 shift $((OPTIND - 1))
 
+# wttr.in is frequently rate-limited or briefly unreachable. Rather than blank
+# the widget to "weather n/a" on every transient hiccup, cache the last good
+# reading (keyed by the requested format+location) and fall back to it. Only
+# show "weather n/a" when a fetch fails and we have never had a good reading.
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/not-quite-tiny-dfr"
+cache_key=$(printf '%s' "$cond+%t$extra|$1" | tr -c 'A-Za-z0-9' '_')
+cache_file="$cache_dir/weather_$cache_key"
+
 out=$(curl -sf --max-time 10 "wttr.in/$1?format=$cond+%t$extra" 2>/dev/null)
 if [ -z "$out" ]; then
-    echo "weather n/a"
+    if [ -s "$cache_file" ]; then
+        cat "$cache_file"
+    else
+        echo "weather n/a"
+    fi
     exit 0
 fi
 
 # wttr.in writes positive temperatures as "+11°C" and pads some fields;
 # drop the sign and squeeze the whitespace.
-echo "$out" | sed 's/+//' | tr -s ' '
+formatted=$(echo "$out" | sed 's/+//' | tr -s ' ')
+mkdir -p "$cache_dir" 2>/dev/null && printf '%s\n' "$formatted" > "$cache_file"
+printf '%s\n' "$formatted"
