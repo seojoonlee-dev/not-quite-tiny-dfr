@@ -71,7 +71,7 @@ Each entry in `PrimaryLayerKeys`, `MediaLayerKeys`, or `Layers` is a table with:
 | `SliderGet` / `SliderSet` | string | unset | Make this a slider widget (see [Slider widgets](#slider-widgets)): `SliderGet` prints the value 0–100 (optionally followed by `muted`), `SliderSet` runs with `{}` replaced by the new value. Both required. |
 | `SliderMute` | string | unset | Mute command for a slider: runs with `{}` replaced by `toggle` (tapping the expanded slider's icon) or `0` (a drag unmutes). |
 | `SliderStretch` | int | `2` | Slots the slider expands to when tapped (collapsed it uses `Stretch`). |
-| `OnClick` | string | `"Action"` | What a tap does. `"Action"` runs the button's `Action`/keys (the default). `"Expand"` instead expands the button in place — reusing the slider's animation — and shows `ExpandCommand`'s output until it idles (see [Expandable widgets](#expandable-widgets)). |
+| `OnClick` | string | unset | What a tap does. `"Action"` runs the button's `Action`/keys; `"Expand"` expands the button in place — reusing the slider's animation — and shows `ExpandCommand`'s output until it idles (see [Expandable widgets](#expandable-widgets)). Only `"Action"` **lights up on tap** (the pressed fill); `"Expand"` (which has its own animation) and buttons with no `OnClick` stay flat when tapped. |
 | `ExpandCommand` | string | unset | For `OnClick = "Expand"`: the shell command whose stdout fills the expanded view (same JSON/plain-text protocol as `Command`). Required to expand. |
 | `ExpandStretch` | int | `2` | Slots the button expands to when tapped (collapsed it uses `Stretch`). |
 

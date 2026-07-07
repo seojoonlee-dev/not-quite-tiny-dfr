@@ -33,47 +33,49 @@
 # MediaCoverBlur = false
 
 # Pinned must mark the same leading slots on every layer; a mismatch is a
-# config error (red banner on the bar).
+# config error (red banner on the bar). OnClick = "Action" makes a key button
+# light up on tap (the pressed fill); widgets, sliders, and Expand buttons stay
+# flat, as does a button with no OnClick.
 # PrimaryLayerKeys = [
-#     { Text = "esc", Action = "Esc", Pinned = true },
-#     { Text = "F1",  Action = "F1"  },
-#     { Text = "F2",  Action = "F2"  },
-#     { Text = "F3",  Action = "F3"  },
-#     { Text = "F4",  Action = "F4"  },
-#     { Text = "F5",  Action = "F5"  },
-#     { Text = "F6",  Action = "F6"  },
-#     { Text = "F7",  Action = "F7"  },
-#     { Text = "F8",  Action = "F8"  },
-#     { Text = "F9",  Action = "F9"  },
-#     { Text = "F10", Action = "F10" },
-#     { Text = "F11", Action = "F11" },
-#     { Text = "F12", Action = "F12" },
+#     { Text = "esc", Action = "Esc", Pinned = true, OnClick = "Action" },
+#     { Text = "F1",  Action = "F1",  OnClick = "Action" },
+#     { Text = "F2",  Action = "F2",  OnClick = "Action" },
+#     { Text = "F3",  Action = "F3",  OnClick = "Action" },
+#     { Text = "F4",  Action = "F4",  OnClick = "Action" },
+#     { Text = "F5",  Action = "F5",  OnClick = "Action" },
+#     { Text = "F6",  Action = "F6",  OnClick = "Action" },
+#     { Text = "F7",  Action = "F7",  OnClick = "Action" },
+#     { Text = "F8",  Action = "F8",  OnClick = "Action" },
+#     { Text = "F9",  Action = "F9",  OnClick = "Action" },
+#     { Text = "F10", Action = "F10", OnClick = "Action" },
+#     { Text = "F11", Action = "F11", OnClick = "Action" },
+#     { Text = "F12", Action = "F12", OnClick = "Action" },
 # ]
 
 # Actions are Linux key names ("IllumDown"/"IllumUp" = keyboard backlight)
 # or the daemon-internal "TouchBarBrightnessDown"/"TouchBarBrightnessUp",
 # which adjust the Touch Bar's own brightness (10 levels, hold to repeat).
 # MediaLayerKeys = [
-#     { Text = "esc", Action = "Esc", Pinned = true },
-#     { Icon = "brightness_low",  Action = "BrightnessDown" },
-#     { Icon = "brightness_high", Action = "BrightnessUp"   },
-#     { Icon = "mic_off",         Action = "MicMute"        },
-#     { Icon = "search",          Action = "Search"         },
-#     { Icon = "backlight_low",   Action = "IllumDown"      },
-#     { Icon = "backlight_high",  Action = "IllumUp"        },
-#     { Icon = "fast_rewind",     Action = "PreviousSong"   },
-#     { Icon = "play_pause",      Action = "PlayPause"      },
-#     { Icon = "fast_forward",    Action = "NextSong"       },
-#     { Icon = "volume_off",      Action = "Mute"           },
-#     { Icon = "volume_down",     Action = "VolumeDown"     },
-#     { Icon = "volume_up",       Action = "VolumeUp"       },
+#     { Text = "esc", Action = "Esc", Pinned = true, OnClick = "Action" },
+#     { Icon = "brightness_low",  Action = "BrightnessDown", OnClick = "Action" },
+#     { Icon = "brightness_high", Action = "BrightnessUp",   OnClick = "Action" },
+#     { Icon = "mic_off",         Action = "MicMute",        OnClick = "Action" },
+#     { Icon = "search",          Action = "Search",         OnClick = "Action" },
+#     { Icon = "backlight_low",   Action = "IllumDown",      OnClick = "Action" },
+#     { Icon = "backlight_high",  Action = "IllumUp",        OnClick = "Action" },
+#     { Icon = "fast_rewind",     Action = "PreviousSong",   OnClick = "Action" },
+#     { Icon = "play_pause",      Action = "PlayPause",      OnClick = "Action" },
+#     { Icon = "fast_forward",    Action = "NextSong",       OnClick = "Action" },
+#     { Icon = "volume_off",      Action = "Mute",           OnClick = "Action" },
+#     { Icon = "volume_down",     Action = "VolumeDown",     OnClick = "Action" },
+#     { Icon = "volume_up",       Action = "VolumeUp",       OnClick = "Action" },
 # ]
 
 # Layers = [
-#     [ { Text = "esc", Action = "Esc", Pinned = true }, { Text = "F1", Action = "F1" }, { Text = "F2", Action = "F2" } ],
-#     [ { Text = "esc", Action = "Esc", Pinned = true }, { Icon = "play_pause", Action = "PlayPause" } ],
-#     [ { Text = "esc", Action = "Esc", Pinned = true }, { Time = "%H:%M" }, { Cpu = "celsius watts", Stretch = 2 } ],
-#     [ { Text = "esc", Action = "Esc", Pinned = true }, { Gpu = "celsius watts", Stretch = 2 } ],
+#     [ { Text = "esc", Action = "Esc", Pinned = true, OnClick = "Action" }, { Text = "F1", Action = "F1", OnClick = "Action" }, { Text = "F2", Action = "F2", OnClick = "Action" } ],
+#     [ { Text = "esc", Action = "Esc", Pinned = true, OnClick = "Action" }, { Icon = "play_pause", Action = "PlayPause", OnClick = "Action" } ],
+#     [ { Text = "esc", Action = "Esc", Pinned = true, OnClick = "Action" }, { Time = "%H:%M" }, { Cpu = "celsius watts", Stretch = 2 } ],
+#     [ { Text = "esc", Action = "Esc", Pinned = true, OnClick = "Action" }, { Gpu = "celsius watts", Stretch = 2 } ],
 # ]
 
 # Cpu/Gpu widgets take a space-separated list of "celsius", "fahrenheit",

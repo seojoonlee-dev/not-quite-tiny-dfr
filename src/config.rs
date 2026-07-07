@@ -333,6 +333,7 @@ fn default_primary_layer() -> Vec<ButtonConfig> {
             .map(|(i, key)| ButtonConfig {
                 text: Some(format!("F{}", i + 1)),
                 action: vec![ButtonAction::Key(key)],
+                on_click: Some(OnClick::Action),
                 ..Default::default()
             }),
         )
@@ -361,6 +362,7 @@ fn default_media_layer() -> Vec<ButtonConfig> {
             .map(|(icon, key)| ButtonConfig {
                 icon: Some(icon.to_string()),
                 action: vec![ButtonAction::Key(key)],
+                on_click: Some(OnClick::Action),
                 ..Default::default()
             }),
         )
@@ -398,7 +400,7 @@ fn esc_button() -> ButtonConfig {
         slider_mute_icon: None,
         slider_low_icon: None,
         slider_stretch: None,
-        on_click: None,
+        on_click: Some(OnClick::Action),
         expand_command: None,
         expand_stretch: None,
         media: None,

@@ -661,6 +661,9 @@ struct Button {
     bg_color: Option<Color>,
     bg_color_active: Option<Color>,
     text_color: Option<Color>,
+    /// Whether tapping shows the pressed (active) fill. Only buttons that
+    /// declare an `OnClick` light up on tap; others stay flat.
+    highlight_on_tap: bool,
 }
 
 /// Copy the latest widget outputs into their buttons, marking changed ones for
@@ -1158,6 +1161,7 @@ impl Button {
             bg_color: None,
             bg_color_active: None,
             text_color: None,
+            highlight_on_tap: false,
         }
     }
     fn new_text(text: String, action: Vec<ButtonAction>) -> Button {
@@ -1171,6 +1175,7 @@ impl Button {
             bg_color: None,
             bg_color_active: None,
             text_color: None,
+            highlight_on_tap: false,
         }
     }
     fn new_command(
@@ -1197,6 +1202,7 @@ impl Button {
             bg_color: None,
             bg_color_active: None,
             text_color: None,
+            highlight_on_tap: false,
         }
     }
     fn new_icon(
@@ -1218,6 +1224,7 @@ impl Button {
             bg_color: None,
             bg_color_active: None,
             text_color: None,
+            highlight_on_tap: false,
         }
     }
     fn load_battery_image(icon: &str, theme: Option<impl AsRef<str>>) -> CachedSvg {
@@ -1282,6 +1289,7 @@ impl Button {
             bg_color: None,
             bg_color_active: None,
             text_color: None,
+            highlight_on_tap: false,
         }
     }
 
@@ -1318,6 +1326,7 @@ impl Button {
             bg_color: None,
             bg_color_active: None,
             text_color: None,
+            highlight_on_tap: false,
         }
     }
 
@@ -1347,6 +1356,7 @@ impl Button {
             bg_color: None,
             bg_color_active: None,
             text_color: None,
+            highlight_on_tap: false,
         }
     }
 
@@ -1380,6 +1390,7 @@ impl Button {
             bg_color: None,
             bg_color_active: None,
             text_color: None,
+            highlight_on_tap: false,
         }
     }
 
@@ -1413,6 +1424,7 @@ impl Button {
             bg_color: None,
             bg_color_active: None,
             text_color: None,
+            highlight_on_tap: false,
         }
     }
 
@@ -1443,6 +1455,7 @@ impl Button {
             bg_color: None,
             bg_color_active: None,
             text_color: None,
+            highlight_on_tap: false,
         }
     }
     fn needs_faster_refresh(&self) -> bool {
@@ -1780,7 +1793,7 @@ impl Button {
                 BatteryState::NotCharging => {}
             }
         }
-        if self.active {
+        if self.active && self.highlight_on_tap {
             Some(self.bg_color_active.unwrap_or(style.button_color_active))
         } else if show_outlines || style.button_color_set || self.bg_color.is_some() {
             // Draw the idle fill when outlines are on, or when the user set an
@@ -2718,7 +2731,11 @@ impl FunctionLayer {
                     stretch = 1;
                 }
                 **state += stretch;
-                let button = if let (Some(get), Some(set)) =
+                // Only OnClick = "Action" lights up on tap. Expand widgets show
+                // their expand animation instead, and buttons with no OnClick
+                // stay flat. Captured before `cfg` is consumed below.
+                let highlight_on_tap = cfg.on_click == Some(OnClick::Action);
+                let mut button = if let (Some(get), Some(set)) =
                     (cfg.slider_get.take(), cfg.slider_set.take())
                 {
                     let id = *next_id;
@@ -2800,6 +2817,7 @@ impl FunctionLayer {
                 } else {
                     Button::with_config(cfg, default_icon_size)
                 };
+                button.highlight_on_tap = highlight_on_tap;
                 Some((i, button))
             })
             .collect::<Vec<_>>();
@@ -5448,6 +5466,51 @@ mod tests {
         assert!(!muted(&layer));
         // A move that neither reaches nor leaves 0 touches mute at all.
         assert_eq!(layer.apply_slider_value(0, 40), Some((0, None)));
+    }
+
+    #[test]
+    fn only_on_click_action_highlights_on_tap() {
+        let keys = vec![
+            ButtonConfig {
+                text: Some("plain".into()),
+                ..Default::default()
+            },
+            ButtonConfig {
+                text: Some("act".into()),
+                on_click: Some(OnClick::Action),
+                ..Default::default()
+            },
+            ButtonConfig {
+                command: Some("echo hi".into()),
+                on_click: Some(OnClick::Expand),
+                expand_command: Some("echo x".into()),
+                ..Default::default()
+            },
+        ];
+        let mut layer = FunctionLayer::with_config(
+            keys,
+            &mut Widgets::default(),
+            &mut 0,
+            48,
+            0,
+            true,
+            true,
+            true,
+            true,
+        );
+        // Only OnClick = "Action" lights up; plain and Expand stay flat.
+        assert!(!layer.buttons[0].1.highlight_on_tap);
+        assert!(layer.buttons[1].1.highlight_on_tap);
+        assert!(!layer.buttons[2].1.highlight_on_tap);
+        // ... and that flag gates the pressed fill: a tapped plain/Expand button
+        // stays flat (no fill), the Action one takes the active color.
+        let style = Style::default();
+        for (_, b) in layer.buttons.iter_mut() {
+            b.active = true;
+        }
+        assert_eq!(layer.buttons[0].1.fill_color(&style, false), None);
+        assert!(layer.buttons[1].1.fill_color(&style, false).is_some());
+        assert_eq!(layer.buttons[2].1.fill_color(&style, false), None);
     }
 
     /// Like `text_layer`, but with an explicit stretch per button.
