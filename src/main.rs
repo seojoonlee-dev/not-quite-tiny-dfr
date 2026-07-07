@@ -1680,19 +1680,84 @@ fn media_zone_at(active: bool, x: f64, left_edge: f64, button_width: f64, icon_w
 /// generation moves.
 fn media_art_surface(info: &media::MediaInfo) -> Option<ImageSurface> {
     thread_local! {
-        static CACHE: std::cell::RefCell<Option<(u64, Option<ImageSurface>)>> =
+        // (media generation, blur applied) -> cached surface. The blur flag is
+        // part of the key so toggling MediaCoverBlur live rebuilds the surface
+        // even though the track (generation) has not changed.
+        static CACHE: std::cell::RefCell<Option<(u64, bool, Option<ImageSurface>)>> =
             const { std::cell::RefCell::new(None) };
     }
+    let blur = media::cover_blur();
     CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if cache.as_ref().map(|(g, _)| *g) != Some(info.generation) {
+        if cache.as_ref().map(|(g, b, _)| (*g, *b)) != Some((info.generation, blur)) {
             let built = info.art.as_ref().and_then(|a| {
-                ImageSurface::create_for_data(a.data.clone(), Format::ARgb32, a.width, a.height, a.stride).ok()
+                let mut data = a.data.clone();
+                if blur {
+                    let (w, h) = (a.width.max(0) as usize, a.height.max(0) as usize);
+                    // Radius scaled to the cover so it reads as a blur at any art
+                    // size (covers are downscaled to <=256px on their long side).
+                    let radius = (w.min(h) / 32).clamp(2, 10);
+                    box_blur_argb32(&mut data, w, h, a.stride.max(0) as usize, radius);
+                }
+                ImageSurface::create_for_data(data, Format::ARgb32, a.width, a.height, a.stride).ok()
             });
-            *cache = Some((info.generation, built));
+            *cache = Some((info.generation, blur, built));
         }
-        cache.as_ref().and_then(|(_, s)| s.clone())
+        cache.as_ref().and_then(|(_, _, s)| s.clone())
     })
+}
+
+/// Blur an ARGB32 pixel buffer in place with a separable box blur, repeated three
+/// times to approximate a Gaussian. `stride` is the row length in bytes (>= 4*w);
+/// edges are extended (clamped) so the blur does not darken toward the borders.
+/// Channels are blurred independently, which is correct for the premultiplied
+/// ARGB the cover is stored as.
+pub(crate) fn box_blur_argb32(data: &mut [u8], w: usize, h: usize, stride: usize, radius: usize) {
+    if radius == 0 || w < 2 || h < 2 {
+        return;
+    }
+    let mut tmp = data.to_vec();
+    for _ in 0..3 {
+        // Horizontal: each row is a line of `w` pixels, 4 bytes apart.
+        blur_1d(data, &mut tmp, h, stride, w, 4, radius);
+        // Vertical: each column is a line of `h` pixels, `stride` bytes apart.
+        blur_1d(&tmp, data, w, 4, h, stride, radius);
+    }
+}
+
+/// One separable box-blur pass. Reads `src`, writes `dst`. There are `lines`
+/// parallel lines starting `line_step` bytes apart; each has `len` samples
+/// spaced `elem_step` bytes apart. Runs a moving sum so the cost is independent
+/// of the radius.
+#[allow(clippy::too_many_arguments)]
+fn blur_1d(
+    src: &[u8],
+    dst: &mut [u8],
+    lines: usize,
+    line_step: usize,
+    len: usize,
+    elem_step: usize,
+    r: usize,
+) {
+    let denom = (2 * r + 1) as u32;
+    for line in 0..lines {
+        let base = line * line_step;
+        for ch in 0..4 {
+            let at = |k: usize| src[base + k * elem_step + ch] as u32;
+            // Window centered at index 0, with the left overhang clamped to the
+            // first sample.
+            let mut sum = r as u32 * at(0);
+            for k in 0..=r {
+                sum += at(k.min(len - 1));
+            }
+            for i in 0..len {
+                dst[base + i * elem_step + ch] = (sum / denom) as u8;
+                let out_k = i.saturating_sub(r);
+                let in_k = (i + 1 + r).min(len - 1);
+                sum = sum - at(out_k) + at(in_k);
+            }
+        }
+    }
 }
 
 /// Paint the media widget across its full span: a now-playing panel (album
@@ -3256,6 +3321,8 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
 
     let mut cfg_mgr = ConfigManager::new(cfg_paths, width, height);
     let (mut cfg, mut layers, initial_widgets) = cfg_mgr.load_config();
+    media::set_lyric_offset(cfg.lyric_offset);
+    media::set_cover_blur(cfg.media_cover_blur);
     let mut pixel_shift = PixelShiftManager::new();
     let mut last = Instant::now();
     // Last time fling momentum was integrated (see the top of the main loop).
@@ -3517,12 +3584,16 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 let (new_cfg, new_layers, new_widgets) = cfg_mgr.load_config();
                 cfg = new_cfg;
                 layers = new_layers;
+                media::set_lyric_offset(cfg.lyric_offset);
+                media::set_cover_blur(cfg.media_cover_blur);
                 active_layer = 0;
                 needs_complete_redraw = true;
                 widget_rt = WidgetRuntime::new(new_widgets, wake_write.clone());
             }
         }
         if let Some(new_widgets) = cfg_mgr.update_config(&mut cfg, &mut layers) {
+            media::set_lyric_offset(cfg.lyric_offset);
+            media::set_cover_blur(cfg.media_cover_blur);
             active_layer = 0;
             needs_complete_redraw = true;
             // Replacing the runtime drops the old one, stopping its threads.

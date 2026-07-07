@@ -26,6 +26,12 @@
 # PinnedIgnoreScroll = true
 # PinnedIgnoreLayerSwipe = true
 
+# Seconds to shift synced lyrics; positive shows them earlier, negative later.
+# LyricOffset = 0.0
+
+# Blur the album cover behind the media panel.
+# MediaCoverBlur = false
+
 # Pinned must mark the same leading slots on every layer; a mismatch is a
 # config error (red banner on the bar).
 # PrimaryLayerKeys = [
@@ -93,6 +99,7 @@
 # [Style]
 # Background = "#000000"
 # BackgroundImage = ""
+# BackgroundImageBlur = false
 # ButtonColor = "#333333"
 # ButtonColorActive = "#666666"
 # TextColor = "#ffffff"

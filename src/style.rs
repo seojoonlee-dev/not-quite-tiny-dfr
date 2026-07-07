@@ -175,6 +175,8 @@ pub struct StyleProxy {
     pub background_image: Option<String>,
     /// Whichever of `Background` / `BackgroundImage` was declared last.
     pub background_last: Option<BackgroundSource>,
+    /// Whether to blur the background image (applied once at load).
+    pub background_image_blur: Option<bool>,
     pub button_color: Option<Color>,
     pub button_color_active: Option<Color>,
     pub text_color: Option<Color>,
@@ -211,6 +213,9 @@ impl<'de> Deserialize<'de> for StyleProxy {
                         "BackgroundImage" => {
                             s.background_image = Some(map.next_value()?);
                             s.background_last = Some(BackgroundSource::Image);
+                        }
+                        "BackgroundImageBlur" => {
+                            s.background_image_blur = Some(map.next_value()?)
                         }
                         "ButtonColor" => s.button_color = Some(map.next_value()?),
                         "ButtonColorActive" => s.button_color_active = Some(map.next_value()?),
@@ -250,6 +255,7 @@ impl StyleProxy {
         if user.background_last.is_some() {
             self.background_last = user.background_last;
         }
+        self.background_image_blur = user.background_image_blur.or(self.background_image_blur);
         self.button_color = user.button_color.or(self.button_color);
         self.button_color_active = user.button_color_active.or(self.button_color_active);
         self.text_color = user.text_color.or(self.text_color);
@@ -354,6 +360,18 @@ mod tests {
         let user: StyleProxy = toml::from_str("Background = \"#123456\"").unwrap();
         base.merge(user);
         assert_eq!(base.image_path(), None); // user declared color last -> color wins
+    }
+
+    #[test]
+    fn background_image_blur_parses_and_merges() {
+        let base: StyleProxy =
+            toml::from_str("BackgroundImage = \"bg.png\"\nBackgroundImageBlur = true").unwrap();
+        assert_eq!(base.background_image_blur, Some(true));
+        // A higher-precedence layer overrides the toggle.
+        let mut base: StyleProxy = toml::from_str("BackgroundImageBlur = true").unwrap();
+        let user: StyleProxy = toml::from_str("BackgroundImageBlur = false").unwrap();
+        base.merge(user);
+        assert_eq!(base.background_image_blur, Some(false));
     }
 
     #[test]

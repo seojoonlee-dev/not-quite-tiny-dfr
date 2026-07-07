@@ -37,6 +37,8 @@ misbehaving.
 | `LayerSwipe` | bool | `true` | Two-finger horizontal swipe slides between layers. |
 | `PinnedIgnoreScroll` | bool | `true` | Pinned buttons hold still while the rest of the layer scrolls. |
 | `PinnedIgnoreLayerSwipe` | bool | `true` | Pinned buttons hold still during layer swipes. |
+| `LyricOffset` | float | `0.0` | Seconds to shift synced lyrics against the audio. Positive shows each line earlier (compensates for audio output latency); negative shows it later. |
+| `MediaCoverBlur` | bool | `false` | Blur the album cover behind the media panel. |
 | `PrimaryLayerKeys` | array of buttons | Esc + F1–F12 | The primary layer. Ignored when `Layers` is set. |
 | `MediaLayerKeys` | array of buttons | Esc + media keys | The media layer. Ignored when `Layers` is set. |
 | `Layers` | array of button arrays | unset | Any number of layers; swiping cycles through them in order. When set, wins over `PrimaryLayerKeys`/`MediaLayerKeys`/`MediaLayerDefault`. |
@@ -118,6 +120,7 @@ Colors are hex strings: `#rgb`, `#rgba`, `#rrggbb`, or `#rrggbbaa`.
 | --- | --- | --- | --- |
 | `Background` | color | `#000000` | Bar background color. |
 | `BackgroundImage` | string | unset | PNG background, scaled/center-cropped to the bar (`cover`). Absolute path, or relative to the config dirs. Whichever of `Background`/`BackgroundImage` is declared **later** wins. |
+| `BackgroundImageBlur` | bool | `false` | Blur the background image (applied once when it's loaded). |
 | `ButtonColor` | color | `#333333` | Idle button fill. Setting it explicitly draws the fill even with `ShowButtonOutlines = false`, so buttons can be tinted over a background image. |
 | `ButtonColorActive` | color | `#666666` | Pressed button fill. |
 | `TextColor` | color | `#ffffff` | Label and icon color. |

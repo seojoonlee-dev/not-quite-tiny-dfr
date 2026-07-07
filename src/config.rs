@@ -34,6 +34,11 @@ pub struct Config {
     pub off_timeout: u32,
     /// Whether a vertical swipe on the bar slides between the two layers.
     pub layer_swipe: bool,
+    /// Seconds to shift synced lyrics against the audio: positive shows each
+    /// line earlier (compensating for audio output latency), negative later.
+    pub lyric_offset: f64,
+    /// Whether the media widget blurs the album cover behind the panel.
+    pub media_cover_blur: bool,
     pub style: Style,
 }
 
@@ -56,6 +61,8 @@ const DEFAULT_SCROLL_RUBBER_BAND: bool = true;
 const DEFAULT_LAYER_SWIPE: bool = true;
 const DEFAULT_PINNED_IGNORE_SCROLL: bool = true;
 const DEFAULT_PINNED_IGNORE_LAYER_SWIPE: bool = true;
+const DEFAULT_LYRIC_OFFSET: f64 = 0.0;
+const DEFAULT_MEDIA_COVER_BLUR: bool = false;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -76,6 +83,8 @@ struct ConfigProxy {
     layer_swipe: Option<bool>,
     pinned_ignore_scroll: Option<bool>,
     pinned_ignore_layer_swipe: Option<bool>,
+    lyric_offset: Option<f64>,
+    media_cover_blur: Option<bool>,
     style: Option<StyleProxy>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
@@ -136,6 +145,12 @@ impl ConfigProxy {
         }
         if o.pinned_ignore_layer_swipe.is_some() {
             self.pinned_ignore_layer_swipe = o.pinned_ignore_layer_swipe;
+        }
+        if o.lyric_offset.is_some() {
+            self.lyric_offset = o.lyric_offset;
+        }
+        if o.media_cover_blur.is_some() {
+            self.media_cover_blur = o.media_cover_blur;
         }
         if o.primary_layer_keys.is_some() {
             self.primary_layer_keys = o.primary_layer_keys;
@@ -450,7 +465,12 @@ fn resolve_image_path(path: &str) -> Option<PathBuf> {
 /// band. The surface is made one pixel-shift range larger than the bar in each
 /// axis, so pixel shift can slide the image around without exposing its edges
 /// (the renderer paints it centered, offset by half that margin).
-fn load_background_image(path: &str, width: i32, height: i32) -> Result<ImageSurface, String> {
+fn load_background_image(
+    path: &str,
+    width: i32,
+    height: i32,
+    blur: bool,
+) -> Result<ImageSurface, String> {
     let width = width + crate::pixel_shift::PIXEL_SHIFT_WIDTH_PX as i32;
     let height = height + crate::pixel_shift::PIXEL_SHIFT_HEIGHT_PX as i32;
     let resolved = resolve_image_path(path).ok_or_else(|| format!("not found: {path}"))?;
@@ -462,7 +482,7 @@ fn load_background_image(path: &str, width: i32, height: i32) -> Result<ImageSur
         return Err("image has zero size".to_string());
     }
     let scale = (width as f64 / iw).max(height as f64 / ih); // cover
-    let dst = ImageSurface::create(Format::ARgb32, width, height).map_err(|e| e.to_string())?;
+    let mut dst = ImageSurface::create(Format::ARgb32, width, height).map_err(|e| e.to_string())?;
     let c = Context::new(&dst).map_err(|e| e.to_string())?;
     // Center the scaled image, cropping the overflow to the bar.
     c.translate(
@@ -473,6 +493,16 @@ fn load_background_image(path: &str, width: i32, height: i32) -> Result<ImageSur
     c.set_source_surface(&src, 0.0, 0.0)
         .map_err(|e| e.to_string())?;
     c.paint().map_err(|e| e.to_string())?;
+    drop(c); // release the surface so its pixels can be taken for the blur
+    if blur {
+        let (w, h, stride) = (dst.width() as usize, dst.height() as usize, dst.stride() as usize);
+        // Radius scaled to the bar's short side (~60px) so the whole-bar
+        // wallpaper reads as clearly blurred, not just softened.
+        let radius = (w.min(h) / 8).clamp(4, 20);
+        dst.flush();
+        let mut data = dst.data().map_err(|e| e.to_string())?;
+        crate::box_blur_argb32(&mut data, w, h, stride, radius);
+    }
     Ok(dst)
 }
 
@@ -543,7 +573,8 @@ fn load_config(
     );
     // Load the background image once here (we know the bar size), if it wins.
     if let Some(path) = style_proxy.image_path() {
-        match load_background_image(path, width as i32, height as i32) {
+        let blur = style_proxy.background_image_blur.unwrap_or(false);
+        match load_background_image(path, width as i32, height as i32, blur) {
             Ok(surf) => style.background_image = Some(surf),
             Err(e) => eprintln!("not-quite-tiny-dfr: background image {path:?}: {e}"),
         }
@@ -647,6 +678,10 @@ fn load_config(
         dim_timeout: base.dim_timeout.unwrap_or(DEFAULT_DIM_TIMEOUT),
         off_timeout: base.off_timeout.unwrap_or(DEFAULT_OFF_TIMEOUT),
         layer_swipe: base.layer_swipe.unwrap_or(DEFAULT_LAYER_SWIPE),
+        lyric_offset: base.lyric_offset.unwrap_or(DEFAULT_LYRIC_OFFSET),
+        media_cover_blur: base
+            .media_cover_blur
+            .unwrap_or(DEFAULT_MEDIA_COVER_BLUR),
         style,
     };
     (cfg, layers, widgets)
@@ -897,6 +932,24 @@ mod tests {
         let over: ConfigProxy = toml::from_str("LayerSwipe = false\n").unwrap();
         base.merge(over);
         assert_eq!(base.layer_swipe, Some(false));
+    }
+
+    #[test]
+    fn lyric_offset_parses_and_merges() {
+        let mut base: ConfigProxy = toml::from_str("LyricOffset = 0.4\n").unwrap();
+        assert_eq!(base.lyric_offset, Some(0.4));
+        let over: ConfigProxy = toml::from_str("LyricOffset = -0.25\n").unwrap();
+        base.merge(over);
+        assert_eq!(base.lyric_offset, Some(-0.25));
+    }
+
+    #[test]
+    fn media_cover_blur_parses_and_merges() {
+        let mut base: ConfigProxy = toml::from_str("MediaCoverBlur = true\n").unwrap();
+        assert_eq!(base.media_cover_blur, Some(true));
+        let over: ConfigProxy = toml::from_str("MediaCoverBlur = false\n").unwrap();
+        base.merge(over);
+        assert_eq!(base.media_cover_blur, Some(false));
     }
 
     #[test]

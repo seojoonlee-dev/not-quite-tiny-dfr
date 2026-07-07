@@ -10,6 +10,7 @@
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -406,9 +407,13 @@ fn fetch_lyrics(
         // immediately slides to the real one when the sync thread catches up.
         let pos = derived_position().unwrap_or(0.0);
         ly.current = index_for_time(&lines, pos).unwrap_or(0);
-        // Start out of a gap; the sync thread applies the debounce from here so
-        // a load mid-break doesn't jump straight to the controls.
-        ly.in_gap = false;
+        // Adopt the real gap state for the current position. Forcing "out of a
+        // gap" here flashed the lyrics on for a load mid-break (intro /
+        // instrumental) and then hid them a moment later once the sync thread's
+        // debounce elapsed; seeding the true state settles straight to whichever
+        // view is correct. The sync thread pre-satisfies its debounce on this
+        // fresh load so it doesn't reverse the decision.
+        ly.in_gap = gap_at(&lines, pos);
         ly.lines = lines;
         ly.generation = ly.generation.wrapping_add(1);
         notify(&wake);
@@ -420,12 +425,40 @@ fn fetch_lyrics(
 /// position without another playerctl call.
 static ANCHOR: Mutex<Option<(f64, Instant, bool)>> = Mutex::new(None);
 
+/// User lyric-timing offset in milliseconds (config `LyricOffset`, in seconds).
+/// Added to the derived playback position before looking up the current line, so
+/// a positive value shows lyrics earlier (compensating for audio output latency)
+/// and a negative value shows them later. Set from the main loop on config load.
+static LYRIC_OFFSET_MS: AtomicI64 = AtomicI64::new(0);
+
+/// Apply the configured lyric offset (seconds); called on config load/reload.
+pub fn set_lyric_offset(secs: f64) {
+    LYRIC_OFFSET_MS.store((secs * 1000.0).round() as i64, Ordering::Relaxed);
+}
+
+/// Whether the album cover is blurred behind the panel (config `MediaCoverBlur`).
+/// Read by the render thread when it builds the cover surface. Set from the main
+/// loop on config load.
+static COVER_BLUR: AtomicBool = AtomicBool::new(false);
+
+/// Apply the configured cover-blur toggle; called on config load/reload.
+pub fn set_cover_blur(on: bool) {
+    COVER_BLUR.store(on, Ordering::Relaxed);
+}
+
+/// Whether the album cover should be drawn blurred.
+pub fn cover_blur() -> bool {
+    COVER_BLUR.load(Ordering::Relaxed)
+}
+
 /// Current playback position derived from the anchor, in seconds; `None` when no
-/// anchor has been set yet. Extrapolates while playing.
+/// anchor has been set yet. Extrapolates while playing, and shifts by the
+/// configured `LyricOffset` so the lyric lookup leads or trails the audio.
 fn derived_position() -> Option<f64> {
+    let offset = LYRIC_OFFSET_MS.load(Ordering::Relaxed) as f64 / 1000.0;
     match *ANCHOR.lock().unwrap() {
-        Some((pos, at, true)) => Some(pos + at.elapsed().as_secs_f64()),
-        Some((pos, _, false)) => Some(pos),
+        Some((pos, at, true)) => Some(pos + at.elapsed().as_secs_f64() + offset),
+        Some((pos, _, false)) => Some(pos + offset),
         None => None,
     }
 }
@@ -555,6 +588,9 @@ fn spawn_lyric_sync_thread(wake: Arc<OwnedFd>) {
         // position against small backward jitter; only a large drop (a real
         // seek, or a new track) moves it back.
         let mut mono_pos: Option<f64> = None;
+        // Whether lyrics were present on the previous tick, so a fresh load
+        // (none -> synced) can be detected and its debounce pre-satisfied.
+        let mut had_lyrics = false;
         loop {
             // Derive the current position from the anchor (no playerctl here).
             if let Some(derived) = derived_position() {
@@ -565,6 +601,14 @@ fn spawn_lyric_sync_thread(wake: Arc<OwnedFd>) {
                 mono_pos = Some(pos);
                 let mut ly = LYRICS_STATE.lock().unwrap();
                 if ly.has_lyrics() {
+                    // On a fresh load, adopt the gap state `fetch_lyrics` seeded
+                    // rather than debouncing into it: pre-satisfy the debounce so
+                    // lyrics that land during an intro/break stay on the controls
+                    // instead of flashing on for `GAP_DEBOUNCE` and hiding again.
+                    if !had_lyrics {
+                        had_lyrics = true;
+                        gap_start = gap_at(&ly.lines, pos).then_some(pos - GAP_DEBOUNCE);
+                    }
                     let mut changed = false;
                     if let Some(idx) = index_for_time(&ly.lines, pos) {
                         if ly.current != idx {
@@ -596,6 +640,11 @@ fn spawn_lyric_sync_thread(wake: Arc<OwnedFd>) {
                         ly.generation = ly.generation.wrapping_add(1);
                         notify(&wake);
                     }
+                } else {
+                    // No lyrics (track changed / still fetching): the next load
+                    // counts as fresh.
+                    had_lyrics = false;
+                    gap_start = None;
                 }
             }
             thread::sleep(LYRIC_TICK);
