@@ -221,13 +221,17 @@ Scripts shipped with the app are installed to
 
 - **`battery_eta.sh`** — the expand-view companion to `battery.sh`. Prints the
   estimated **time to empty** while discharging or **time to full** while
-  charging, from UPower's own `TimeToEmpty`/`TimeToFull`, e.g. `2h 15m left` or
-  `1h 30m to full`. Use it as the
-  `ExpandCommand` of a `battery.sh` widget with `OnClick = "Expand"` so the
-  collapsed button shows the percentage and a tap expands it to the ETA (see
-  [Expandable widgets](#expandable-widgets)). Same UPower source as
-  `battery.sh`, so it adds no dependency; an optional trailing argument selects
-  a UPower device leaf.
+  charging, e.g. `2h 15m left` or `1h 30m to full` (and `full` at the top). It
+  combines UPower's recalibrated `Energy`/`EnergyFull` with the *instantaneous*
+  current×voltage from sysfs, so it reacts to load right away instead of
+  trailing UPower's smoothed rate; a median-of-samples plus an EMA keep it
+  steady. Use it as the `ExpandCommand` of a `battery.sh` widget with
+  `OnClick = "Expand"` so the collapsed button shows the percentage and a tap
+  expands it to the ETA (see [Expandable widgets](#expandable-widgets)). Pass
+  the **same `-f N`** as `battery.sh` so "to full" targets the same ceiling and
+  reads `full` exactly when the collapsed view shows 100% (it also picks up
+  `battery.sh`'s learned ceiling automatically). Adds no dependency beyond
+  UPower; a trailing argument selects a UPower device leaf.
 
 ## Expandable widgets
 
@@ -238,11 +242,11 @@ volume slider uses — to `ExpandStretch` slots and shows `ExpandCommand`'s
 output, then auto-collapses after a few idle seconds. The expand script uses
 the same JSON/plain-text protocol as `Command`.
 
-The expand script **polls in the background** (every ~5s), so a smoothed value
-is always ready to show the instant you tap — no wait to compute it. Once open,
-that value is **frozen** until the button collapses, so it never shifts under
-you; it only takes on a fresh background reading while out of sight, ready for
-the next open. The collapsed reading and the expand view **crossfade** into
+The expand script **polls in the background**, so a smoothed value is always
+ready to show the instant you tap — no wait to compute it. Once open, that value
+is **frozen** until the button collapses, so it never shifts under you; it only
+takes on a fresh background reading while out of sight, ready for the next open.
+The collapsed reading and the expand view **crossfade** into
 each other as the button animates open and closed. For a value that would
 otherwise jump around (an ETA, a rate), smooth it in the script too — the
 bundled `battery_eta.sh` keeps an EMA of the power draw so the estimate drifts

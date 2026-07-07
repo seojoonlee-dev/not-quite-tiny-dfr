@@ -7,8 +7,13 @@
 # reacts to load right away instead of trailing UPower's own smoothed
 # EnergyRate (which it only re-emits every ~30s):
 #
-#   discharging:  eta = Energy            / (current_now * voltage_now)
-#   charging:     eta = (EnergyFull-Energy) / (current_now * voltage_now)
+#   discharging:  eta = Energy                 / (current_now * voltage_now)
+#   charging:     eta = (ceiling_energy-Energy) / (current_now * voltage_now)
+#
+# The charging target is the "full" ceiling battery.sh uses -- a degraded T2
+# pack stops a few percent short of EnergyFull, and battery.sh already shows
+# that point as 100%, so the ETA targets it too (and says "full" once reached)
+# instead of a perpetual few-min-to-full against an unreachable 100%.
 #
 # current_now is spiky, so it is sampled several times and the median is taken
 # (which ignores transient spikes outright); that value is then eased with an
@@ -18,13 +23,35 @@
 # collapsed button shows the percentage, tapping expands it to this ETA. Uses
 # the same UPower daemon as battery.sh, so it adds no dependency.
 #
-# Usage: battery_eta.sh [device]
-#   device: a UPower object-path leaf (default DisplayDevice, the aggregate).
+# Usage: battery_eta.sh [-f N] [device]
+#   -f N     the "full" ceiling percent, matching battery.sh's -f (default 100).
+#            battery.sh's learned ceiling (a shared state file) takes precedence.
+#   device   a UPower object-path leaf (default DisplayDevice, the aggregate).
 # Env knobs: NQTD_BAT (sysfs dir), NQTD_ETA_SAMPLES, NQTD_ETA_ALPHA.
+
+fullat=100
+while getopts f: opt; do
+    case $opt in
+        f) fullat=$OPTARG ;;
+        *) ;;
+    esac
+done
+shift $((OPTIND - 1))
 
 dev="${1:-DisplayDevice}"
 path="/org/freedesktop/UPower/devices/$dev"
 bat="${NQTD_BAT:-/sys/class/power_supply/BAT0}"
+
+# Full ceiling: the percentage battery.sh treats as 100% (a degraded T2 pack
+# stops a few percent below EnergyFull, and the SMC trickles/holds near the
+# top). Prefer the ceiling battery.sh has learned (shared state file) so "to
+# full" targets the same point battery.sh already shows as 100% -- otherwise it
+# would report a perpetual few-minutes-to-full against an unreachable 100%. -f
+# seeds it before battery.sh has learned one (pass the same -f as battery.sh).
+cap_file="${XDG_RUNTIME_DIR:-/tmp}/nqtd-battery-fullat.${dev}"
+ceiling=""
+[ -r "$cap_file" ] && ceiling=$(cat "$cap_file" 2>/dev/null)
+[ -z "$ceiling" ] && ceiling="$fullat"
 # current_now is already a stable, slowly-updating reading on T2 hardware, so a
 # short burst (median-filtered, ~0.1s total) is enough to shrug off a stray
 # glitch read while keeping the widget's response to a tap effectively instant.
@@ -84,7 +111,8 @@ state_file="${XDG_RUNTIME_DIR:-/tmp}/nqtd-battery-eta.${dev}.state"
 now=$(date +%s)
 prev_p=""
 prev_t=0
-[ -r "$state_file" ] && read prev_p prev_t < "$state_file" 2>/dev/null
+# (trailing junk absorbs any extra field, e.g. an older state-file format).
+[ -r "$state_file" ] && read prev_p prev_t junk < "$state_file" 2>/dev/null
 if [ -z "$prev_p" ] || [ "$((now - prev_t))" -gt 30 ]; then
     smooth=$power
 else
@@ -108,23 +136,30 @@ fmt() {  # seconds -> "Xh Ym" / "Ym" / "<1m"
 # UPower Device.State 2 = discharging; anything else is on the charger.
 if [ "$state" = "2" ]; then
     if [ "$too_low" = "1" ]; then
-        echo "estimating…"
+        msg="estimating…"
     else
         secs=$(awk -v e="$energy" -v p="$smooth" 'BEGIN { printf "%d", (e / p) * 3600 }')
-        echo "$(fmt "$secs") left"
+        msg="$(fmt "$secs") left"
     fi
 else
-    remain=$(awk -v f="$energy_full" -v e="$energy" \
-        'BEGIN { r = f - e; printf "%.4f", (r < 0 ? 0 : r) }')
-    full=$(awk -v r="$remain" 'BEGIN { print (r < 0.05) ? 1 : 0 }')
+    # Target the ceiling energy (EnergyFull * ceiling/100), not a literal 100%.
+    # "full" once Energy reaches the point battery.sh rounds up to 100% (>=
+    # 99.5% of the ceiling), so the two views agree instead of showing a
+    # lingering "few min to full" while the pack trickle-charges the last bit.
+    target=$(awk -v f="$energy_full" -v c="$ceiling" 'BEGIN { printf "%.4f", f * c / 100 }')
+    full=$(awk -v e="$energy" -v t="$target" \
+        'BEGIN { print (t <= 0 || e / t * 100 >= 99.5) ? 1 : 0 }')
     if [ "$state" = "4" ] || [ "$full" = "1" ]; then
-        # Fully charged (State 4, or there's essentially nothing left to add).
-        echo "full"
+        # Fully charged (State 4, or already at the ceiling battery.sh calls full).
+        msg="full"
     elif [ "$too_low" = "1" ]; then
         # Just plugged in; UPower has no rate yet.
-        echo "charging"
+        msg="charging"
     else
-        secs=$(awk -v r="$remain" -v p="$smooth" 'BEGIN { printf "%d", (r / p) * 3600 }')
-        echo "$(fmt "$secs") to full"
+        secs=$(awk -v t="$target" -v e="$energy" -v p="$smooth" \
+            'BEGIN { r = t - e; if (r < 0) r = 0; printf "%d", (r / p) * 3600 }')
+        msg="$(fmt "$secs") to full"
     fi
 fi
+
+printf '%s\n' "$msg"
