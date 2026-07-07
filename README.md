@@ -55,6 +55,8 @@ Each entry in `PrimaryLayerKeys`, `MediaLayerKeys`, or `Layers` is a table with:
 | `Battery` | string | unset | Make this a battery indicator; value is the display mode: `"icon"`, `"percentage"`, or `"both"`. |
 | `Cpu` (alias `CpuTemp`) | string | unset | Make this a CPU indicator; space-separated list of what to show: `"celsius"`, `"fahrenheit"`, `"watts"` (e.g. `"celsius watts"`). |
 | `CpuLabel` | bool | `true` | Show the leading `CPU` label on a `Cpu` widget. |
+| `Gpu` | string | unset | Make this a GPU indicator; same component list as `Cpu` (`"celsius"`, `"fahrenheit"`, `"watts"`). Vendor (AMD/NVIDIA/Intel) is detected automatically. |
+| `GpuLabel` | bool | `true` | Show the leading vendor label (e.g. `AMD`) on a `Gpu` widget. |
 | `Action` | string or array | none | Linux key name (`"F1"`, `"VolumeUp"`, `"IllumUp"` = keyboard backlight, …) or internal action `"TouchBarBrightnessUp"`/`"TouchBarBrightnessDown"` (the bar's own brightness, 10 levels, hold to repeat). An array sends a chord. |
 | `Pinned` | bool | `false` | Keep this leading button outside the scrolling band and still during layer swipes. Pinned slots must match across all layers, or the config is rejected. |
 | `Stretch` | int | `1` | How many button slots this button spans. |
@@ -127,9 +129,6 @@ Colors are hex strings: `#rgb`, `#rgba`, `#rrggbb`, or `#rrggbbaa`.
 | `HeightPercent` | number | `90` | Button height as a percentage (0–100) of the bar height. |
 | `BatteryChargingColor` | color | `#00b300` | Battery indicator color while charging. |
 | `BatteryLowColor` | color | `#b30000` | Battery indicator color when low. |
-| `CpuTempCoolColor` | color | `#8ec07c` | CPU temperature text color below 70 °C. |
-| `CpuTempWarmColor` | color | `#fabd2f` | CPU temperature text color from 70 °C. |
-| `CpuTempHotColor` | color | `#fb4934` | CPU temperature text color from 85 °C. |
 
 ## Custom widgets
 
@@ -232,16 +231,37 @@ every 2 seconds and the button redraws only when a reading changes.
 
 - **Temperature** (`celsius`/`fahrenheit`) reads the `x86_pkg_temp` thermal zone
   when present (Intel), else the hottest zone under `/sys/class/thermal` (e.g.
-  Apple Silicon). It is color-coded by temperature: `CpuTempCoolColor` below
-  70 °C, `CpuTempWarmColor` from 70 °C, and `CpuTempHotColor` from 85 °C (see
-  the `[Style]` table).
+  Apple Silicon).
 
 - **Power** (`watts`) shows CPU package draw (e.g. `15W`), derived from the
   Intel RAPL energy counter. That counter is root-only, so the daemon opens it
   while it still has privileges at startup; if RAPL isn't present it shows
-  `n/a`. Uncolored (no heat coding).
+  `n/a`.
 
 Any component that can't be read shows `n/a` in its place.
+
+## GPU widget
+
+The GPU indicator is built into the daemon and mirrors the CPU widget:
+
+```toml
+{ Gpu = "celsius watts", Stretch = 2 }
+```
+
+The `Gpu` value is the same **space-separated list** as `Cpu` — any of
+`celsius`, `fahrenheit`, and `watts` (alias `power`) — so `"celsius watts"`
+shows both, e.g. `AMD 54°C 22W`. At startup the daemon **detects the GPU
+vendor** and uses it as the label prefix (`AMD`, `NVIDIA`, or `Intel`);
+`GpuLabel = false` drops it. A background thread polls every 2 seconds and the
+button redraws only when a reading changes.
+
+- **Temperature** (`celsius`/`fahrenheit`) and **power** (`watts`) come from the
+  card's `amdgpu`/`i915` hwmon sysfs (`temp1_input`, `power1_average`) on
+  AMD/Intel, or from `nvidia-smi` on NVIDIA. All are readable unprivileged, so —
+  unlike CPU RAPL — nothing is opened as root.
+
+A component the detected GPU doesn't expose (e.g. power on some integrated
+chips) shows `n/a`, as does everything when no supported GPU is found.
 
 ## Battery widget
 

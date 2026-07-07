@@ -67,7 +67,12 @@
 #     [ { Text = "esc", Action = "Esc", Pinned = true }, { Text = "F1", Action = "F1" }, { Text = "F2", Action = "F2" } ],
 #     [ { Text = "esc", Action = "Esc", Pinned = true }, { Icon = "play_pause", Action = "PlayPause" } ],
 #     [ { Text = "esc", Action = "Esc", Pinned = true }, { Time = "%H:%M" }, { Cpu = "celsius watts", Stretch = 2 } ],
+#     [ { Text = "esc", Action = "Esc", Pinned = true }, { Gpu = "celsius watts", Stretch = 2 } ],
 # ]
+
+# Cpu/Gpu widgets take a space-separated list of "celsius", "fahrenheit",
+# "watts" (e.g. "celsius watts"). CpuLabel/GpuLabel = false drops the label
+# prefix. The GPU vendor (AMD/NVIDIA/Intel) is detected automatically.
 
 # A slider widget (SliderGet prints 0-100, optionally "NN muted"; SliderSet
 # runs with {} = new value; SliderMute runs with {} = "0" when a drag unmutes;
@@ -94,6 +99,3 @@
 # HeightPercent = 90
 # BatteryChargingColor = "#00b300"
 # BatteryLowColor = "#b30000"
-# CpuTempCoolColor = "#8ec07c"
-# CpuTempWarmColor = "#fabd2f"
-# CpuTempHotColor = "#fb4934"

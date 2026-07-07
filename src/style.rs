@@ -139,10 +139,6 @@ pub struct Style {
     pub height_percent: f64,
     pub battery_charging_color: Color,
     pub battery_low_color: Color,
-    /// Text colors of the CpuTemp widget by temperature band.
-    pub cpu_temp_cool_color: Color,
-    pub cpu_temp_warm_color: Color,
-    pub cpu_temp_hot_color: Color,
 }
 
 impl Default for Style {
@@ -164,10 +160,6 @@ impl Default for Style {
             height_percent: 90.0,
             battery_charging_color: Color::rgb(0.0, 0.7, 0.0),
             battery_low_color: Color::rgb(0.7, 0.0, 0.0),
-            // Defaults match the retired bundled cpu_temp.sh widget script.
-            cpu_temp_cool_color: Color::parse_hex("#8ec07c").unwrap(),
-            cpu_temp_warm_color: Color::parse_hex("#fabd2f").unwrap(),
-            cpu_temp_hot_color: Color::parse_hex("#fb4934").unwrap(),
         }
     }
 }
@@ -194,9 +186,6 @@ pub struct StyleProxy {
     pub height_percent: Option<f64>,
     pub battery_charging_color: Option<Color>,
     pub battery_low_color: Option<Color>,
-    pub cpu_temp_cool_color: Option<Color>,
-    pub cpu_temp_warm_color: Option<Color>,
-    pub cpu_temp_hot_color: Option<Color>,
 }
 
 impl<'de> Deserialize<'de> for StyleProxy {
@@ -236,9 +225,6 @@ impl<'de> Deserialize<'de> for StyleProxy {
                             s.battery_charging_color = Some(map.next_value()?)
                         }
                         "BatteryLowColor" => s.battery_low_color = Some(map.next_value()?),
-                        "CpuTempCoolColor" => s.cpu_temp_cool_color = Some(map.next_value()?),
-                        "CpuTempWarmColor" => s.cpu_temp_warm_color = Some(map.next_value()?),
-                        "CpuTempHotColor" => s.cpu_temp_hot_color = Some(map.next_value()?),
                         // Unknown keys are ignored (kept lenient on purpose).
                         _ => {
                             map.next_value::<de::IgnoredAny>()?;
@@ -275,9 +261,6 @@ impl StyleProxy {
         self.height_percent = user.height_percent.or(self.height_percent);
         self.battery_charging_color = user.battery_charging_color.or(self.battery_charging_color);
         self.battery_low_color = user.battery_low_color.or(self.battery_low_color);
-        self.cpu_temp_cool_color = user.cpu_temp_cool_color.or(self.cpu_temp_cool_color);
-        self.cpu_temp_warm_color = user.cpu_temp_warm_color.or(self.cpu_temp_warm_color);
-        self.cpu_temp_hot_color = user.cpu_temp_hot_color.or(self.cpu_temp_hot_color);
     }
 
     /// Resolve into a concrete [`Style`], filling any unset field with its
@@ -308,9 +291,6 @@ impl StyleProxy {
                 .battery_charging_color
                 .unwrap_or(d.battery_charging_color),
             battery_low_color: self.battery_low_color.unwrap_or(d.battery_low_color),
-            cpu_temp_cool_color: self.cpu_temp_cool_color.unwrap_or(d.cpu_temp_cool_color),
-            cpu_temp_warm_color: self.cpu_temp_warm_color.unwrap_or(d.cpu_temp_warm_color),
-            cpu_temp_hot_color: self.cpu_temp_hot_color.unwrap_or(d.cpu_temp_hot_color),
         }
     }
 

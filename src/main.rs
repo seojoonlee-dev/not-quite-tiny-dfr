@@ -47,6 +47,7 @@ use udev::MonitorBuilder;
 mod backlight;
 mod config;
 mod display;
+mod gpu;
 mod media;
 mod pixel_shift;
 mod style;
@@ -172,9 +173,6 @@ const FLING_STALE_US: u64 = 80_000;
 const BATTERY_POLL: Duration = Duration::from_secs(1);
 /// How often the CPU temperature poller thread re-reads sysfs.
 const CPU_TEMP_POLL: Duration = Duration::from_secs(2);
-/// Cpu widget temperature color thresholds, in °C.
-const CPU_TEMP_WARM_C: i32 = 70;
-const CPU_TEMP_HOT_C: i32 = 85;
 /// A fling decelerating below this (px/s) stops.
 const FLING_STOP_VELOCITY: f64 = 40.0;
 /// Exponential-decay time constant of fling friction, in seconds.
@@ -308,6 +306,15 @@ static CPU_TEMP_STATE: Mutex<Option<i32>> = Mutex::new(None);
 /// counter by a poller thread. `None` means no readable RAPL counter.
 static CPU_POWER_STATE: Mutex<Option<i32>> = Mutex::new(None);
 
+/// Latest GPU temperature and package power (whole °C / whole W), updated by a
+/// poller thread (same never-read-sysfs-on-the-render-path rule as the CPU
+/// states). `None` means the detected GPU doesn't expose that sensor.
+static GPU_TEMP_STATE: Mutex<Option<i32>> = Mutex::new(None);
+static GPU_POWER_STATE: Mutex<Option<i32>> = Mutex::new(None);
+/// The detected GPU's vendor label ("AMD"/"NVIDIA"/"Intel"), or a bare "GPU"
+/// until detection resolves it. Shown as the widget's label prefix.
+static GPU_LABEL: Mutex<&'static str> = Mutex::new("GPU");
+
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum CpuTempUnit {
     Celsius,
@@ -319,6 +326,17 @@ enum CpuTempUnit {
 /// `Cpu` config value (e.g. "celsius watts") and `CpuLabel`.
 #[derive(Copy, Clone, Eq, PartialEq)]
 struct CpuDisplay {
+    temp: Option<CpuTempUnit>,
+    watts: bool,
+    label: bool,
+}
+
+/// What a `Gpu` widget shows: an optional temperature (in some unit) and/or the
+/// power draw, with an optional vendor label prefix ("AMD"/"NVIDIA"/...).
+/// Selected by the `Gpu` config value (e.g. "celsius watts") and `GpuLabel`.
+/// Reuses [`CpuTempUnit`] for the unit -- celsius/fahrenheit are the same here.
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct GpuDisplay {
     temp: Option<CpuTempUnit>,
     watts: bool,
     label: bool,
@@ -456,6 +474,7 @@ enum ButtonImage {
     Time(Vec<ChronoItem<'static>>, Locale),
     Battery(BatteryIconMode, BatteryImages),
     Cpu(CpuDisplay),
+    Gpu(GpuDisplay),
     Slider(SliderState),
     Media(MediaState),
     /// A command widget: `text`/`color` are updated from its script's output.
@@ -926,6 +945,36 @@ fn cpu_text(d: &CpuDisplay) -> String {
     parts.join(" ")
 }
 
+/// The GPU widget's label for the current cached readings. Mirrors `cpu_text`,
+/// but the label is the detected vendor name rather than a fixed "CPU".
+fn gpu_text(d: &GpuDisplay) -> String {
+    let label = *GPU_LABEL.lock().unwrap();
+    let mut parts: Vec<String> = Vec::new();
+    if d.label {
+        parts.push(label.to_string());
+    }
+    if let Some(unit) = d.temp {
+        parts.push(match *GPU_TEMP_STATE.lock().unwrap() {
+            Some(c) => match unit {
+                CpuTempUnit::Celsius => format!("{c}\u{00b0}C"),
+                CpuTempUnit::Fahrenheit => format!("{}\u{00b0}F", c * 9 / 5 + 32),
+            },
+            None => "n/a".to_string(),
+        });
+    }
+    if d.watts {
+        parts.push(match *GPU_POWER_STATE.lock().unwrap() {
+            Some(w) => format!("{w}W"),
+            None => "n/a".to_string(),
+        });
+    }
+    // A spec that selects nothing and hides the label still shows a bare label.
+    if parts.is_empty() {
+        return label.to_string();
+    }
+    parts.join(" ")
+}
+
 impl Button {
     fn with_config(cfg: ButtonConfig, default_icon_size: i32) -> Button {
         let (bg_color, bg_color_active, text_color) = (cfg.color, cfg.color_active, cfg.text_color);
@@ -949,6 +998,8 @@ impl Button {
             }
         } else if let Some(spec) = cfg.cpu {
             Button::new_cpu(cfg.action, &spec, cfg.cpu_label.unwrap_or(true))
+        } else if let Some(spec) = cfg.gpu {
+            Button::new_gpu(cfg.action, &spec, cfg.gpu_label.unwrap_or(true))
         } else {
             Button::new_spacer()
         };
@@ -1188,6 +1239,39 @@ impl Button {
         }
     }
 
+    fn new_gpu(action: Vec<ButtonAction>, spec: &str, label: bool) -> Button {
+        // Same space-separated component list as the Cpu widget; unknown tokens
+        // are a journal line, not a daemon abort (this runs on live reloads too).
+        let mut temp = None;
+        let mut watts = false;
+        let mut any = false;
+        for tok in spec.split_whitespace() {
+            match tok {
+                "celsius" => (temp, any) = (Some(CpuTempUnit::Celsius), true),
+                "fahrenheit" => (temp, any) = (Some(CpuTempUnit::Fahrenheit), true),
+                "watts" | "power" => (watts, any) = (true, true),
+                other => {
+                    eprintln!("not-quite-tiny-dfr: unknown Gpu component {other:?}, ignoring");
+                }
+            }
+        }
+        // An empty or all-unknown spec falls back to temperature in celsius.
+        if !any {
+            temp = Some(CpuTempUnit::Celsius);
+        }
+        Button {
+            action,
+            active: false,
+            changed: false,
+            image: ButtonImage::Gpu(GpuDisplay { temp, watts, label }),
+            icon_width: 0.0,
+            icon_height: 0.0,
+            bg_color: None,
+            bg_color_active: None,
+            text_color: None,
+        }
+    }
+
     fn new_time(action: Vec<ButtonAction>, format: &str, locale_str: Option<&str>) -> Button {
         let format_str = if format == "24hr" {
             "%H:%M    %a %-e %b"
@@ -1328,6 +1412,10 @@ impl Button {
                 let layout = text_layout(c, style, &cpu_text(d));
                 show_layout_centered(c, &layout, height, button_left_edge, button_width, y_shift);
             }
+            ButtonImage::Gpu(d) => {
+                let layout = text_layout(c, style, &gpu_text(d));
+                show_layout_centered(c, &layout, height, button_left_edge, button_width, y_shift);
+            }
             ButtonImage::Slider(s) => {
                 let color = self.text_color.unwrap_or(style.text_color);
                 // The icon reflects the control's state: the mute symbol while
@@ -1417,30 +1505,13 @@ impl Button {
         }
     }
     /// The color to draw this button's text in, letting a command widget's own
-    /// JSON `color` -- or a Cpu widget's cool/warm/hot coding -- override
-    /// the configured/default text color.
+    /// JSON `color` override the configured/default text color.
     fn effective_text_color(&self, style: &style::Style) -> Color {
         if let ButtonImage::Command {
             color: Some(color), ..
         } = &self.image
         {
             return *color;
-        }
-        // Temperature is heat-coded; the watts mode isn't, so it falls through
-        // to the ordinary text color below.
-        if let ButtonImage::Cpu(d) = &self.image {
-            // Only temperature is heat-coded; a watts-only widget isn't.
-            if d.temp.is_some() {
-                match *CPU_TEMP_STATE.lock().unwrap() {
-                    Some(c) if c >= CPU_TEMP_HOT_C => return style.cpu_temp_hot_color,
-                    Some(c) if c >= CPU_TEMP_WARM_C => return style.cpu_temp_warm_color,
-                    Some(_) => {
-                        return self.text_color.unwrap_or(style.cpu_temp_cool_color);
-                    }
-                    // No sensor: "CPU n/a" in the ordinary text color.
-                    None => {}
-                }
-            }
         }
         self.text_color.unwrap_or(style.text_color)
     }
@@ -1893,6 +1964,7 @@ pub struct FunctionLayer {
     displays_time: bool,
     displays_battery: bool,
     displays_cpu: bool,
+    displays_gpu: bool,
     displays_media: bool,
     buttons: Vec<(usize, Button)>,
     virtual_button_count: usize,
@@ -2353,6 +2425,7 @@ impl FunctionLayer {
         let displays_time = cfg.iter().any(|cfg| cfg.time.is_some());
         let displays_battery = cfg.iter().any(|cfg| cfg.battery.is_some());
         let displays_cpu = cfg.iter().any(|cfg| cfg.cpu.is_some());
+        let displays_gpu = cfg.iter().any(|cfg| cfg.gpu.is_some());
         let displays_media = cfg.iter().any(|cfg| cfg.media == Some(true));
         let buttons = cfg
             .into_iter()
@@ -2417,6 +2490,7 @@ impl FunctionLayer {
             displays_time,
             displays_battery,
             displays_cpu,
+            displays_gpu,
             displays_media,
             buttons,
             virtual_button_count,
@@ -3148,6 +3222,9 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
     let mut last_cpu_temp_drawn = *CPU_TEMP_STATE.lock().unwrap();
     // Same, for the Cpu widget's watts mode.
     let mut last_cpu_power_drawn = *CPU_POWER_STATE.lock().unwrap();
+    // Same, for Gpu buttons (temperature and watts).
+    let mut last_gpu_temp_drawn = *GPU_TEMP_STATE.lock().unwrap();
+    let mut last_gpu_power_drawn = *GPU_POWER_STATE.lock().unwrap();
     // The media generation currently on screen; the Media widget redraws when
     // the poller publishes a new status / track / album art.
     let mut last_media_gen = MEDIA_STATE.lock().unwrap().generation;
@@ -3264,6 +3341,35 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 }
                 last = Some((cur, now));
             }
+        });
+    }
+    // GPU temperature + power poller: mirrors the CPU pollers, but one thread
+    // reads both sensors from whichever source the detected GPU exposes
+    // (amdgpu/i915 hwmon, or nvidia-smi). All are readable unprivileged, so --
+    // unlike RAPL -- nothing needs opening while root.
+    if let Some(gpu) = gpu::Gpu::detect() {
+        *GPU_LABEL.lock().unwrap() = gpu.vendor.label();
+        let seed = gpu.read();
+        *GPU_TEMP_STATE.lock().unwrap() = seed.temp;
+        *GPU_POWER_STATE.lock().unwrap() = seed.watts;
+        let wake = wake_write.clone();
+        thread::spawn(move || loop {
+            let reading = gpu.read();
+            let changed = {
+                let mut temp = GPU_TEMP_STATE.lock().unwrap();
+                let mut power = GPU_POWER_STATE.lock().unwrap();
+                let changed = *temp != reading.temp || *power != reading.watts;
+                *temp = reading.temp;
+                *power = reading.watts;
+                changed
+            };
+            if changed {
+                let byte = [1u8];
+                unsafe {
+                    libc::write(wake.as_raw_fd(), byte.as_ptr() as *const libc::c_void, 1);
+                }
+            }
+            thread::sleep(CPU_TEMP_POLL);
         });
     }
     // Now-playing media polling (playerctl / MPRIS): same wake-pipe pattern as
@@ -3812,6 +3918,19 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 last_cpu_power_drawn = power;
                 for button in &mut layers[active_layer].buttons {
                     if let ButtonImage::Cpu(_) = button.1.image {
+                        button.1.changed = true;
+                    }
+                }
+            }
+        }
+        if layers[active_layer].displays_gpu {
+            let reading = *GPU_TEMP_STATE.lock().unwrap();
+            let power = *GPU_POWER_STATE.lock().unwrap();
+            if reading != last_gpu_temp_drawn || power != last_gpu_power_drawn {
+                last_gpu_temp_drawn = reading;
+                last_gpu_power_drawn = power;
+                for button in &mut layers[active_layer].buttons {
+                    if let ButtonImage::Gpu(_) = button.1.image {
                         button.1.changed = true;
                     }
                 }

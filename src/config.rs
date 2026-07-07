@@ -222,6 +222,12 @@ pub struct ButtonConfig {
     pub cpu: Option<String>,
     // Whether the CPU widget shows the "CPU" label prefix (default true).
     pub cpu_label: Option<bool>,
+    // Built-in GPU widget. Same space-separated component list as the CPU widget
+    // ("celsius", "fahrenheit", "watts"). The vendor (AMD/NVIDIA/Intel) is
+    // detected automatically and used as the label prefix.
+    pub gpu: Option<String>,
+    // Whether the GPU widget shows the vendor label prefix (default true).
+    pub gpu_label: Option<bool>,
     pub locale: Option<String>,
     #[serde(deserialize_with = "array_or_single", default)]
     pub action: Vec<ButtonAction>,
@@ -339,6 +345,8 @@ fn esc_button() -> ButtonConfig {
         battery: None,
         cpu: None,
         cpu_label: None,
+        gpu: None,
+        gpu_label: None,
         icon_width: None,
         icon_height: None,
         color: None,
@@ -384,6 +392,8 @@ fn error_layer(message: &str) -> FunctionLayer {
             battery: None,
             cpu: None,
             cpu_label: None,
+            gpu: None,
+            gpu_label: None,
             icon_width: None,
             icon_height: None,
             color: None,
@@ -899,6 +909,15 @@ mod tests {
         // The old `CpuTemp` key still works via the serde alias.
         let old: ButtonConfig = toml::from_str("CpuTemp = \"celsius\"\n").unwrap();
         assert_eq!(old.cpu.as_deref(), Some("celsius"));
+    }
+
+    #[test]
+    fn gpu_button_parses() {
+        let cfg: ButtonConfig =
+            toml::from_str("Gpu = \"celsius watts\"\nGpuLabel = false\nStretch = 2\n").unwrap();
+        assert_eq!(cfg.gpu.as_deref(), Some("celsius watts"));
+        assert_eq!(cfg.gpu_label, Some(false));
+        assert_eq!(cfg.stretch, Some(2));
     }
 
     #[test]
