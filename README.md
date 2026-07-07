@@ -71,6 +71,9 @@ Each entry in `PrimaryLayerKeys`, `MediaLayerKeys`, or `Layers` is a table with:
 | `SliderGet` / `SliderSet` | string | unset | Make this a slider widget (see [Slider widgets](#slider-widgets)): `SliderGet` prints the value 0–100 (optionally followed by `muted`), `SliderSet` runs with `{}` replaced by the new value. Both required. |
 | `SliderMute` | string | unset | Mute command for a slider: runs with `{}` replaced by `toggle` (tapping the expanded slider's icon) or `0` (a drag unmutes). |
 | `SliderStretch` | int | `2` | Slots the slider expands to when tapped (collapsed it uses `Stretch`). |
+| `OnClick` | string | `"Action"` | What a tap does. `"Action"` runs the button's `Action`/keys (the default). `"Expand"` instead expands the button in place — reusing the slider's animation — and shows `ExpandCommand`'s output until it idles (see [Expandable widgets](#expandable-widgets)). |
+| `ExpandCommand` | string | unset | For `OnClick = "Expand"`: the shell command whose stdout fills the expanded view (same JSON/plain-text protocol as `Command`). Required to expand. |
+| `ExpandStretch` | int | `2` | Slots the button expands to when tapped (collapsed it uses `Stretch`). |
 
 ### `Action` values
 
@@ -200,15 +203,64 @@ Scripts shipped with the app are installed to
   where the kernel's `charge_full`/`capacity` read wrong and the built-in
   indicator can stick near 100%, this reports the true level. `-c` colors the
   label (green while charging, red below 10%) and `-t` drops the icon for
-  text-only; an optional trailing argument selects a UPower device leaf
-  (default `DisplayDevice`, the aggregate battery):
+  text-only. The percentage **auto-calibrates to a flat 100%** like macOS: each
+  time the firmware reports the pack fully charged, its raw level (e.g. ~97% on
+  a degraded T2 cell that the SMC won't trickle past) is learned as the ceiling
+  and the reading is rescaled `0…ceiling` → `0…100`, so it shows `100%` when
+  full and glides down smoothly when unplugged instead of snapping to 97. `-f N`
+  just seeds that ceiling before the first full charge of the session. An
+  optional trailing argument selects a UPower device leaf (default
+  `DisplayDevice`):
 
   ```toml
-  { Command = "sh /usr/share/not-quite-tiny-dfr/widgets/battery.sh", Interval = 30, Stretch = 1 }
+  { Command = "sh /usr/share/not-quite-tiny-dfr/widgets/battery.sh -w -f 96", Interval = 0, Stretch = 1 }
   ```
 
   It shows `battery n/a` if UPower isn't running or the device is absent.
   Requires `busctl` (from systemd) to reach the system bus.
+
+- **`battery_eta.sh`** — the expand-view companion to `battery.sh`. Prints the
+  estimated **time to empty** while discharging or **time to full** while
+  charging, from UPower's own `TimeToEmpty`/`TimeToFull`, e.g. `2h 15m left` or
+  `1h 30m to full`. Use it as the
+  `ExpandCommand` of a `battery.sh` widget with `OnClick = "Expand"` so the
+  collapsed button shows the percentage and a tap expands it to the ETA (see
+  [Expandable widgets](#expandable-widgets)). Same UPower source as
+  `battery.sh`, so it adds no dependency; an optional trailing argument selects
+  a UPower device leaf.
+
+## Expandable widgets
+
+Any command widget can be made **tap-to-expand** by setting `OnClick =
+"Expand"` and an `ExpandCommand`. Collapsed, the button shows `Command`'s
+output at `Stretch` slots; a tap widens it — with the same spring animation the
+volume slider uses — to `ExpandStretch` slots and shows `ExpandCommand`'s
+output, then auto-collapses after a few idle seconds. The expand script uses
+the same JSON/plain-text protocol as `Command`.
+
+The expand script **polls in the background** (every ~5s), so a smoothed value
+is always ready to show the instant you tap — no wait to compute it. Once open,
+that value is **frozen** until the button collapses, so it never shifts under
+you; it only takes on a fresh background reading while out of sight, ready for
+the next open. The collapsed reading and the expand view **crossfade** into
+each other as the button animates open and closed. For a value that would
+otherwise jump around (an ETA, a rate), smooth it in the script too — the
+bundled `battery_eta.sh` keeps an EMA of the power draw so the estimate drifts
+instead of flickering.
+
+The bundled battery pair is the worked example: percentage collapsed, ETA
+expanded.
+
+```toml
+{ Command = "sh /usr/share/not-quite-tiny-dfr/widgets/battery.sh -t", Interval = 30,
+  OnClick = "Expand",
+  ExpandCommand = "sh /usr/share/not-quite-tiny-dfr/widgets/battery_eta.sh",
+  ExpandStretch = 3 }
+```
+
+`OnClick = "Expand"` suppresses the button's `Action` while it's the expand
+trigger. The built-in [slider](#slider-widgets) is the same mechanism with a
+draggable track instead of a second script.
 
 ## Slider widgets
 

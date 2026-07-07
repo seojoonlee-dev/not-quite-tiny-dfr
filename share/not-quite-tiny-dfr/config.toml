@@ -92,9 +92,22 @@
 # { Media = true, Stretch = 6 },
 
 # battery.sh -- battery icon + percentage from UPower. Flags: -c, -t, -w (with
-# -w use Interval = 0). Trailing arg: UPower device leaf (default DisplayDevice):
+# -w use Interval = 0), -f N (seed the "full" ceiling; the script auto-learns it
+# whenever the pack reports fully charged and rescales 0..ceiling -> 0..100, so a
+# degraded T2 cell that stops at ~97% reads a flat 100% like macOS). Trailing
+# arg: UPower device leaf (default DisplayDevice):
 # { Command = "sh /usr/share/not-quite-tiny-dfr/widgets/battery.sh", Interval = 30, Stretch = 1 },
-# { Command = "sh /usr/share/not-quite-tiny-dfr/widgets/battery.sh -w", Interval = 0, Stretch = 1 },
+# { Command = "sh /usr/share/not-quite-tiny-dfr/widgets/battery.sh -w -f 96", Interval = 0, Stretch = 1 },
+
+# OnClick = "Expand" makes any command widget tap-to-expand (the slider's
+# animation): the collapsed button shows Command's output, and a tap widens it
+# to ExpandStretch slots (default 2) to show ExpandCommand's output until it
+# idles. ExpandCommand polls in the background (~5s) so a value is ready the
+# instant it opens; that value is frozen while open and only refreshes while out
+# of sight, and the two contents crossfade during the animation. Example --
+# battery percentage that expands to the time-to-empty ETA (battery_eta.sh,
+# also from UPower, so no extra dependency):
+# { Command = "sh /usr/share/not-quite-tiny-dfr/widgets/battery.sh -t", Interval = 30, OnClick = "Expand", ExpandCommand = "sh /usr/share/not-quite-tiny-dfr/widgets/battery_eta.sh", ExpandStretch = 3 },
 
 # [Style]
 # Background = "#000000"

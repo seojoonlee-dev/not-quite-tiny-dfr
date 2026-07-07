@@ -183,6 +183,16 @@ pub enum ButtonAction {
     TouchBarBrightnessDown,
 }
 
+/// What a tap on a button does, chosen with the `OnClick` config key.
+/// `Action` (the default) runs the button's configured Action/keys; `Expand`
+/// instead expands the button in place -- reusing the slider's expand
+/// animation -- and shows an `ExpandCommand` script's output until it idles.
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Deserialize)]
+pub enum OnClick {
+    Action,
+    Expand,
+}
+
 impl<'de> Deserialize<'de> for ButtonAction {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let name = String::deserialize(deserializer)?;
@@ -246,6 +256,19 @@ pub struct ButtonConfig {
     pub locale: Option<String>,
     #[serde(deserialize_with = "array_or_single", default)]
     pub action: Vec<ButtonAction>,
+    // What a tap does: "Action" (default) runs the button's Action/keys;
+    // "Expand" instead expands the button in place (the slider's animation)
+    // and shows a separate ExpandCommand script's output until it idles.
+    pub on_click: Option<OnClick>,
+    // For OnClick = "Expand": the shell command whose stdout fills the expanded
+    // view (same JSON `{"text","color","icon"}` or plain-text protocol as a
+    // command widget). It polls in the background so a value is always ready the
+    // instant the button opens; the shown value is then frozen until it
+    // collapses (it only refreshes while out of sight), and the collapsed and
+    // expanded contents crossfade during the animation. `expand_stretch` is the
+    // expanded width in slots (default 2).
+    pub expand_command: Option<String>,
+    pub expand_stretch: Option<usize>,
     // Leading buttons marked Pinned sit outside the scrolling band and hold
     // still during layer swipes (each behavior has its own global toggle).
     pub pinned: Option<bool>,
@@ -375,6 +398,9 @@ fn esc_button() -> ButtonConfig {
         slider_mute_icon: None,
         slider_low_icon: None,
         slider_stretch: None,
+        on_click: None,
+        expand_command: None,
+        expand_stretch: None,
         media: None,
     }
 }
@@ -422,6 +448,9 @@ fn error_layer(message: &str) -> FunctionLayer {
             slider_mute_icon: None,
             slider_low_icon: None,
             slider_stretch: None,
+            on_click: None,
+            expand_command: None,
+            expand_stretch: None,
             media: None,
         },
     ];
@@ -971,6 +1000,21 @@ mod tests {
         assert_eq!(cfg.gpu.as_deref(), Some("celsius watts"));
         assert_eq!(cfg.gpu_label, Some(false));
         assert_eq!(cfg.stretch, Some(2));
+    }
+
+    #[test]
+    fn on_click_expand_parses() {
+        let cfg: ButtonConfig = toml::from_str(
+            "Command = \"battery.sh\"\nOnClick = \"Expand\"\n\
+             ExpandCommand = \"battery_eta.sh\"\nExpandStretch = 4\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.on_click, Some(OnClick::Expand));
+        assert_eq!(cfg.expand_command.as_deref(), Some("battery_eta.sh"));
+        assert_eq!(cfg.expand_stretch, Some(4));
+        // Default (unset) leaves OnClick as the plain Action behavior.
+        let plain: ButtonConfig = toml::from_str("Command = \"x\"\n").unwrap();
+        assert_eq!(plain.on_click, None);
     }
 
     #[test]

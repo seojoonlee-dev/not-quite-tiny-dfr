@@ -56,7 +56,7 @@ mod widget;
 
 use crate::config::ConfigManager;
 use backlight::BacklightManager;
-use config::{ButtonAction, ButtonConfig, Config};
+use config::{ButtonAction, ButtonConfig, Config, OnClick};
 use display::DrmBackend;
 use pixel_shift::{PixelShiftManager, PIXEL_SHIFT_HEIGHT_PX, PIXEL_SHIFT_WIDTH_PX};
 use media::{MediaStatus, LYRICS_STATE, MEDIA_STATE};
@@ -100,6 +100,11 @@ const SLIDER_TRACK_HEIGHT: f64 = 6.0;
 const SLIDER_KNOB_RADIUS: f64 = 10.0;
 /// Slots an expanded slider spans when the config sets no SliderStretch.
 const DEFAULT_SLIDER_STRETCH: usize = 2;
+/// How often an OnClick = Expand widget's script polls in the background, so a
+/// smoothed value is always ready to show the instant the button opens. The
+/// displayed value is frozen while the button is expanded (see
+/// `apply_widget_results`), so this only refreshes it while it's out of sight.
+const EXPAND_POLL_SECS: f64 = 5.0;
 /// Below this value a slider shows its `low_icon` (if configured) instead of
 /// its default icon.
 const SLIDER_LOW_THRESHOLD: i32 = 50;
@@ -414,6 +419,88 @@ impl BatteryIconMode {
     }
 }
 
+/// The tap-to-expand mechanic shared by the Slider widget and any OnClick =
+/// Expand button (e.g. a command widget). Collapsed the button spans
+/// `base_stretch` slots; a tap expands it to `expanded_stretch` slots until it
+/// idles (see SLIDER_COLLAPSE), animating the width with `ease_expand`.
+struct ExpandState {
+    expanded: bool,
+    /// Slots occupied collapsed (the config's Stretch) and expanded.
+    base_stretch: usize,
+    expanded_stretch: usize,
+    /// Last expand/drag/tap, for the auto-collapse timer.
+    last_interaction: Instant,
+    /// Start of the width animation toward the current `expanded` state;
+    /// `None` once settled. The layout switches instantly (hit testing uses
+    /// the target); this only drives the drawn width's transition.
+    anim: Option<Instant>,
+}
+
+impl ExpandState {
+    fn new(base_stretch: usize, expanded_stretch: usize) -> ExpandState {
+        ExpandState {
+            expanded: false,
+            base_stretch,
+            expanded_stretch: expanded_stretch.max(base_stretch),
+            last_interaction: Instant::now(),
+            anim: None,
+        }
+    }
+
+    /// Eased expand progress: 0 fully collapsed, 1 fully expanded. Shares the
+    /// clock and curve of `expand_anim` so content glides in step with the
+    /// width, instead of teleporting when the animation ends.
+    fn expand_progress(&self) -> f64 {
+        let settled = if self.expanded { 1.0 } else { 0.0 };
+        let Some(t0) = self.anim else { return settled };
+        let t = t0.elapsed().as_secs_f64() / SLIDER_ANIM.as_secs_f64();
+        if t >= 1.0 {
+            return settled;
+        }
+        let eased = ease_expand(t);
+        if self.expanded {
+            eased
+        } else {
+            1.0 - eased
+        }
+    }
+
+    /// Slots the drawn width currently lags behind the laid-out width, or
+    /// `None` once the animation has settled. Positive while expanding (drawn
+    /// narrower than the layout), negative while collapsing.
+    fn anim_slots(&self) -> Option<f64> {
+        let t0 = self.anim?;
+        let t = t0.elapsed().as_secs_f64() / SLIDER_ANIM.as_secs_f64();
+        if t >= 1.0 {
+            return None; // settled; the main loop clears `anim`
+        }
+        let delta = (self.expanded_stretch - self.base_stretch) as f64;
+        let remaining = delta * (1.0 - ease_expand(t));
+        Some(if self.expanded { remaining } else { -remaining })
+    }
+
+    /// Slots the button occupies right now, per its target (not drawn) state.
+    fn current_stretch(&self) -> usize {
+        if self.expanded {
+            self.expanded_stretch
+        } else {
+            self.base_stretch
+        }
+    }
+
+    /// Toggle the target state, starting the width animation. Returns whether
+    /// anything changed (the caller then relayouts and forces a redraw).
+    fn set_expanded(&mut self, expanded: bool) -> bool {
+        if self.expanded == expanded {
+            return false;
+        }
+        self.expanded = expanded;
+        self.last_interaction = Instant::now();
+        self.anim = Some(Instant::now());
+        true
+    }
+}
+
 /// State of an interactive slider button. Collapsed it is an icon; tapping it
 /// expands it into a draggable track until it idles (see SLIDER_COLLAPSE).
 struct SliderState {
@@ -434,37 +521,21 @@ struct SliderState {
     /// Whether a SliderMute command is configured (enables the drag-unmute and
     /// auto-mute-at-0 behaviors).
     has_mute: bool,
-    expanded: bool,
-    /// Slots occupied collapsed (the config's Stretch) and expanded.
-    base_stretch: usize,
-    expanded_stretch: usize,
-    /// Last expand/drag, for the auto-collapse timer.
-    last_interaction: Instant,
-    /// Start of the width animation toward the current `expanded` state;
-    /// `None` once settled. The layout switches instantly (hit testing uses
-    /// the target); this only drives the drawn width's transition.
-    anim: Option<Instant>,
+    /// The tap-to-expand track state.
+    expand: ExpandState,
 }
 
-impl SliderState {
-    /// Eased expand progress: 0 fully collapsed, 1 fully expanded. Shares the
-    /// clock and curve of `slider_anim` so the icon glides between its
-    /// collapsed (centered) and expanded (left-cap) positions in step with the
-    /// width, instead of teleporting when the animation ends.
-    fn expand_progress(&self) -> f64 {
-        let settled = if self.expanded { 1.0 } else { 0.0 };
-        let Some(t0) = self.anim else { return settled };
-        let t = t0.elapsed().as_secs_f64() / SLIDER_ANIM.as_secs_f64();
-        if t >= 1.0 {
-            return settled;
-        }
-        let eased = ease_expand(t);
-        if self.expanded {
-            eased
-        } else {
-            1.0 - eased
-        }
-    }
+/// The expanded view of an OnClick = Expand command widget: a second script
+/// (its own widget `id`) whose latest output is shown -- with the same
+/// icon+text layout as the collapsed reading -- while the button is expanded.
+/// `state` drives the shared tap-to-expand width animation.
+struct CommandExpand {
+    id: usize,
+    text: String,
+    color: Option<Color>,
+    icon_name: Option<String>,
+    icon: Option<CachedSvg>,
+    state: ExpandState,
 }
 
 enum ButtonImage {
@@ -480,6 +551,8 @@ enum ButtonImage {
     /// A command widget: `text`/`color`/`icon` are updated from its script's
     /// output. `icon_name` is the last icon the script asked for; `icon` is the
     /// SVG resolved from it (via `theme`), reloaded only when the name changes.
+    /// `expand` is set for an OnClick = Expand widget: tapping expands the
+    /// button and shows its expand script's output (see [`CommandExpand`]).
     Command {
         id: usize,
         text: String,
@@ -487,6 +560,7 @@ enum ButtonImage {
         theme: Option<String>,
         icon_name: Option<String>,
         icon: Option<CachedSvg>,
+        expand: Option<CommandExpand>,
     },
     Spacer,
 }
@@ -605,33 +679,66 @@ fn apply_widget_results(layers: &mut [FunctionLayer], rt: &WidgetRuntime, draggi
                     theme,
                     icon_name,
                     icon,
-                } => match map.get(id) {
-                    Some(out)
-                        if *text != out.text || *color != out.color || *icon_name != out.icon =>
-                    {
-                        *text = out.text.clone();
-                        *color = out.color;
-                        // The SVG is comparatively expensive to rasterize, so
-                        // only re-resolve it when the requested name changes
-                        // (e.g. the battery crosses an icon step), not on every
-                        // percentage tick.
-                        if *icon_name != out.icon {
-                            *icon_name = out.icon.clone();
-                            *icon = icon_name.as_ref().and_then(|name| {
-                                match try_load_image(
-                                    name,
-                                    theme.as_ref(),
-                                    DEFAULT_ICON_SIZE,
-                                    DEFAULT_ICON_SIZE,
-                                ) {
-                                    Ok(ButtonImage::Svg(svg)) => Some(svg),
-                                    _ => None,
-                                }
-                            });
+                    expand,
+                } => {
+                    // The SVG is comparatively expensive to rasterize, so only
+                    // re-resolve it when the requested name changes (e.g. the
+                    // battery crosses an icon step), not on every tick.
+                    let resolve = |name: &Option<String>| -> Option<CachedSvg> {
+                        name.as_ref().and_then(|name| {
+                            match try_load_image(
+                                name,
+                                theme.as_ref(),
+                                DEFAULT_ICON_SIZE,
+                                DEFAULT_ICON_SIZE,
+                            ) {
+                                Ok(ButtonImage::Svg(svg)) => Some(svg),
+                                _ => None,
+                            }
+                        })
+                    };
+                    let mut changed = false;
+                    if let Some(out) = map.get(id) {
+                        if *text != out.text || *color != out.color || *icon_name != out.icon {
+                            *text = out.text.clone();
+                            *color = out.color;
+                            if *icon_name != out.icon {
+                                *icon_name = out.icon.clone();
+                                *icon = resolve(icon_name);
+                            }
+                            changed = true;
                         }
                     }
-                    _ => continue,
-                },
+                    // The expand script (its own widget id) drives the expanded
+                    // view; resolve its icon through the same command theme. The
+                    // script polls in the background, but the shown value is
+                    // frozen while the button is open (expanded or animating) so
+                    // it never shifts under the user -- it only takes on the
+                    // latest background reading once fully collapsed and out of
+                    // sight, ready for the next open.
+                    if let Some(e) = expand {
+                        let shown = e.state.expanded || e.state.anim.is_some();
+                        if !shown {
+                            if let Some(out) = map.get(&e.id) {
+                                if e.text != out.text
+                                    || e.color != out.color
+                                    || e.icon_name != out.icon
+                                {
+                                    e.text = out.text.clone();
+                                    e.color = out.color;
+                                    if e.icon_name != out.icon {
+                                        e.icon_name = out.icon.clone();
+                                        e.icon = resolve(&e.icon_name);
+                                    }
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if !changed {
+                        continue;
+                    }
+                }
                 ButtonImage::Slider(s) => {
                     // Skip while a finger owns the value, and for a beat after
                     // a set: an in-flight poll may still carry the pre-set
@@ -1066,7 +1173,12 @@ impl Button {
             text_color: None,
         }
     }
-    fn new_command(id: usize, action: Vec<ButtonAction>, theme: Option<String>) -> Button {
+    fn new_command(
+        id: usize,
+        action: Vec<ButtonAction>,
+        theme: Option<String>,
+        expand: Option<CommandExpand>,
+    ) -> Button {
         Button {
             action,
             active: false,
@@ -1078,6 +1190,7 @@ impl Button {
                 theme,
                 icon_name: None,
                 icon: None,
+                expand,
             },
             icon_width: 0.0,
             icon_height: 0.0,
@@ -1198,11 +1311,7 @@ impl Button {
                 value: 0,
                 muted: false,
                 has_mute,
-                expanded: false,
-                base_stretch,
-                expanded_stretch: expanded_stretch.max(base_stretch),
-                last_interaction: Instant::now(),
-                anim: None,
+                expand: ExpandState::new(base_stretch, expanded_stretch),
             }),
             icon_width: icon_size as f64,
             icon_height: icon_size as f64,
@@ -1466,7 +1575,7 @@ impl Button {
                 // Icon x glides between centered (collapsed) and the left cap
                 // (expanded) with the expand progress, so it tracks the width
                 // instead of snapping when the animation ends.
-                let p = s.expand_progress();
+                let p = s.expand.expand_progress();
                 let centered = button_left_edge + (button_width as f64 - self.icon_width) / 2.0;
                 let capped = button_left_edge + SLIDER_EDGE_PAD + SLIDER_PAD;
                 let icon_x = (centered + (capped - centered) * p).round();
@@ -1478,7 +1587,7 @@ impl Button {
                 };
                 // The expanded look also plays through the collapse animation,
                 // so the track shrinks shut instead of vanishing.
-                if !s.expanded && s.anim.is_none() {
+                if !s.expand.expanded && s.expand.anim.is_none() {
                     // Collapsed: just the icon (a plain button look).
                     draw_icon(c);
                     return;
@@ -1495,7 +1604,7 @@ impl Button {
                 // The track (but not the icon) fades out as the slider closes,
                 // so the bar dissolves instead of just shrinking; opening stays
                 // fully opaque.
-                let track_alpha = if s.expanded { 1.0 } else { p };
+                let track_alpha = if s.expand.expanded { 1.0 } else { p };
                 Color {
                     a: color.a * 0.25 * track_alpha,
                     ..color
@@ -1529,36 +1638,66 @@ impl Button {
                 );
                 c.fill().unwrap();
             }
-            ButtonImage::Command { text, icon, .. } => {
-                let layout = text_layout(c, style, text);
-                match icon {
-                    // Icon + text, centered together as a group -- mirrors the
-                    // built-in battery "both" layout.
-                    Some(svg) => {
-                        let (text_width, text_height) = layout.pixel_size();
-                        let icon_sz = DEFAULT_ICON_SIZE as f64;
-                        let gap = if text.is_empty() { 0.0 } else { BATTERY_ICON_TEXT_GAP };
-                        let group = icon_sz + gap + text_width as f64;
-                        let x = button_left_edge
-                            + (button_width as f64 / 2.0 - group / 2.0).round();
-                        let y = y_shift + ((height as f64 - icon_sz) / 2.0).round();
-                        svg.render(c, x, y, icon_sz, icon_sz);
-                        if !text.is_empty() {
-                            c.move_to(
-                                x + icon_sz + gap,
-                                y_shift + ((height as f64 - text_height as f64) / 2.0).round(),
-                            );
-                            pangocairo::functions::show_layout(c, &layout);
+            ButtonImage::Command {
+                text, icon, expand, ..
+            } => {
+                // Draw one content group -- icon + text centered together,
+                // mirroring the built-in battery "both" layout.
+                let draw_content = |text: &str, icon: &Option<CachedSvg>| {
+                    let layout = text_layout(c, style, text);
+                    match icon {
+                        Some(svg) => {
+                            let (text_width, text_height) = layout.pixel_size();
+                            let icon_sz = DEFAULT_ICON_SIZE as f64;
+                            let gap = if text.is_empty() { 0.0 } else { BATTERY_ICON_TEXT_GAP };
+                            let group = icon_sz + gap + text_width as f64;
+                            let x = button_left_edge
+                                + (button_width as f64 / 2.0 - group / 2.0).round();
+                            let y = y_shift + ((height as f64 - icon_sz) / 2.0).round();
+                            svg.render(c, x, y, icon_sz, icon_sz);
+                            if !text.is_empty() {
+                                c.move_to(
+                                    x + icon_sz + gap,
+                                    y_shift + ((height as f64 - text_height as f64) / 2.0).round(),
+                                );
+                                pangocairo::functions::show_layout(c, &layout);
+                            }
                         }
+                        None => show_layout_centered(
+                            c,
+                            &layout,
+                            height,
+                            button_left_edge,
+                            button_width,
+                            y_shift,
+                        ),
                     }
-                    None => show_layout_centered(
-                        c,
-                        &layout,
-                        height,
-                        button_left_edge,
-                        button_width,
-                        y_shift,
-                    ),
+                };
+                match expand {
+                    // Mid expand/collapse: crossfade the collapsed reading and
+                    // the expand view into each other. Each is drawn to its own
+                    // group and painted with complementary alpha, so the text
+                    // and icon dissolve from one to the other as the width
+                    // animates. `p` runs 0 (collapsed) .. 1 (expanded); re-set
+                    // the text color each time since pop_group clobbers it.
+                    Some(e) if e.state.anim.is_some() => {
+                        let p = e.state.expand_progress();
+                        let color = self.effective_text_color(style);
+                        color.set_source(c);
+                        c.push_group();
+                        draw_content(text, icon);
+                        c.pop_group_to_source().unwrap();
+                        c.paint_with_alpha(1.0 - p).unwrap();
+                        color.set_source(c);
+                        c.push_group();
+                        draw_content(&e.text, &e.icon);
+                        c.pop_group_to_source().unwrap();
+                        c.paint_with_alpha(p).unwrap();
+                    }
+                    // Settled open: just the expand view.
+                    Some(e) if e.state.expanded => draw_content(&e.text, &e.icon),
+                    // Collapsed, or a plain command widget: the normal reading.
+                    _ => draw_content(text, icon),
                 }
             }
             // The media widget is painted in full by paint_media (it needs the
@@ -1567,14 +1706,38 @@ impl Button {
             ButtonImage::Spacer => (),
         }
     }
+    /// The tap-to-expand state shared by Slider and OnClick = Expand command
+    /// widgets, or `None` for buttons that don't expand.
+    fn expand_state(&self) -> Option<&ExpandState> {
+        match &self.image {
+            ButtonImage::Slider(s) => Some(&s.expand),
+            ButtonImage::Command {
+                expand: Some(e), ..
+            } => Some(&e.state),
+            _ => None,
+        }
+    }
+    fn expand_state_mut(&mut self) -> Option<&mut ExpandState> {
+        match &mut self.image {
+            ButtonImage::Slider(s) => Some(&mut s.expand),
+            ButtonImage::Command {
+                expand: Some(e), ..
+            } => Some(&mut e.state),
+            _ => None,
+        }
+    }
     /// The color to draw this button's text in, letting a command widget's own
-    /// JSON `color` override the configured/default text color.
+    /// JSON `color` override the configured/default text color. An expanded
+    /// command widget uses its expand script's color instead.
     fn effective_text_color(&self, style: &style::Style) -> Color {
-        if let ButtonImage::Command {
-            color: Some(color), ..
-        } = &self.image
-        {
-            return *color;
+        if let ButtonImage::Command { color, expand, .. } = &self.image {
+            let color = match expand {
+                Some(e) if e.state.expanded || e.state.anim.is_some() => &e.color,
+                _ => color,
+            };
+            if let Some(color) = color {
+                return *color;
+            }
         }
         self.text_color.unwrap_or(style.text_color)
     }
@@ -2277,9 +2440,9 @@ impl FunctionLayer {
         (width - edge - guard) + spacing
     }
 
-    /// Recompute the virtual slot indices after a slider expanded or
-    /// collapsed. Non-slider stretches are recovered from the current indices
-    /// (they never change); each slider contributes its current width.
+    /// Recompute the virtual slot indices after an expandable button expanded
+    /// or collapsed. Fixed stretches are recovered from the current indices
+    /// (they never change); each expandable contributes its current width.
     fn relayout(&mut self) {
         let old_count = self.virtual_button_count;
         let stretches: Vec<usize> = (0..self.buttons.len())
@@ -2289,10 +2452,9 @@ impl FunctionLayer {
                 } else {
                     old_count
                 };
-                match &self.buttons[i].1.image {
-                    ButtonImage::Slider(s) if s.expanded => s.expanded_stretch,
-                    ButtonImage::Slider(s) => s.base_stretch,
-                    _ => next - self.buttons[i].0,
+                match self.buttons[i].1.expand_state() {
+                    Some(e) => e.current_stretch(),
+                    None => next - self.buttons[i].0,
                 }
             })
             .collect();
@@ -2311,21 +2473,19 @@ impl FunctionLayer {
         };
     }
 
-    /// Expand or collapse a slider button, returning whether anything changed
-    /// (the caller then forces a complete redraw: the layout shifted).
-    fn set_slider_expanded(&mut self, btn: usize, expanded: bool) -> bool {
+    /// Expand or collapse an expandable button (slider or OnClick = Expand
+    /// command), returning whether anything changed (the caller then forces a
+    /// complete redraw: the layout shifted).
+    fn set_expanded(&mut self, btn: usize, expanded: bool) -> bool {
         let Some((_, button)) = self.buttons.get_mut(btn) else {
             return false;
         };
-        let ButtonImage::Slider(s) = &mut button.image else {
+        let Some(e) = button.expand_state_mut() else {
             return false;
         };
-        if s.expanded == expanded {
+        if !e.set_expanded(expanded) {
             return false;
         }
-        s.expanded = expanded;
-        s.last_interaction = Instant::now();
-        s.anim = Some(Instant::now());
         button.changed = true;
         self.relayout();
         true
@@ -2335,27 +2495,20 @@ impl FunctionLayer {
     /// slots the drawn width lags behind the laid-out width). Positive while
     /// expanding (drawn narrower than the layout), negative while collapsing;
     /// the overshoot makes it dip past zero before settling.
-    fn slider_anim(&self) -> Option<(usize, f64)> {
+    fn expand_anim(&self) -> Option<(usize, f64)> {
         for (i, (_, b)) in self.buttons.iter().enumerate() {
-            if let ButtonImage::Slider(s) = &b.image {
-                let Some(t0) = s.anim else { continue };
-                let t = t0.elapsed().as_secs_f64() / SLIDER_ANIM.as_secs_f64();
-                if t >= 1.0 {
-                    continue; // settled; the main loop clears `anim`
-                }
-                let delta = (s.expanded_stretch - s.base_stretch) as f64;
-                let remaining = delta * (1.0 - ease_expand(t));
-                return Some((i, if s.expanded { remaining } else { -remaining }));
+            if let Some(slots) = b.expand_state().and_then(ExpandState::anim_slots) {
+                return Some((i, slots));
             }
         }
         None
     }
 
-    fn slider_expanded(&self, btn: usize) -> bool {
-        match self.buttons.get(btn) {
-            Some((_, b)) => matches!(&b.image, ButtonImage::Slider(s) if s.expanded),
-            None => false,
-        }
+    fn is_expanded(&self, btn: usize) -> bool {
+        self.buttons
+            .get(btn)
+            .and_then(|(_, b)| b.expand_state())
+            .is_some_and(|e| e.expanded)
     }
 
     /// On-screen left edge and width of button `i`, mirroring the renderer's
@@ -2431,7 +2584,7 @@ impl FunctionLayer {
         let ButtonImage::Slider(s) = &mut button.image else {
             return None;
         };
-        s.last_interaction = Instant::now();
+        s.expand.last_interaction = Instant::now();
         if s.value == value {
             return None;
         }
@@ -2459,7 +2612,7 @@ impl FunctionLayer {
     fn touch_slider(&mut self, btn: usize) {
         if let Some((_, button)) = self.buttons.get_mut(btn) {
             if let ButtonImage::Slider(s) = &mut button.image {
-                s.last_interaction = Instant::now();
+                s.expand.last_interaction = Instant::now();
             }
         }
     }
@@ -2599,7 +2752,51 @@ impl FunctionLayer {
                         command,
                         interval: WidgetSpec::interval_from_secs(cfg.interval),
                     });
-                    Button::new_command(id, std::mem::take(&mut cfg.action), cfg.theme.take())
+                    // OnClick = Expand makes the widget tap-to-expand; its
+                    // expanded view is driven by a separate ExpandCommand
+                    // script (its own widget id), animated like a slider.
+                    let expand = if cfg.on_click == Some(OnClick::Expand) {
+                        match cfg.expand_command.take() {
+                            Some(expand_command) => {
+                                let eid = *next_id;
+                                *next_id += 1;
+                                widgets.commands.push(WidgetSpec {
+                                    id: eid,
+                                    command: expand_command,
+                                    // Polls continuously in the background so a
+                                    // smoothed value is always ready to show the
+                                    // instant the button opens.
+                                    interval: WidgetSpec::interval_from_secs(Some(EXPAND_POLL_SECS)),
+                                });
+                                Some(CommandExpand {
+                                    id: eid,
+                                    text: "\u{2026}".to_string(),
+                                    color: None,
+                                    icon_name: None,
+                                    icon: None,
+                                    state: ExpandState::new(
+                                        stretch,
+                                        cfg.expand_stretch.unwrap_or(DEFAULT_SLIDER_STRETCH),
+                                    ),
+                                })
+                            }
+                            None => {
+                                eprintln!(
+                                    "not-quite-tiny-dfr: OnClick = Expand needs an \
+                                     ExpandCommand; ignoring"
+                                );
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    Button::new_command(
+                        id,
+                        std::mem::take(&mut cfg.action),
+                        cfg.theme.take(),
+                        expand,
+                    )
                 } else {
                     Button::with_config(cfg, default_icon_size)
                 };
@@ -2697,7 +2894,7 @@ impl FunctionLayer {
         // Mid expand/collapse, the slider draws narrower/wider than its slots
         // and everything right of it rides along (in slot units; scaled by
         // each path's pitch below).
-        let anim = self.slider_anim();
+        let anim = self.expand_anim();
 
         if let Some(geo) = self.scroll_geometry(effective_width, style) {
             // Band movement (scroll/fling/snap) arrives as complete_redraw --
@@ -3680,27 +3877,47 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 let mut collapse: Vec<usize> = Vec::new();
                 let mut animating = false;
                 for (bi, (_, button)) in layer.buttons.iter_mut().enumerate() {
-                    let ButtonImage::Slider(s) = &mut button.image else {
-                        continue;
-                    };
-                    // Tick the width animation: keep frames coming while it
-                    // plays (including one settle frame at the exact layout).
-                    if let Some(t0) = s.anim {
-                        if t0.elapsed() >= SLIDER_ANIM {
-                            s.anim = None;
-                            button.changed = true;
+                    // Scope the ExpandState borrow (it goes through a method, so
+                    // it borrows the whole button) and pull out plain values, so
+                    // `button.changed` can be set once the borrow ends.
+                    let (settled, anim_active, collapse_now, wait) = {
+                        let Some(e) = button.expand_state_mut() else {
+                            continue;
+                        };
+                        // Tick the width animation: keep frames coming while it
+                        // plays (including one settle frame at the exact layout).
+                        let mut settled = false;
+                        let mut anim_active = false;
+                        if let Some(t0) = e.anim {
+                            if t0.elapsed() >= SLIDER_ANIM {
+                                e.anim = None;
+                                settled = true;
+                            }
+                            anim_active = true;
                         }
+                        if !e.expanded || fingered.contains(&(li, bi)) {
+                            (settled, anim_active, false, None)
+                        } else {
+                            let elapsed = e.last_interaction.elapsed();
+                            if elapsed >= SLIDER_COLLAPSE {
+                                (settled, anim_active, true, None)
+                            } else {
+                                let wait = (SLIDER_COLLAPSE - elapsed).as_millis() as u64;
+                                (settled, anim_active, false, Some(wait))
+                            }
+                        }
+                    };
+                    if settled {
+                        button.changed = true;
+                    }
+                    if anim_active {
                         animating = true;
                     }
-                    if !s.expanded || fingered.contains(&(li, bi)) {
-                        continue;
-                    }
-                    let elapsed = s.last_interaction.elapsed();
-                    if elapsed >= SLIDER_COLLAPSE {
-                        collapse.push(bi);
-                    } else {
-                        let wait = (SLIDER_COLLAPSE - elapsed).as_millis() as u64;
+                    if let Some(wait) = wait {
                         slider_wait_ms = Some(slider_wait_ms.map_or(wait, |w| w.min(wait)));
+                    }
+                    if collapse_now {
+                        collapse.push(bi);
                     }
                 }
                 if animating && li == active_layer {
@@ -3708,7 +3925,7 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                     slider_animating = true;
                 }
                 for bi in collapse {
-                    if layer.set_slider_expanded(bi, false) && li == active_layer {
+                    if layer.set_expanded(bi, false) && li == active_layer {
                         needs_complete_redraw = true;
                         slider_animating = true;
                     }
@@ -4498,7 +4715,7 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                             ButtonImage::Slider(_)
                                         ) =>
                                 {
-                                    if layer.slider_expanded(btn) {
+                                    if layer.is_expanded(btn) {
                                         if let Some(v) = layer.slider_value_from_x(
                                             btn,
                                             x,
@@ -4886,15 +5103,24 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                             }
                                             button.set_visual_active(false);
                                             button.changed = true;
-                                        } else if matches!(
-                                            layers[layer].buttons[btn].1.image,
-                                            ButtonImage::Slider(_)
-                                        ) {
-                                            // A clean tap on a collapsed slider
-                                            // opens it (a slider emits no keys).
+                                        } else if layers[layer].buttons[btn]
+                                            .1
+                                            .expand_state()
+                                            .is_some()
+                                        {
+                                            // A clean tap on an expandable button
+                                            // (a slider, or an OnClick = Expand
+                                            // command) opens it -- and suppresses
+                                            // any key action while doing so. If it
+                                            // is already open, just refresh the
+                                            // idle timer so it stays up.
                                             layers[layer].buttons[btn].1.set_visual_active(false);
-                                            if layers[layer].set_slider_expanded(btn, true) {
+                                            if layers[layer].set_expanded(btn, true) {
                                                 needs_complete_redraw = true;
+                                            } else if let Some(e) =
+                                                layers[layer].buttons[btn].1.expand_state_mut()
+                                            {
+                                                e.last_interaction = Instant::now();
                                             }
                                         } else {
                                             let button = &mut layers[layer].buttons[btn].1;
@@ -5142,12 +5368,12 @@ mod tests {
         let mut layer = slider_layer();
         assert_eq!(layer.virtual_button_count, 3);
         assert_eq!(layer.buttons[2].0, 2);
-        assert!(layer.set_slider_expanded(1, true));
+        assert!(layer.set_expanded(1, true));
         assert_eq!(layer.virtual_button_count, 6); // slider grew 1 -> 4 slots
         assert_eq!(layer.buttons[2].0, 5); // the text button moved right
         assert_eq!(layer.pinned_slots, 1); // pinned prefix untouched
-        assert!(!layer.set_slider_expanded(1, true)); // no-op when already open
-        assert!(layer.set_slider_expanded(1, false));
+        assert!(!layer.set_expanded(1, true)); // no-op when already open
+        assert!(layer.set_expanded(1, false));
         assert_eq!(layer.virtual_button_count, 3);
         assert_eq!(layer.buttons[2].0, 2);
     }
@@ -5156,7 +5382,7 @@ mod tests {
     fn slider_value_maps_track_position() {
         let style = Style::default();
         let mut layer = slider_layer();
-        layer.set_slider_expanded(1, true);
+        layer.set_expanded(1, true);
         let (left, width) = layer.button_screen_rect(1, W as f64, &style).unwrap();
         let (track_left, track_width) = slider_track_rect(&layer.buttons[1].1, left, width);
         // Left edge of the track = 0, right edge = 100, middle = 50.
