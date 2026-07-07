@@ -13,11 +13,9 @@ use input::{
         touch::{TouchEvent, TouchEventPosition, TouchEventSlot, TouchEventTrait},
         Event, EventTrait,
     },
-    Device as InputDevice, Libinput, LibinputInterface,
+    Device as InputDevice, Libinput,
 };
-use input_linux::{uinput::UInputHandle, EventKind, Key, SynchronizeKind};
-use input_linux_sys::{input_event, input_id, timeval, uinput_setup};
-use libc::{c_char, O_ACCMODE, O_RDONLY, O_RDWR, O_WRONLY};
+use input_linux::{uinput::UInputHandle, Key};
 use librsvg_rebind::{prelude::HandleExt, Handle, Rectangle};
 use nix::{
     errno::Errno,
@@ -31,11 +29,8 @@ use privdrop::PrivDrop;
 use std::{
     cmp::min,
     collections::{HashMap, HashSet},
-    fs::{File, OpenOptions},
-    os::{
-        fd::{AsFd, AsRawFd},
-        unix::{fs::OpenOptionsExt, io::OwnedFd},
-    },
+    fs::File,
+    os::fd::{AsFd, AsRawFd},
     panic::{self, AssertUnwindSafe},
     path::{Path, PathBuf},
     sync::Arc,
@@ -53,10 +48,12 @@ mod pixel_shift;
 mod render;
 mod sensors;
 mod style;
+mod uinput;
 mod user;
 mod widget;
 
 use render::*;
+use uinput::{create_uinput, toggle_keys, Interface};
 use sensors::{
     find_battery_device, find_cpu_temp_zone, get_battery_state, open_cpu_power_source,
     read_cpu_temp, read_energy_uj, BatteryState, BATTERY_STATE, CPU_POWER_STATE, CPU_TEMP_STATE,
@@ -2619,73 +2616,6 @@ impl FunctionLayer {
     }
 }
 
-struct Interface;
-
-impl LibinputInterface for Interface {
-    fn open_restricted(&mut self, path: &Path, flags: i32) -> Result<OwnedFd, i32> {
-        let mode = flags & O_ACCMODE;
-
-        OpenOptions::new()
-            .custom_flags(flags)
-            .read(mode == O_RDONLY || mode == O_RDWR)
-            .write(mode == O_WRONLY || mode == O_RDWR)
-            .open(path)
-            .map(|file| file.into())
-            .map_err(|err| err.raw_os_error().unwrap())
-    }
-    fn close_restricted(&mut self, fd: OwnedFd) {
-        _ = File::from(fd);
-    }
-}
-
-fn emit<F>(uinput: &mut UInputHandle<F>, ty: EventKind, code: u16, value: i32)
-where
-    F: AsRawFd,
-{
-    uinput
-        .write(&[input_event {
-            value,
-            type_: ty as u16,
-            code,
-            time: timeval {
-                tv_sec: 0,
-                tv_usec: 0,
-            },
-        }])
-        .unwrap();
-}
-
-fn toggle_keys<F>(uinput: &mut UInputHandle<F>, codes: &Vec<ButtonAction>, value: i32)
-where
-    F: AsRawFd,
-{
-    if codes.is_empty() {
-        return;
-    }
-    for action in codes {
-        match action {
-            // Handled inside the daemon; no input event leaves it.
-            ButtonAction::TouchBarBrightnessUp | ButtonAction::TouchBarBrightnessDown => {
-                if value <= 1 {
-                    let delta = if *action == ButtonAction::TouchBarBrightnessUp {
-                        1
-                    } else {
-                        -1
-                    };
-                    backlight::dim_button(delta, value == 1);
-                }
-            }
-            ButtonAction::Key(kc) => emit(uinput, EventKind::Key, *kc as u16, value),
-        }
-    }
-    emit(
-        uinput,
-        EventKind::Synchronize,
-        SynchronizeKind::Report as u16,
-        0,
-    );
-}
-
 /// Drop root down to `user`, keeping the supplementary `groups` (input/video)
 /// needed for device access. Privilege dropping is one-way, so this is only
 /// called once we actually know which user to serve.
@@ -2702,36 +2632,6 @@ fn drop_privileges(user: &str, groups: &[&str]) {
         std::env::set_var("HOME", &u.dir);
         std::env::set_var("XDG_RUNTIME_DIR", format!("/run/user/{}", u.uid.as_raw()));
     }
-}
-
-/// Set up the virtual keyboard. Created in main(), before the panic boundary:
-/// /dev/uinput is only openable as root, and by the time real_main panics the
-/// privileges are long dropped -- but the emergency Esc key still needs it.
-fn create_uinput() -> UInputHandle<File> {
-    let uinput = UInputHandle::new(OpenOptions::new().write(true).open("/dev/uinput").unwrap());
-    uinput.set_evbit(EventKind::Key).unwrap();
-    for k in Key::iter() {
-        uinput.set_keybit(k).unwrap();
-    }
-    let mut dev_name_c = [0 as c_char; 80];
-    let dev_name = "Dynamic Function Row Virtual Input Device".as_bytes();
-    for i in 0..dev_name.len() {
-        dev_name_c[i] = dev_name[i] as c_char;
-    }
-    uinput
-        .dev_setup(&uinput_setup {
-            id: input_id {
-                bustype: 0x19,
-                vendor: 0x1209,
-                product: 0x316E,
-                version: 1,
-            },
-            ff_effects_max: 0,
-            name: dev_name_c,
-        })
-        .unwrap();
-    uinput.dev_create().unwrap();
-    uinput
 }
 
 /// Landscape width (px) of the emergency Esc touch region; must match the Esc
