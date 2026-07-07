@@ -142,11 +142,14 @@ The command's stdout is read as **JSON** if it looks like JSON, otherwise as
 **plain text** (first line):
 
 ```
-echo "42%"                                  ->  shows: 42%
-echo '{"text":"42°C","color":"#ff5555"}'    ->  shows red: 42°C
+echo "42%"                                          ->  shows: 42%
+echo '{"text":"42°C","color":"#ff5555"}'            ->  shows red: 42°C
+echo '{"text":"84%","icon":"battery_5_bar"}'        ->  shows the icon + 84%
 ```
 
-Fields: `text` (label) and `color` (hex, colors the label). `Interval` defaults
+Fields: `text` (label), `color` (hex, colors the label), and `icon` (an icon
+name resolved like a button's `Icon`, drawn to the left of the label).
+`Interval` defaults
 to 2s and is clamped to a 0.1s minimum. Commands run asynchronously with a
 timeout, so a slow or hung script never freezes the bar. Widgets redraw only
 when their output changes. The command can be any executable — a shell one-liner,
@@ -185,6 +188,24 @@ Scripts shipped with the app are installed to
   Text is rendered with pango, which falls back across system fonts per
   glyph — color emoji (and `-w`'s wind arrows) render as long as an emoji
   font (e.g. `noto-fonts-emoji`) is installed system-wide.
+
+- **`battery.sh`** — shows the battery percentage read from the **UPower**
+  daemon (the same source the caelestia shell uses), next to the same stepped
+  battery icon the built-in indicator draws, e.g. 🔋 `84%`. Unlike the built-in
+  `Battery` indicator, which does its own `/sys/class/power_supply` math, UPower
+  recalibrates the battery's learned "full" charge — so on degraded T2 Macs,
+  where the kernel's `charge_full`/`capacity` read wrong and the built-in
+  indicator can stick near 100%, this reports the true level. `-c` colors the
+  label (green while charging, red below 10%) and `-t` drops the icon for
+  text-only; an optional trailing argument selects a UPower device leaf
+  (default `DisplayDevice`, the aggregate battery):
+
+  ```toml
+  { Command = "sh /usr/share/not-quite-tiny-dfr/widgets/battery.sh", Interval = 30, Stretch = 1 }
+  ```
+
+  It shows `battery n/a` if UPower isn't running or the device is absent.
+  Requires `busctl` (from systemd) to reach the system bus.
 
 ## Slider widgets
 
@@ -276,6 +297,12 @@ first device of type `Battery` under `/sys/class/power_supply` is used
 automatically; if none exists the button shows `Battery N/A`. A background
 thread polls sysfs once per second, and the button redraws only when the
 reading changes.
+
+> On degraded T2 batteries the kernel's `charge_full`/`capacity` values are
+> unreliable, so this sysfs-based percentage can read wrong (often stuck near
+> 100%). If you hit that, use the bundled **`battery.sh`** widget instead — it
+> reads UPower's recalibrated percentage and shows the same stepped icon. See
+> [Bundled widget scripts](#bundled-widget-scripts).
 
 The icon steps through the bundled `battery_0_bar` … `battery_full` SVGs
 (charging variants get a bolt overlay). The button fill also signals state —

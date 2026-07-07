@@ -477,11 +477,16 @@ enum ButtonImage {
     Gpu(GpuDisplay),
     Slider(SliderState),
     Media(MediaState),
-    /// A command widget: `text`/`color` are updated from its script's output.
+    /// A command widget: `text`/`color`/`icon` are updated from its script's
+    /// output. `icon_name` is the last icon the script asked for; `icon` is the
+    /// SVG resolved from it (via `theme`), reloaded only when the name changes.
     Command {
         id: usize,
         text: String,
         color: Option<Color>,
+        theme: Option<String>,
+        icon_name: Option<String>,
+        icon: Option<CachedSvg>,
     },
     Spacer,
 }
@@ -593,10 +598,37 @@ fn apply_widget_results(layers: &mut [FunctionLayer], rt: &WidgetRuntime, draggi
     for layer in layers.iter_mut() {
         for (_, button) in layer.buttons.iter_mut() {
             match &mut button.image {
-                ButtonImage::Command { id, text, color } => match map.get(id) {
-                    Some(out) if *text != out.text || *color != out.color => {
+                ButtonImage::Command {
+                    id,
+                    text,
+                    color,
+                    theme,
+                    icon_name,
+                    icon,
+                } => match map.get(id) {
+                    Some(out)
+                        if *text != out.text || *color != out.color || *icon_name != out.icon =>
+                    {
                         *text = out.text.clone();
                         *color = out.color;
+                        // The SVG is comparatively expensive to rasterize, so
+                        // only re-resolve it when the requested name changes
+                        // (e.g. the battery crosses an icon step), not on every
+                        // percentage tick.
+                        if *icon_name != out.icon {
+                            *icon_name = out.icon.clone();
+                            *icon = icon_name.as_ref().and_then(|name| {
+                                match try_load_image(
+                                    name,
+                                    theme.as_ref(),
+                                    DEFAULT_ICON_SIZE,
+                                    DEFAULT_ICON_SIZE,
+                                ) {
+                                    Ok(ButtonImage::Svg(svg)) => Some(svg),
+                                    _ => None,
+                                }
+                            });
+                        }
                     }
                     _ => continue,
                 },
@@ -1034,7 +1066,7 @@ impl Button {
             text_color: None,
         }
     }
-    fn new_command(id: usize, action: Vec<ButtonAction>) -> Button {
+    fn new_command(id: usize, action: Vec<ButtonAction>, theme: Option<String>) -> Button {
         Button {
             action,
             active: false,
@@ -1043,6 +1075,9 @@ impl Button {
                 id,
                 text: "\u{2026}".to_string(),
                 color: None,
+                theme,
+                icon_name: None,
+                icon: None,
             },
             icon_width: 0.0,
             icon_height: 0.0,
@@ -1494,9 +1529,37 @@ impl Button {
                 );
                 c.fill().unwrap();
             }
-            ButtonImage::Command { text, .. } => {
+            ButtonImage::Command { text, icon, .. } => {
                 let layout = text_layout(c, style, text);
-                show_layout_centered(c, &layout, height, button_left_edge, button_width, y_shift);
+                match icon {
+                    // Icon + text, centered together as a group -- mirrors the
+                    // built-in battery "both" layout.
+                    Some(svg) => {
+                        let (text_width, text_height) = layout.pixel_size();
+                        let icon_sz = DEFAULT_ICON_SIZE as f64;
+                        let gap = if text.is_empty() { 0.0 } else { BATTERY_ICON_TEXT_GAP };
+                        let group = icon_sz + gap + text_width as f64;
+                        let x = button_left_edge
+                            + (button_width as f64 / 2.0 - group / 2.0).round();
+                        let y = y_shift + ((height as f64 - icon_sz) / 2.0).round();
+                        svg.render(c, x, y, icon_sz, icon_sz);
+                        if !text.is_empty() {
+                            c.move_to(
+                                x + icon_sz + gap,
+                                y_shift + ((height as f64 - text_height as f64) / 2.0).round(),
+                            );
+                            pangocairo::functions::show_layout(c, &layout);
+                        }
+                    }
+                    None => show_layout_centered(
+                        c,
+                        &layout,
+                        height,
+                        button_left_edge,
+                        button_width,
+                        y_shift,
+                    ),
+                }
             }
             // The media widget is painted in full by paint_media (it needs the
             // rounded-rect geometry), so it never reaches this content pass.
@@ -2471,7 +2534,7 @@ impl FunctionLayer {
                         command,
                         interval: WidgetSpec::interval_from_secs(cfg.interval),
                     });
-                    Button::new_command(id, std::mem::take(&mut cfg.action))
+                    Button::new_command(id, std::mem::take(&mut cfg.action), cfg.theme.take())
                 } else {
                     Button::with_config(cfg, default_icon_size)
                 };

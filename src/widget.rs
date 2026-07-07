@@ -81,6 +81,7 @@ impl WidgetSpec {
 pub struct WidgetOutput {
     pub text: String,
     pub color: Option<Color>,
+    pub icon: Option<String>,
 }
 
 /// The optional JSON form a script may print for richer control.
@@ -88,6 +89,7 @@ pub struct WidgetOutput {
 struct WidgetJson {
     text: Option<String>,
     color: Option<String>,
+    icon: Option<String>,
 }
 
 /// Owns the worker threads that poll widget commands. Dropping it signals the
@@ -190,6 +192,7 @@ impl WidgetRuntime {
             WidgetOutput {
                 text: value.to_string(),
                 color: None,
+                icon: None,
             },
         );
         self.pending_sets.lock().unwrap().insert(id, value);
@@ -340,6 +343,7 @@ fn run_command(command: &str, stop: &AtomicBool) -> WidgetOutput {
             return WidgetOutput {
                 text: format!("err: {e}"),
                 color: None,
+                icon: None,
             }
         }
     };
@@ -356,6 +360,7 @@ fn run_command(command: &str, stop: &AtomicBool) -> WidgetOutput {
                         WidgetOutput {
                             text: "timeout".into(),
                             color: None,
+                            icon: None,
                         }
                     } else {
                         WidgetOutput::default()
@@ -385,6 +390,7 @@ fn parse_output(raw: &str) -> WidgetOutput {
             return WidgetOutput {
                 text: j.text.unwrap_or_default(),
                 color: j.color.as_deref().and_then(Color::parse_hex),
+                icon: j.icon.filter(|s| !s.is_empty()),
             };
         }
         // Looked like JSON but wasn't valid; fall through to plain text.
@@ -392,6 +398,7 @@ fn parse_output(raw: &str) -> WidgetOutput {
     WidgetOutput {
         text: trimmed.lines().next().unwrap_or_default().to_string(),
         color: None,
+        icon: None,
     }
 }
 
@@ -432,6 +439,18 @@ mod tests {
         let o = parse_output(r##"{"text":"42%","color":"#ff0000"}"##);
         assert_eq!(o.text, "42%");
         assert_eq!(o.color, Some(Color::rgb(1.0, 0.0, 0.0)));
+        assert_eq!(o.icon, None);
+    }
+
+    #[test]
+    fn parses_json_icon() {
+        let o = parse_output(r##"{"text":"69%","icon":"battery_5_bar"}"##);
+        assert_eq!(o.text, "69%");
+        assert_eq!(o.icon.as_deref(), Some("battery_5_bar"));
+        // An empty icon string is treated as absent.
+        assert_eq!(parse_output(r##"{"text":"x","icon":""}"##).icon, None);
+        // Plain text carries no icon.
+        assert_eq!(parse_output("50%").icon, None);
     }
 
     #[test]

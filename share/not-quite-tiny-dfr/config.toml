@@ -85,6 +85,11 @@
 # artist. Taps control the active player. Spans Stretch slots:
 # { Media = true, Stretch = 6 },
 
+# battery.sh -- battery icon + percentage from UPower. Flags: -c, -t, -w (with
+# -w use Interval = 0). Trailing arg: UPower device leaf (default DisplayDevice):
+# { Command = "sh /usr/share/not-quite-tiny-dfr/widgets/battery.sh", Interval = 30, Stretch = 1 },
+# { Command = "sh /usr/share/not-quite-tiny-dfr/widgets/battery.sh -w", Interval = 0, Stretch = 1 },
+
 # [Style]
 # Background = "#000000"
 # BackgroundImage = ""
