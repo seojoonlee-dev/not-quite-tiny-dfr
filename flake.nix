@@ -1,5 +1,5 @@
 {
-  description = "The most basic dynamic function row daemon possible";
+  description = "A customizable dynamic function row daemon, forked from tiny-dfr";
   inputs = { nixpkgs.url = "github:nixos/nixpkgs/nixos-24.11"; };
   outputs = { self, nixpkgs }:
     let
@@ -12,7 +12,7 @@
         in {
           default = pkgs.rustPlatform.buildRustPackage {
             pname = "not-quite-tiny-dfr";
-            version = "0.3.5";
+            version = "0.3.7";
             src = ./.;
             cargoLock = { lockFile = ./Cargo.lock; };
             nativeBuildInputs = [ pkgs.pkg-config ];
