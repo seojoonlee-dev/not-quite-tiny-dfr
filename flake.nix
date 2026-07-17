@@ -50,5 +50,7 @@
             RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
           };
         });
+
+      nixosModules.default = import ./nix/modules/nixos/not-quite-tiny-dfr.nix self;
     };
 }
