@@ -1,53 +1,18 @@
 # not-quite-tiny-dfr
-Not quite the most basic dynamic function row daemon possible.
 
-A customizable Touch Bar daemon for Apple T2 and Silicon Macs, forked from
-[tiny-dfr](https://github.com/AsahiLinux/tiny-dfr). It adds full theming
+> [!NOTE]
+> This project is entirely vibe-coded.
+
+> [!NOTE]
+> Everything is only tested on my 2019 15" MacBook Pro running arch linux. Things may break in other distros/macs. If you are able to run this successfully on other machines without any issues, please email me at developer.seojoonlee@gmail.com. If you encountered any issues please create an issue or a PR. Contributions are always welcome. I will be adding a seperate "Supported Distros/Devices" section to this README in the near future.
+
+Not quite the most basic dynamic function row daemon possible. That will be [tiny-dfr](https://github.com/AsahiLinux/tiny-dfr). This is not-quite-tiny-dfr. A customizable Touch Bar daemon for Apple T2 and Silicon Macs, forked from [tiny-dfr](https://github.com/AsahiLinux/tiny-dfr). It adds full theming
 (colors, spacing, corners, fonts, background images), per-user configuration in
-`~/.config/not-quite-tiny-dfr/`, and programmable **command widgets**.
+`~/.config/not-quite-tiny-dfr/`, and custom widgets while trying to keep the footprint as light as possible.
 
 Config is merged from, in increasing precedence:
 `/usr/share/not-quite-tiny-dfr/config.toml` → `/etc/not-quite-tiny-dfr/config.toml`
-→ `~/.config/not-quite-tiny-dfr/config.toml`. All are live-reloaded.
-
-## NixOS
-
-This flake exposes `nixosModules.default`, a drop-in replacement for
-nixpkgs' `hardware.apple.touchBar` module -- same option interface
-(`enable`/`package`/`settings`), but pointed at this fork's actual config
-path and systemd unit name instead of the mainline module's hardcoded
-`tiny-dfr` literals (which otherwise silently no-op when `package` is set to
-a differently-named fork; see the module's own header comment for details).
-
-```nix
-{
-  inputs.not-quite-tiny-dfr.url = "github:seojoonlee-dev/not-quite-tiny-dfr";
-
-  outputs = { nixpkgs, not-quite-tiny-dfr, ... }: {
-    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
-      modules = [
-        not-quite-tiny-dfr.nixosModules.default
-        {
-          hardware.apple.touchBar = {
-            enable = true;
-            # package defaults to this flake's own package output; override
-            # only if you need a different revision/build.
-            settings = {
-              MediaLayerDefault = true;
-              EnablePixelShift = true;
-              # ... see "Configuration options" below
-            };
-          };
-        }
-      ];
-    };
-  };
-}
-```
-
-If any `settings` command widget (or a `Slider{Get,Set}`) needs something on
-`PATH` beyond a shell -- e.g. a package referenced by bare name rather than
-absolute store path -- add it via `hardware.apple.touchBar.extraPath`.
+→ `~/.config/not-quite-tiny-dfr/config.toml`. All are live-reloaded so editing a config applies changes immediately to the touchbar.
 
 ## Configuration options
 
@@ -144,8 +109,7 @@ An `Action` is one of three things:
 
 2. **A daemon-internal action.** Exactly two exist: `"TouchBarBrightnessUp"`
    and `"TouchBarBrightnessDown"`. They never leave the daemon — they step the
-   Touch Bar's own backlight through its 10 software dimming levels, and holding
-   repeats.
+   Touch Bar's own backlight through its 10 software dimming levels.
 
 3. **An array of the above** — e.g. `Action = ["LeftCtrl", "C"]`. All entries
    are pressed together in listed order on touch-down and released on lift, so
@@ -153,8 +117,7 @@ An `Action` is one of three things:
 
 Omitting `Action` (or `Action = []`) makes the button inert: it draws but sends
 nothing, which is the usual choice for display-only widgets like clocks. A name
-that matches neither a key nor an internal action is a config error — red
-banner on the bar.
+that matches neither a key nor an internal action is a config error.
 
 ### `[Style]` table
 
@@ -466,3 +429,44 @@ SVG cache above is what makes doing so on every widget tick cheap).
 Set `NQTD_FRAME_LOG=1` in the daemon's environment to log per-frame
 `draw`/`flush`/`period` timings to the journal; `NQTD_TOUCH_LOG=1` logs touch
 events.
+
+## OS-specific quirks
+
+### NixOS
+
+This flake exposes `nixosModules.default`, a drop-in replacement for
+nixpkgs' `hardware.apple.touchBar` module -- same option interface
+(`enable`/`package`/`settings`), but pointed at this fork's actual config
+path and systemd unit name instead of the mainline module's hardcoded
+`tiny-dfr` literals (which otherwise silently no-op when `package` is set to
+a differently-named fork; see the module's own header comment for details).
+
+```nix
+{
+  inputs.not-quite-tiny-dfr.url = "github:seojoonlee-dev/not-quite-tiny-dfr";
+
+  outputs = { nixpkgs, not-quite-tiny-dfr, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        not-quite-tiny-dfr.nixosModules.default
+        {
+          hardware.apple.touchBar = {
+            enable = true;
+            # package defaults to this flake's own package output; override
+            # only if you need a different revision/build.
+            settings = {
+              MediaLayerDefault = true;
+              EnablePixelShift = true;
+              # ... see "Configuration options" below
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+If any `settings` command widget (or a `Slider{Get,Set}`) needs something on
+`PATH` beyond a shell -- e.g. a package referenced by bare name rather than
+absolute store path -- add it via `hardware.apple.touchBar.extraPath`.
