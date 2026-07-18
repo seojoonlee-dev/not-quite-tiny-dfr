@@ -8,12 +8,15 @@
 //! bytes: cairo `ImageSurface`s are not `Send`, so the render thread wraps the
 //! bytes into a surface itself (see `main.rs`).
 
+use std::fs;
+use std::io::Read;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use cairo::Format;
 use serde_json::Value;
@@ -35,6 +38,12 @@ const SEEK_BACK_THRESHOLD: f64 = 2.0;
 /// Album art is downscaled so its longest side is at most this many pixels:
 /// plenty for the short bar panel while keeping the buffer small.
 const ART_MAX: u32 = 256;
+/// Backoff for an art URL whose fetch/decode failed: first retry after
+/// `ART_RETRY_MIN`, doubling up to `ART_RETRY_MAX`, for as long as the URL
+/// stays current -- so a transient miss (curl timeout, CDN 404 while the image
+/// propagates) recovers instead of losing the cover for the whole track.
+const ART_RETRY_MIN: Duration = Duration::from_secs(2);
+const ART_RETRY_MAX: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum MediaStatus {
@@ -320,9 +329,11 @@ fn netease_get(url: &str) -> Option<String> {
 
 /// Fetch synced lyrics from NetEase, the fallback for tracks lrclib doesn't
 /// cover (its catalog is large, especially for non-English music). Searches by
-/// "title artist", picks the first song whose artist matches ours
-/// case-insensitively (either direction, mirroring the lrclib guard), then
-/// fetches that song's LRC.
+/// "title artist", then tries each song whose artist matches ours
+/// case-insensitively (either direction, mirroring the lrclib guard) and
+/// returns the first non-empty LRC -- catalog entries with no lyrics are
+/// common, so committing to a single candidate loses tracks the next
+/// candidate covers.
 fn fetch_netease(title: &str, artist: &str) -> Option<String> {
     let query = urlencode(&format!("{title} {artist}"));
     let search = format!("https://music.163.com/api/search/get?s={query}&type=1&limit=5");
@@ -330,17 +341,20 @@ fn fetch_netease(title: &str, artist: &str) -> Option<String> {
     let songs = results.get("result")?.get("songs")?.as_array()?;
 
     let artist_lc = artist.to_lowercase();
-    let id = songs.iter().find_map(|s| {
-        let name = s.get("artists")?.as_array()?.first()?.get("name")?.as_str()?;
-        let name_lc = name.to_lowercase();
-        let matches = artist_lc.contains(&name_lc) || name_lc.contains(&artist_lc);
-        matches.then(|| s.get("id")?.as_i64()).flatten()
-    })?;
-
-    let lyric_url = format!("https://music.163.com/api/song/lyric?id={id}&lv=1&kv=1&tv=-1");
-    let doc: Value = serde_json::from_str(&netease_get(&lyric_url)?).ok()?;
-    let lrc = doc.get("lrc")?.get("lyric")?.as_str()?;
-    (!lrc.is_empty()).then(|| lrc.to_string())
+    songs
+        .iter()
+        .filter_map(|s| {
+            let name = s.get("artists")?.as_array()?.first()?.get("name")?.as_str()?;
+            let name_lc = name.to_lowercase();
+            let matches = artist_lc.contains(&name_lc) || name_lc.contains(&artist_lc);
+            matches.then(|| s.get("id")?.as_i64()).flatten()
+        })
+        .find_map(|id| {
+            let lyric_url = format!("https://music.163.com/api/song/lyric?id={id}&lv=1&kv=1&tv=-1");
+            let doc: Value = serde_json::from_str(&netease_get(&lyric_url)?).ok()?;
+            let lrc = doc.get("lrc")?.get("lyric")?.as_str()?;
+            (!lrc.is_empty()).then(|| lrc.to_string())
+        })
 }
 
 /// Fetch synced lyrics, trying lrclib first, then NetEase. Within lrclib the
@@ -391,6 +405,205 @@ fn fetch_lrc(title: &str, artist: &str, album: &str, duration: f64) -> Option<St
     fetch_netease(title, artist)
 }
 
+/// Cap on the number of tracks kept in the on-disk lyric cache; the entries
+/// with the lowest decayed play score (see `cache_score`) are evicted past
+/// this.
+const LYRIC_CACHE_MAX: usize = 1000;
+/// Cap on the number of covers kept in the on-disk art cache. Covers are
+/// ~30 KB each (vs a few KB per LRC), so this cap is tighter than the lyric
+/// one to keep the cache in the low tens of MB.
+const ART_CACHE_MAX: usize = 300;
+/// Covers above this size are served but not cached: one oversized outlier
+/// (curl allows up to 8M) would otherwise crowd out hundreds of thumbnails'
+/// worth of budget. Refetching those is just the pre-cache status quo.
+const ART_CACHE_ENTRY_MAX: usize = 1024 * 1024;
+
+/// Whether the on-disk caches are used (config `MediaArtCache` /
+/// `MediaLyricsCache`). Set from the main loop on config load. Disabling one
+/// stops its reads and writes but leaves existing entries on disk, so
+/// re-enabling picks the cache back up where it left off.
+static ART_CACHE_ENABLED: AtomicBool = AtomicBool::new(true);
+static LYRICS_CACHE_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Apply the configured art-cache toggle; called on config load/reload.
+pub fn set_art_cache(on: bool) {
+    ART_CACHE_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// Apply the configured lyrics-cache toggle; called on config load/reload.
+pub fn set_lyrics_cache(on: bool) {
+    LYRICS_CACHE_ENABLED.store(on, Ordering::Relaxed);
+}
+
+/// An on-disk cache directory: `sub/` under systemd's $CACHE_DIRECTORY
+/// (handed to the user on privilege drop), falling back to the user cache
+/// dir when run outside the service -- the same chain widget scripts like
+/// weather.sh use.
+fn cache_dir(sub: &str) -> Option<PathBuf> {
+    let base = std::env::var_os("CACHE_DIRECTORY")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("XDG_CACHE_HOME")
+                .map(|d| PathBuf::from(d).join("not-quite-tiny-dfr"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache/not-quite-tiny-dfr"))
+        })?;
+    Some(base.join(sub))
+}
+
+/// Stable cache filename for a key (FNV-1a; not `DefaultHasher`, whose
+/// output may change across Rust releases and would orphan the whole cache).
+/// The key itself is stored on the file's first line so a hash collision can
+/// never serve another key's entry.
+fn cache_file_name(key: &str, ext: &str) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in key.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{h:016x}.{ext}")
+}
+
+/// Serialize a cache entry: the key line, a `plays=N` line, then the data.
+/// The play count feeds eviction; every cache hit rewrites the entry with the
+/// count bumped (which also refreshes the mtime the decay is measured from).
+fn cache_entry_body(key: &str, plays: u64, data: &[u8]) -> Vec<u8> {
+    let header = format!("{key}\nplays={plays}\n");
+    let mut body = Vec::with_capacity(header.len() + data.len());
+    body.extend_from_slice(header.as_bytes());
+    body.extend_from_slice(data);
+    body
+}
+
+/// Parse a cache entry into `(key, plays, data offset)`. Entries written
+/// before play counts existed have no `plays=` line; they read as 0 plays
+/// (first in line for eviction) with the data starting right after the key,
+/// and the rewrite-on-hit upgrades them in place.
+fn cache_parse_entry(body: &[u8]) -> Option<(&[u8], u64, usize)> {
+    let nl = body.iter().position(|&b| b == b'\n')?;
+    let key = &body[..nl];
+    let rest = &body[nl + 1..];
+    if let Some(r) = rest.strip_prefix(b"plays=") {
+        if let Some(nl2) = r.iter().position(|&b| b == b'\n') {
+            if let Ok(plays) = std::str::from_utf8(&r[..nl2]).unwrap_or("").parse() {
+                return Some((key, plays, nl + 1 + 6 + nl2 + 1));
+            }
+        }
+    }
+    Some((key, 0, nl + 1))
+}
+
+/// The play count in an entry's header, reading only the leading bytes (art
+/// entries can run to a MB, and eviction scans the whole directory). Anything
+/// unparseable ranks as 0 plays.
+fn cache_entry_plays(path: &Path) -> u64 {
+    let mut buf = [0u8; 4096];
+    let Ok(mut f) = fs::File::open(path) else { return 0 };
+    let Ok(n) = f.read(&mut buf) else { return 0 };
+    cache_parse_entry(&buf[..n]).map_or(0, |(_, plays, _)| plays)
+}
+
+/// Half-life of a play count for eviction ranking: 30 days without a play
+/// halves an entry's score.
+const CACHE_HALF_LIFE: Duration = Duration::from_secs(30 * 24 * 3600);
+
+/// Eviction score for an entry: its play count decayed by the time since the
+/// last play (its mtime -- every hit rewrites the file). Lowest goes first.
+/// The decay keeps a raw count from ruling forever: a track played 50 times
+/// but untouched for a year scores ~0.01 and loses to anything heard this
+/// week, while a current favorite still comfortably outranks one-offs.
+fn cache_score(plays: u64, age: Duration) -> f64 {
+    plays as f64 * 0.5f64.powf(age.as_secs_f64() / CACHE_HALF_LIFE.as_secs_f64())
+}
+
+/// Cached bytes for `key` in the `sub/` cache, if present. A hit counts as a
+/// play: the entry is rewritten with its count bumped, so eviction can rank
+/// by how often each track is actually played.
+fn cache_load(sub: &str, ext: &str, key: &str) -> Option<Vec<u8>> {
+    let path = cache_dir(sub)?.join(cache_file_name(key, ext));
+    let body = fs::read(&path).ok()?;
+    let (file_key, plays, data_at) = cache_parse_entry(&body)?;
+    if file_key != key.as_bytes() {
+        return None; // hash collision with a different key
+    }
+    let data = body[data_at..].to_vec();
+    let _ = fs::write(&path, cache_entry_body(key, plays + 1, &data));
+    Some(data)
+}
+
+/// Persist `data` for `key` in the `sub/` cache (one play so far), then evict
+/// the entries with the lowest decayed play score beyond `max` (oldest first
+/// among ties) -- so a track in steady rotation outlives a one-off heard
+/// yesterday, but not by clinging to a play count it stopped earning.
+fn cache_store(sub: &str, ext: &str, max: usize, key: &str, data: &[u8]) {
+    let Some(dir) = cache_dir(sub) else { return };
+    if fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let _ = fs::write(
+        dir.join(cache_file_name(key, ext)),
+        cache_entry_body(key, 1, data),
+    );
+    let Ok(entries) = fs::read_dir(&dir) else { return };
+    let now = SystemTime::now();
+    let mut files: Vec<(f64, SystemTime, PathBuf)> = entries
+        .flatten()
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            let age = now.duration_since(mtime).unwrap_or(Duration::ZERO);
+            Some((cache_score(cache_entry_plays(&e.path()), age), mtime, e.path()))
+        })
+        .collect();
+    if files.len() <= max {
+        return;
+    }
+    files.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    for (_, _, path) in &files[..files.len() - max] {
+        let _ = fs::remove_file(path);
+    }
+}
+
+/// Cached LRC for the track, if present.
+fn lyric_cache_load(track_key: &str) -> Option<String> {
+    if !LYRICS_CACHE_ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
+    String::from_utf8(cache_load("lyrics", "lrc", track_key)?).ok()
+}
+
+/// Persist fetched LRC for the track. Only fetch hits are stored: a miss is
+/// retried over the network next play, so lyrics added to the providers
+/// later still show up.
+fn lyric_cache_store(track_key: &str, lrc: &str) {
+    if !LYRICS_CACHE_ENABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    cache_store("lyrics", "lrc", LYRIC_CACHE_MAX, track_key, lrc.as_bytes());
+}
+
+/// Cached cover bytes (as fetched, still encoded) for an art URL, if present.
+fn art_cache_load(url: &str) -> Option<Vec<u8>> {
+    if !ART_CACHE_ENABLED.load(Ordering::Relaxed) {
+        return None;
+    }
+    cache_load("art", "art", url)
+}
+
+/// Persist fetched cover bytes for an art URL. Only bytes that already
+/// decoded are stored, so a truncated download or an error page can never
+/// poison the cache; oversized covers are skipped per `ART_CACHE_ENTRY_MAX`.
+fn art_cache_store(url: &str, bytes: &[u8]) {
+    if !ART_CACHE_ENABLED.load(Ordering::Relaxed) || bytes.len() > ART_CACHE_ENTRY_MAX {
+        return;
+    }
+    cache_store("art", "art", ART_CACHE_MAX, url, bytes);
+}
+
 /// Spawn a background fetch of lyrics for `track_key`, publishing the parsed
 /// result into `LYRICS_STATE` only if that track is still current.
 fn fetch_lyrics(
@@ -402,9 +615,16 @@ fn fetch_lyrics(
     wake: Arc<OwnedFd>,
 ) {
     thread::spawn(move || {
-        let lines = fetch_lrc(&title, &artist, &album, duration)
-            .map(|lrc| parse_lrc(&lrc))
-            .unwrap_or_default();
+        // The on-disk cache first (works offline, saves a round-trip on
+        // replays); on a miss, fetch and cache the hit for next time.
+        let lrc = lyric_cache_load(&track_key).or_else(|| {
+            let fetched = fetch_lrc(&title, &artist, &album, duration);
+            if let Some(lrc) = &fetched {
+                lyric_cache_store(&track_key, lrc);
+            }
+            fetched
+        });
+        let lines = lrc.map(|lrc| parse_lrc(&lrc)).unwrap_or_default();
         let mut ly = LYRICS_STATE.lock().unwrap();
         if ly.track_key != track_key {
             return; // the track changed while we were fetching
@@ -489,8 +709,11 @@ pub fn spawn_poller(wake: Arc<OwnedFd>) {
 fn spawn_metadata_thread(wake: Arc<OwnedFd>) {
     thread::spawn(move || {
         // The art URL currently decoded into MEDIA_STATE, so unchanged art is
-        // never re-decoded (and a failing URL is not retried every tick).
+        // never re-decoded. Only recorded on a successful decode; failures go
+        // through `art_retry` instead.
         let mut cur_art_url = String::new();
+        // Backoff state for a failing art URL: (url, next attempt, its delay).
+        let mut art_retry: Option<(String, Instant, Duration)> = None;
         // The track lyrics are currently loaded/fetching for.
         let mut cur_track_key = String::new();
         loop {
@@ -517,30 +740,53 @@ fn spawn_metadata_thread(wake: Arc<OwnedFd>) {
             } else {
                 art_source_url(&track.art_url, &track.page_url)
             };
-            let art_reload = !art_source.is_empty() && art_source != cur_art_url;
-            let decoded = if art_reload {
-                load_art(&art_source, status)
-            } else {
-                None
-            };
+            // Attempt a load only while the player is active: during Idle
+            // (e.g. Stopped at startup or between tracks) the metadata is not
+            // settled yet, and burning the attempt there used to lose the
+            // cover for the whole track. Failed URLs are retried with backoff.
+            let want_art =
+                status != MediaStatus::Idle && !art_source.is_empty() && art_source != cur_art_url;
+            let art_attempt = want_art
+                && match &art_retry {
+                    Some((url, next, _)) if *url == art_source => Instant::now() >= *next,
+                    _ => true, // first try for this URL
+                };
+            let decoded = if art_attempt { load_art(&art_source) } else { None };
+            let art_ok = decoded.is_some();
+            // On the first failure for a new URL, clear the previous track's
+            // cover (retries then leave the blank panel alone).
+            let art_clear = art_attempt
+                && !art_ok
+                && !matches!(&art_retry, Some((url, _, _)) if *url == art_source);
+            if art_attempt {
+                if art_ok {
+                    cur_art_url = art_source.clone();
+                    art_retry = None;
+                } else {
+                    let delay = match &art_retry {
+                        Some((url, _, d)) if *url == art_source => (*d * 2).min(ART_RETRY_MAX),
+                        _ => ART_RETRY_MIN,
+                    };
+                    art_retry = Some((art_source.clone(), Instant::now() + delay, delay));
+                }
+            }
             {
                 let mut shared = MEDIA_STATE.lock().unwrap();
                 let meta_changed = shared.status != status
                     || shared.title != track.title
                     || shared.artist != track.artist;
-                if art_reload {
+                if art_ok {
                     shared.art = decoded;
+                } else if art_clear {
+                    shared.art = None;
                 }
-                if meta_changed || art_reload {
+                if meta_changed || art_ok || art_clear {
                     shared.status = status;
                     shared.title = track.title.clone();
                     shared.artist = track.artist.clone();
                     shared.generation = shared.generation.wrapping_add(1);
                     notify(&wake);
                 }
-            }
-            if art_reload {
-                cur_art_url = art_source;
             }
             // Re-anchor the position for the lyric-sync thread.
             *ANCHOR.lock().unwrap() = Some((
@@ -710,7 +956,7 @@ fn is_ad_url(url: &str) -> bool {
 
 /// Parse one playerctl format line (see `PLAYERCTL_FORMAT`).
 fn parse_line(line: &str) -> Track {
-    let mut parts = line.splitn(7, '\u{1f}');
+    let mut parts = line.splitn(8, '\u{1f}');
     let status = match parts.next().unwrap_or("") {
         "Playing" => MediaStatus::Playing,
         "Paused" => MediaStatus::Paused,
@@ -813,21 +1059,38 @@ fn youtube_thumb(page_url: &str) -> Option<String> {
 
 /// Decode an art URL into a cairo ARGB32 buffer, downscaled to `ART_MAX`.
 /// Handles `file://` paths and `http(s)://` URLs (e.g. browser/YouTube
-/// thumbnails, fetched with curl). Returns `None` for idle players, an empty
-/// or unsupported URL, or any fetch/decode failure -- the widget then draws a
-/// plain panel.
-fn load_art(url: &str, status: MediaStatus) -> Option<MediaArt> {
-    if status == MediaStatus::Idle || url.is_empty() {
+/// thumbnails, fetched with curl). Returns `None` for an empty or unsupported
+/// URL, or any fetch/decode failure -- the widget then draws a plain panel
+/// (and the poller retries with backoff).
+///
+/// Fetched covers go through the on-disk art cache (works offline, saves the
+/// round-trip on replays); `file://` art is already local, so only the http
+/// path is cached.
+fn load_art(url: &str) -> Option<MediaArt> {
+    if url.is_empty() {
         return None;
     }
-    let bytes = if let Some(path) = url.strip_prefix("file://") {
-        std::fs::read(percent_decode(path)).ok()?
-    } else if url.starts_with("http://") || url.starts_with("https://") {
-        fetch_url(url)?
-    } else {
+    if let Some(path) = url.strip_prefix("file://") {
+        return decode_art(&std::fs::read(percent_decode(path)).ok()?);
+    }
+    if !url.starts_with("http://") && !url.starts_with("https://") {
         return None;
-    };
-    let img = image::load_from_memory(&bytes).ok()?.thumbnail(ART_MAX, ART_MAX);
+    }
+    // A cached entry that no longer decodes (corrupt file) falls through to a
+    // fresh fetch, whose store then overwrites it.
+    if let Some(art) = art_cache_load(url).and_then(|bytes| decode_art(&bytes)) {
+        return Some(art);
+    }
+    let bytes = fetch_url(url)?;
+    let art = decode_art(&bytes)?;
+    art_cache_store(url, &bytes);
+    Some(art)
+}
+
+/// Decode encoded image bytes into a cairo ARGB32 buffer, downscaled to
+/// `ART_MAX`.
+fn decode_art(bytes: &[u8]) -> Option<MediaArt> {
+    let img = image::load_from_memory(bytes).ok()?.thumbnail(ART_MAX, ART_MAX);
     let rgba = img.to_rgba8();
     let (w, h) = (rgba.width() as i32, rgba.height() as i32);
     if w == 0 || h == 0 {
@@ -854,10 +1117,12 @@ fn load_art(url: &str, status: MediaStatus) -> Option<MediaArt> {
 }
 
 /// Fetch an http(s) art URL into memory with curl, bounded in time and size so
-/// a slow or huge response can't stall the poller or balloon memory.
+/// a slow or huge response can't stall the poller or balloon memory. `-f` makes
+/// an HTTP error status count as a failure instead of handing the error page
+/// to the image decoder.
 fn fetch_url(url: &str) -> Option<Vec<u8>> {
     let out = Command::new("curl")
-        .args(["-sL", "--max-time", "5", "--max-filesize", "8M", url])
+        .args(["-sfL", "--max-time", "5", "--max-filesize", "8M", url])
         .output()
         .ok()?;
     (out.status.success() && !out.stdout.is_empty()).then_some(out.stdout)
@@ -882,4 +1147,130 @@ fn percent_decode(s: &str) -> String {
         i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // One test (not several) because it points the caches at a scratch dir via
+    // CACHE_DIRECTORY, and parallel tests would race on the process env.
+    #[test]
+    fn disk_cache_roundtrip_collision_and_eviction() {
+        let dir = std::env::temp_dir().join(format!("nqtd-disk-cache-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        std::env::set_var("CACHE_DIRECTORY", &dir);
+
+        let key = "Title\u{1f}Artist";
+        let lrc = "[00:01.00] hello\n[00:02.00] world";
+        assert_eq!(lyric_cache_load(key), None);
+        lyric_cache_store(key, lrc);
+        assert_eq!(lyric_cache_load(key).as_deref(), Some(lrc));
+
+        // A file under this key's name but holding another track's key (hash
+        // collision) must not be served.
+        let path = dir.join("lyrics").join(cache_file_name(key, "lrc"));
+        fs::write(&path, "Other\u{1f}Someone\nwrong").unwrap();
+        assert_eq!(lyric_cache_load(key), None);
+
+        // Fill to the cap with old entries; the next store evicts down to the
+        // cap and the fresh entry survives.
+        let lyrics_dir = dir.join("lyrics");
+        let old = SystemTime::now() - Duration::from_secs(3600);
+        for i in 0..LYRIC_CACHE_MAX {
+            let p = lyrics_dir.join(format!("{i:016x}.old"));
+            fs::write(&p, "x").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&p)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        }
+        let fresh = "New\u{1f}Band";
+        lyric_cache_store(fresh, lrc);
+        assert_eq!(fs::read_dir(&lyrics_dir).unwrap().count(), LYRIC_CACHE_MAX);
+        assert_eq!(lyric_cache_load(fresh).as_deref(), Some(lrc));
+
+        // Play count outranks recency: `fresh` has been played several times,
+        // so even as the oldest file in the directory it survives eviction
+        // while a never-played (0-play) filler goes instead.
+        assert_eq!(lyric_cache_load(fresh).as_deref(), Some(lrc));
+        let fresh_path = lyrics_dir.join(cache_file_name(fresh, "lrc"));
+        fs::File::options()
+            .write(true)
+            .open(&fresh_path)
+            .unwrap()
+            .set_modified(old - Duration::from_secs(3600))
+            .unwrap();
+        lyric_cache_store("Encore\u{1f}Band", lrc);
+        assert_eq!(fs::read_dir(&lyrics_dir).unwrap().count(), LYRIC_CACHE_MAX);
+        assert_eq!(lyric_cache_load(fresh).as_deref(), Some(lrc));
+
+        // A pre-play-count entry (no `plays=` line) still loads, and the hit
+        // rewrites it into the counted format.
+        let legacy = "Legacy\u{1f}Old";
+        let legacy_path = lyrics_dir.join(cache_file_name(legacy, "lrc"));
+        fs::write(&legacy_path, format!("{legacy}\n{lrc}")).unwrap();
+        assert_eq!(lyric_cache_load(legacy).as_deref(), Some(lrc));
+        assert_eq!(cache_entry_plays(&legacy_path), 1);
+
+        // Art cache: binary bytes (including embedded newlines and non-UTF-8)
+        // round-trip intact, and oversized covers are not stored.
+        let url = "https://img.youtube.com/vi/abcdefghijk/hqdefault.jpg";
+        let cover = [0xffu8, 0xd8, 0xff, b'\n', 0x00, b'\n', 0xfe];
+        assert_eq!(art_cache_load(url), None);
+        art_cache_store(url, &cover);
+        assert_eq!(art_cache_load(url).as_deref(), Some(&cover[..]));
+        let big_url = "https://example.com/huge.png";
+        art_cache_store(big_url, &vec![0u8; ART_CACHE_ENTRY_MAX + 1]);
+        assert_eq!(art_cache_load(big_url), None);
+
+        // Time decay: `url` has 2 plays but is backdated a year, so once the
+        // art cache is over the cap it loses eviction to the just-stored
+        // 1-play covers despite its higher raw count.
+        let art_dir = dir.join("art");
+        fs::File::options()
+            .write(true)
+            .open(art_dir.join(cache_file_name(url, "art")))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(365 * 24 * 3600))
+            .unwrap();
+        for i in 0..ART_CACHE_MAX {
+            art_cache_store(&format!("https://example.com/{i}.jpg"), &cover);
+        }
+        assert_eq!(fs::read_dir(&art_dir).unwrap().count(), ART_CACHE_MAX);
+        assert_eq!(art_cache_load(url), None);
+
+        // Disabled caches neither serve existing entries nor store new ones,
+        // but the entries themselves survive for when the cache is re-enabled.
+        set_lyrics_cache(false);
+        set_art_cache(false);
+        assert_eq!(lyric_cache_load(fresh), None);
+        lyric_cache_store("Gated\u{1f}Band", lrc);
+        assert_eq!(art_cache_load("https://example.com/0.jpg"), None);
+        art_cache_store("https://example.com/gated.jpg", &cover);
+        set_lyrics_cache(true);
+        set_art_cache(true);
+        assert_eq!(lyric_cache_load(fresh).as_deref(), Some(lrc));
+        assert_eq!(lyric_cache_load("Gated\u{1f}Band"), None);
+        assert_eq!(art_cache_load("https://example.com/gated.jpg"), None);
+
+        let _ = fs::remove_dir_all(&dir);
+        std::env::remove_var("CACHE_DIRECTORY");
+    }
+
+    #[test]
+    fn decayed_score_ranks_frequency_and_age() {
+        // One half-life halves the count; fresh entries keep the raw count.
+        assert!((cache_score(4, CACHE_HALF_LIFE) - 2.0).abs() < 1e-9);
+        assert!((cache_score(3, Duration::ZERO) - 3.0).abs() < 1e-9);
+        // An old favorite untouched for a year loses to anything played now,
+        // but a current favorite still outranks a fresh one-off.
+        let year = Duration::from_secs(365 * 24 * 3600);
+        assert!(cache_score(50, year) < cache_score(1, Duration::ZERO));
+        assert!(cache_score(50, Duration::from_secs(24 * 3600)) > cache_score(1, Duration::ZERO));
+        // Never-played (legacy/unparseable) entries rank below everything.
+        assert_eq!(cache_score(0, Duration::ZERO), 0.0);
+    }
 }

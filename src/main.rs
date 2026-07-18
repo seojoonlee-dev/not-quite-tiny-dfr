@@ -1697,6 +1697,8 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
     let (mut cfg, mut layers, initial_widgets) = cfg_mgr.load_config();
     media::set_lyric_offset(cfg.lyric_offset);
     media::set_cover_blur(cfg.media_cover_blur);
+    media::set_art_cache(cfg.media_art_cache);
+    media::set_lyrics_cache(cfg.media_lyrics_cache);
     let mut pixel_shift = PixelShiftManager::new();
     let mut last = Instant::now();
     // Last time fling momentum was integrated (see the top of the main loop).
@@ -1960,6 +1962,8 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 layers = new_layers;
                 media::set_lyric_offset(cfg.lyric_offset);
                 media::set_cover_blur(cfg.media_cover_blur);
+                media::set_art_cache(cfg.media_art_cache);
+                media::set_lyrics_cache(cfg.media_lyrics_cache);
                 active_layer = 0;
                 needs_complete_redraw = true;
                 widget_rt = WidgetRuntime::new(new_widgets, wake_write.clone());
@@ -1968,6 +1972,8 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         if let Some(new_widgets) = cfg_mgr.update_config(&mut cfg, &mut layers) {
             media::set_lyric_offset(cfg.lyric_offset);
             media::set_cover_blur(cfg.media_cover_blur);
+            media::set_art_cache(cfg.media_art_cache);
+            media::set_lyrics_cache(cfg.media_lyrics_cache);
             active_layer = 0;
             needs_complete_redraw = true;
             // Replacing the runtime drops the old one, stopping its threads.

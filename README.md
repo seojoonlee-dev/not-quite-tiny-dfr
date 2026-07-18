@@ -78,6 +78,8 @@ misbehaving.
 | `PinnedIgnoreLayerSwipe` | bool | `true` | Pinned buttons hold still during layer swipes. |
 | `LyricOffset` | float | `0.0` | Seconds to shift synced lyrics against the audio. Positive shows each line earlier (compensates for audio output latency); negative shows it later. |
 | `MediaCoverBlur` | bool | `false` | Blur the album cover behind the media panel. |
+| `MediaArtCache` | bool | `true` | Cache fetched album covers on disk (in the service's cache directory). Disabling stops reads and writes but keeps existing entries for when it's re-enabled. |
+| `MediaLyricsCache` | bool | `true` | Cache fetched lyrics on disk. Same disable semantics as `MediaArtCache`. |
 | `PrimaryLayerKeys` | array of buttons | Esc + F1–F12 | The primary layer. Ignored when `Layers` is set. |
 | `MediaLayerKeys` | array of buttons | Esc + media keys | The media layer. Ignored when `Layers` is set. |
 | `Layers` | array of button arrays | unset | Any number of layers; swiping cycles through them in order. When set, wins over `PrimaryLayerKeys`/`MediaLayerKeys`/`MediaLayerDefault`. |

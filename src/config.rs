@@ -39,6 +39,10 @@ pub struct Config {
     pub lyric_offset: f64,
     /// Whether the media widget blurs the album cover behind the panel.
     pub media_cover_blur: bool,
+    /// Whether fetched album covers are cached on disk.
+    pub media_art_cache: bool,
+    /// Whether fetched lyrics are cached on disk.
+    pub media_lyrics_cache: bool,
     pub style: Style,
 }
 
@@ -63,6 +67,8 @@ const DEFAULT_PINNED_IGNORE_SCROLL: bool = true;
 const DEFAULT_PINNED_IGNORE_LAYER_SWIPE: bool = true;
 const DEFAULT_LYRIC_OFFSET: f64 = 0.0;
 const DEFAULT_MEDIA_COVER_BLUR: bool = false;
+const DEFAULT_MEDIA_ART_CACHE: bool = true;
+const DEFAULT_MEDIA_LYRICS_CACHE: bool = true;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
@@ -85,6 +91,8 @@ struct ConfigProxy {
     pinned_ignore_layer_swipe: Option<bool>,
     lyric_offset: Option<f64>,
     media_cover_blur: Option<bool>,
+    media_art_cache: Option<bool>,
+    media_lyrics_cache: Option<bool>,
     style: Option<StyleProxy>,
     primary_layer_keys: Option<Vec<ButtonConfig>>,
     media_layer_keys: Option<Vec<ButtonConfig>>,
@@ -151,6 +159,12 @@ impl ConfigProxy {
         }
         if o.media_cover_blur.is_some() {
             self.media_cover_blur = o.media_cover_blur;
+        }
+        if o.media_art_cache.is_some() {
+            self.media_art_cache = o.media_art_cache;
+        }
+        if o.media_lyrics_cache.is_some() {
+            self.media_lyrics_cache = o.media_lyrics_cache;
         }
         if o.primary_layer_keys.is_some() {
             self.primary_layer_keys = o.primary_layer_keys;
@@ -728,6 +742,10 @@ fn load_config(
         media_cover_blur: base
             .media_cover_blur
             .unwrap_or(DEFAULT_MEDIA_COVER_BLUR),
+        media_art_cache: base.media_art_cache.unwrap_or(DEFAULT_MEDIA_ART_CACHE),
+        media_lyrics_cache: base
+            .media_lyrics_cache
+            .unwrap_or(DEFAULT_MEDIA_LYRICS_CACHE),
         style,
     };
     (cfg, layers, widgets)

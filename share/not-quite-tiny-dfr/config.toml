@@ -32,6 +32,10 @@
 # Blur the album cover behind the media panel.
 # MediaCoverBlur = false
 
+# Cache fetched album covers / lyrics on disk.
+# MediaArtCache = true
+# MediaLyricsCache = true
+
 # Pinned must mark the same leading slots on every layer; a mismatch is a
 # config error (red banner on the bar). OnClick = "Action" makes a key button
 # light up on tap (the pressed fill); widgets, sliders, and Expand buttons stay
