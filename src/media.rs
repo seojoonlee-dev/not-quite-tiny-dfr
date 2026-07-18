@@ -87,6 +87,18 @@ pub fn control(verb: &str) {
     let _ = Command::new("playerctl").arg(verb).status();
 }
 
+/// Run the media widget's OnClick shell command, fire-and-forget. A thread
+/// waits on the child (reaping it) so an arbitrary command can't stall the
+/// render loop.
+pub fn run_tap_command(command: &str) {
+    let command = command.to_string();
+    thread::spawn(move || {
+        if let Err(e) = Command::new("sh").arg("-c").arg(&command).status() {
+            eprintln!("not-quite-tiny-dfr: failed to run OnClick command {command:?}: {e}");
+        }
+    });
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
 pub enum LyricsStatus {
     /// No lyrics (nothing playing, or none found for the track).

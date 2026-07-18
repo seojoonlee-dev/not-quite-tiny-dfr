@@ -983,7 +983,15 @@ impl FunctionLayer {
                         has_mute,
                     )
                 } else if cfg.media == Some(true) {
-                    Button::new_media(cfg.theme.as_ref(), cfg.icon_width.unwrap_or(default_icon_size))
+                    let tap_command = match cfg.on_click.take() {
+                        Some(OnClick::Command(c)) => Some(c),
+                        _ => None,
+                    };
+                    Button::new_media(
+                        cfg.theme.as_ref(),
+                        cfg.icon_width.unwrap_or(default_icon_size),
+                        tap_command,
+                    )
                 } else if let Some(command) = cfg.command.take() {
                     let id = *next_id;
                     *next_id += 1;
@@ -3264,6 +3272,13 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                                                     m.view_anim = Some(now);
                                                 } else if let Some(z) = zone {
                                                     media::control(z.verb());
+                                                } else if active && m.tap_command.is_some() {
+                                                    // Controls/title view, tap on
+                                                    // the info area: run the
+                                                    // OnClick command.
+                                                    media::run_tap_command(
+                                                        m.tap_command.as_deref().unwrap(),
+                                                    );
                                                 } else if active && has_lyrics && !m.show_lyrics {
                                                     m.show_lyrics = true;
                                                     m.view_anim = Some(now);

@@ -65,6 +65,9 @@ pub(crate) struct MediaState {
     pub(crate) lyric_idx: usize,
     pub(crate) prev_lyric: String,
     pub(crate) lyric_anim: Option<Instant>,
+    /// Shell command run when the active panel is tapped outside the transport
+    /// controls (the `OnClick` config value, when it is a command).
+    pub(crate) tap_command: Option<String>,
 }
 
 impl MediaState {

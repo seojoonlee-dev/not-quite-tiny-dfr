@@ -671,7 +671,11 @@ impl Button {
         }
     }
 
-    pub(crate) fn new_media(theme: Option<impl AsRef<str>>, icon_size: i32) -> Button {
+    pub(crate) fn new_media(
+        theme: Option<impl AsRef<str>>,
+        icon_size: i32,
+        tap_command: Option<String>,
+    ) -> Button {
         let load = |name| Some(Self::load_battery_image(name, theme.as_ref()));
         Button {
             action: vec![],
@@ -691,6 +695,7 @@ impl Button {
                 lyric_idx: usize::MAX,
                 prev_lyric: String::new(),
                 lyric_anim: None,
+                tap_command,
             }),
             icon_width: icon_size as f64,
             icon_height: icon_size as f64,

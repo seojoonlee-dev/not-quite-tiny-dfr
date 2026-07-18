@@ -187,10 +187,25 @@ pub enum ButtonAction {
 /// `Action` (the default) runs the button's configured Action/keys; `Expand`
 /// instead expands the button in place -- reusing the slider's expand
 /// animation -- and shows an `ExpandCommand` script's output until it idles.
-#[derive(Copy, Clone, PartialEq, Eq, Debug, Deserialize)]
+/// Any other string is a shell command: on a media widget it runs when the
+/// active panel is tapped outside the transport controls (e.g. to raise the
+/// player app).
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum OnClick {
     Action,
     Expand,
+    Command(String),
+}
+
+impl<'de> Deserialize<'de> for OnClick {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        Ok(match s.as_str() {
+            "Action" => OnClick::Action,
+            "Expand" => OnClick::Expand,
+            _ => OnClick::Command(s),
+        })
+    }
 }
 
 impl<'de> Deserialize<'de> for ButtonAction {
@@ -1017,6 +1032,17 @@ mod tests {
         // Default (unset) leaves OnClick as the plain Action behavior.
         let plain: ButtonConfig = toml::from_str("Command = \"x\"\n").unwrap();
         assert_eq!(plain.on_click, None);
+    }
+
+    #[test]
+    fn on_click_command_parses() {
+        // Anything other than "Action"/"Expand" is a shell command.
+        let cfg: ButtonConfig =
+            toml::from_str("Media = true\nOnClick = \"gtk-launch tidal\"\n").unwrap();
+        assert_eq!(
+            cfg.on_click,
+            Some(OnClick::Command("gtk-launch tidal".to_string()))
+        );
     }
 
     #[test]

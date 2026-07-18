@@ -90,8 +90,9 @@
 
 # A media widget (playerctl/MPRIS): transport controls that, while a player is
 # running, join into a panel backed by the album cover with the track title and
-# artist. Taps control the active player. Spans Stretch slots:
-# { Media = true, Stretch = 6 },
+# artist. Taps control the active player. Spans Stretch slots. OnClick may name
+# a shell command to run when the panel is tapped outside the controls:
+# { Media = true, Stretch = 6, OnClick = "systemd-run --user gtk-launch spotify" },
 
 # battery.sh -- battery icon + percentage from UPower. Flags: -c, -t, -w (with
 # -w use Interval = 0), -f N (seed the "full" ceiling; the script auto-learns it
