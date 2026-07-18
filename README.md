@@ -10,6 +10,45 @@ Config is merged from, in increasing precedence:
 `/usr/share/not-quite-tiny-dfr/config.toml` → `/etc/not-quite-tiny-dfr/config.toml`
 → `~/.config/not-quite-tiny-dfr/config.toml`. All are live-reloaded.
 
+## NixOS
+
+This flake exposes `nixosModules.default`, a drop-in replacement for
+nixpkgs' `hardware.apple.touchBar` module -- same option interface
+(`enable`/`package`/`settings`), but pointed at this fork's actual config
+path and systemd unit name instead of the mainline module's hardcoded
+`tiny-dfr` literals (which otherwise silently no-op when `package` is set to
+a differently-named fork; see the module's own header comment for details).
+
+```nix
+{
+  inputs.not-quite-tiny-dfr.url = "github:seojoonlee-dev/not-quite-tiny-dfr";
+
+  outputs = { nixpkgs, not-quite-tiny-dfr, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      modules = [
+        not-quite-tiny-dfr.nixosModules.default
+        {
+          hardware.apple.touchBar = {
+            enable = true;
+            # package defaults to this flake's own package output; override
+            # only if you need a different revision/build.
+            settings = {
+              MediaLayerDefault = true;
+              EnablePixelShift = true;
+              # ... see "Configuration options" below
+            };
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+If any `settings` command widget (or a `Slider{Get,Set}`) needs something on
+`PATH` beyond a shell -- e.g. a package referenced by bare name rather than
+absolute store path -- add it via `hardware.apple.touchBar.extraPath`.
+
 ## Configuration options
 
 Every key is optional; unset keys fall back to the defaults below. Top-level
