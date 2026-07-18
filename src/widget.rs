@@ -340,6 +340,10 @@ fn run_command(command: &str, stop: &AtomicBool) -> WidgetOutput {
     let mut child = match child {
         Ok(c) => c,
         Err(e) => {
+            // The output is discarded for slider set/mute commands, so the
+            // log line is the only trace a spawn failure leaves (e.g. no `sh`
+            // on the unit's PATH).
+            eprintln!("not-quite-tiny-dfr: failed to run command {command:?}: {e}");
             return WidgetOutput {
                 text: format!("err: {e}"),
                 color: None,
@@ -354,6 +358,12 @@ fn run_command(command: &str, stop: &AtomicBool) -> WidgetOutput {
             Ok(None) => {
                 let timed_out = start.elapsed() > COMMAND_TIMEOUT;
                 if timed_out || stop.load(Ordering::Relaxed) {
+                    if timed_out {
+                        eprintln!(
+                            "not-quite-tiny-dfr: command timed out after {}s: {command:?}",
+                            COMMAND_TIMEOUT.as_secs()
+                        );
+                    }
                     let _ = child.kill();
                     let _ = child.wait();
                     return if timed_out {
