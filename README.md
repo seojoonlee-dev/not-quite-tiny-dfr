@@ -204,7 +204,9 @@ a Python script, a compiled binary.
 > user**. Only use scripts you trust — a malicious config or script can do
 > anything you can. The systemd unit sandboxes the daemon: your home directory
 > is mounted **read-only** (scripts can read but not write it), `/tmp` is
-> **private and writable** (use it for caches), and network access
+> **private and writable** but wiped on restart, `$CACHE_DIRECTORY`
+> (`/var/cache/not-quite-tiny-dfr`, owned by the logged-in user) is **writable
+> and persistent** (use it for caches), and network access
 > (`AF_INET`/`AF_INET6`) is **enabled** so widgets like weather scripts work. If
 > you don't want network-capable widgets, remove `AF_INET AF_INET6` from
 > `RestrictAddressFamilies=` in the unit.

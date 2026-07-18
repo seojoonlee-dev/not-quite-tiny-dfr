@@ -27,7 +27,9 @@ shift $((OPTIND - 1))
 # the widget to "weather n/a" on every transient hiccup, cache the last good
 # reading (keyed by the requested format+location) and fall back to it. Only
 # show "weather n/a" when a fetch fails and we have never had a good reading.
-cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/not-quite-tiny-dfr"
+# Under the systemd sandbox the home directory is read-only; CACHE_DIRECTORY
+# (from the unit's CacheDirectory=) is the writable spot there.
+cache_dir="${CACHE_DIRECTORY:-${XDG_CACHE_HOME:-$HOME/.cache}/not-quite-tiny-dfr}"
 cache_key=$(printf '%s' "$cond+%t$extra|$1" | tr -c 'A-Za-z0-9' '_')
 cache_file="$cache_dir/weather_$cache_key"
 

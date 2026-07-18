@@ -1514,10 +1514,35 @@ impl FunctionLayer {
     }
 }
 
+/// Chown `dir` and everything under it to `uid:gid`; errors are ignored (the
+/// worst case is a cache entry the user cannot overwrite).
+fn chown_recursive(dir: &std::path::Path, uid: u32, gid: u32) {
+    let _ = std::os::unix::fs::chown(dir, Some(uid), Some(gid));
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                chown_recursive(&path, uid, gid);
+            } else {
+                let _ = std::os::unix::fs::chown(&path, Some(uid), Some(gid));
+            }
+        }
+    }
+}
+
 /// Drop root down to `user`, keeping the supplementary `groups` (input/video)
 /// needed for device access. Privilege dropping is one-way, so this is only
 /// called once we actually know which user to serve.
 fn drop_privileges(user: &str, groups: &[&str]) {
+    let u = nix::unistd::User::from_name(user).ok().flatten();
+    // The unit's CacheDirectory= is created root-owned, but under the sandbox
+    // it is the only writable place widget scripts can persist caches (home is
+    // read-only). Hand it to the user while we are still root -- recursively,
+    // in case the daemon already wrote into it (e.g. the lyric cache) before
+    // the deferred drop.
+    if let (Some(u), Ok(dir)) = (&u, std::env::var("CACHE_DIRECTORY")) {
+        chown_recursive(dir.as_ref(), u.uid.as_raw(), u.gid.as_raw());
+    }
     PrivDrop::default()
         .user(user)
         .group_list(groups)
@@ -1526,7 +1551,7 @@ fn drop_privileges(user: &str, groups: &[&str]) {
     // Give child processes (widget and slider commands) the user's session
     // environment: PipeWire tools (wpctl) locate the session via
     // XDG_RUNTIME_DIR, and scripts expect ~ to be the user's home, not root's.
-    if let Ok(Some(u)) = nix::unistd::User::from_name(user) {
+    if let Some(u) = u {
         std::env::set_var("HOME", &u.dir);
         std::env::set_var("XDG_RUNTIME_DIR", format!("/run/user/{}", u.uid.as_raw()));
     }

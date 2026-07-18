@@ -28,6 +28,10 @@ ProtectControlGroups=strict
 # (e.g. a weather-API script). Widgets run arbitrary commands as your user --
 # only use scripts you trust. Home stays read-only; /tmp is private+writable.
 RestrictAddressFamilies=AF_UNIX AF_NETLINK AF_INET AF_INET6
+# Writable /var/cache/not-quite-tiny-dfr, exported as $CACHE_DIRECTORY, so
+# widget scripts can persist caches despite the read-only home; the daemon
+# chowns it to the logged-in user when it drops privileges.
+CacheDirectory=not-quite-tiny-dfr
 RestrictNamespaces=true
 RestrictSUIDSGID=true
 
