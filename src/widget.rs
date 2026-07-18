@@ -16,6 +16,11 @@ use std::{
 
 /// Hard cap so a hung script can't wedge its worker thread forever.
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
+/// First retry delay after a widget command fails (non-zero exit); doubles per
+/// consecutive failure, capped at the widget's interval. Keeps a fetch that
+/// failed because e.g. the network wasn't up yet from squatting on stale
+/// output for a whole long interval.
+const RETRY_BASE: Duration = Duration::from_secs(15);
 /// Floor on the poll interval so nobody cooks their CPU with `Interval = 0.01`.
 const MIN_INTERVAL: Duration = Duration::from_millis(100);
 /// How often worker threads wake to re-check the stop flag while waiting.
@@ -238,7 +243,7 @@ fn run_setter(
     // queued a newer value, in which case that one is about to run anyway.
     let refresh = |id: usize, stop: &AtomicBool| {
         if let Some(get) = get_commands.get(&id) {
-            let out = run_command(get, stop);
+            let (out, _) = run_command(get, stop);
             if !pending.lock().unwrap().contains_key(&id)
                 && !pending_mutes.lock().unwrap().contains_key(&id)
             {
@@ -294,8 +299,9 @@ fn run_widget(
     stop: Arc<AtomicBool>,
     wake: Arc<OwnedFd>,
 ) {
+    let mut retry = RETRY_BASE;
     while !stop.load(Ordering::Relaxed) {
-        let output = run_command(&spec.command, &stop);
+        let (output, ok) = run_command(&spec.command, &stop);
         let changed = {
             let mut map = results.lock().unwrap();
             if map.get(&spec.id) != Some(&output) {
@@ -312,7 +318,15 @@ fn run_widget(
                 libc::write(wake.as_raw_fd(), byte.as_ptr() as *const c_void, 1);
             }
         }
-        sleep_until(Instant::now() + spec.interval, &stop);
+        let delay = if ok {
+            retry = RETRY_BASE;
+            spec.interval
+        } else {
+            let delay = retry.min(spec.interval);
+            retry = (retry * 2).min(spec.interval.max(RETRY_BASE));
+            delay
+        };
+        sleep_until(Instant::now() + delay, &stop);
     }
 }
 
@@ -327,9 +341,9 @@ fn sleep_until(deadline: Instant, stop: &AtomicBool) {
     }
 }
 
-/// Run `sh -c <command>`, returning its parsed output. Kills the child if it
-/// exceeds the timeout or the runtime is stopping.
-fn run_command(command: &str, stop: &AtomicBool) -> WidgetOutput {
+/// Run `sh -c <command>`, returning its parsed output and whether it exited
+/// zero. Kills the child if it exceeds the timeout or the runtime is stopping.
+fn run_command(command: &str, stop: &AtomicBool) -> (WidgetOutput, bool) {
     let child = Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -344,17 +358,24 @@ fn run_command(command: &str, stop: &AtomicBool) -> WidgetOutput {
             // log line is the only trace a spawn failure leaves (e.g. no `sh`
             // on the unit's PATH).
             eprintln!("not-quite-tiny-dfr: failed to run command {command:?}: {e}");
-            return WidgetOutput {
-                text: format!("err: {e}"),
-                color: None,
-                icon: None,
-            }
+            return (
+                WidgetOutput {
+                    text: format!("err: {e}"),
+                    color: None,
+                    icon: None,
+                },
+                false,
+            )
         }
     };
     let start = Instant::now();
+    let mut ok = false;
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => break,
+            Ok(Some(status)) => {
+                ok = status.success();
+                break;
+            }
             Ok(None) => {
                 let timed_out = start.elapsed() > COMMAND_TIMEOUT;
                 if timed_out || stop.load(Ordering::Relaxed) {
@@ -367,13 +388,16 @@ fn run_command(command: &str, stop: &AtomicBool) -> WidgetOutput {
                     let _ = child.kill();
                     let _ = child.wait();
                     return if timed_out {
-                        WidgetOutput {
-                            text: "timeout".into(),
-                            color: None,
-                            icon: None,
-                        }
+                        (
+                            WidgetOutput {
+                                text: "timeout".into(),
+                                color: None,
+                                icon: None,
+                            },
+                            false,
+                        )
                     } else {
-                        WidgetOutput::default()
+                        (WidgetOutput::default(), false)
                     };
                 }
                 thread::sleep(POLL_STEP);
@@ -385,7 +409,7 @@ fn run_command(command: &str, stop: &AtomicBool) -> WidgetOutput {
     if let Some(mut stdout) = child.stdout.take() {
         let _ = stdout.read_to_string(&mut out);
     }
-    parse_output(&out)
+    (parse_output(&out), ok)
 }
 
 /// Parse a widget's stdout: JSON `{"text","color"}` if it looks like JSON,

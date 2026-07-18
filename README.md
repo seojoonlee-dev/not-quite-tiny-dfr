@@ -200,6 +200,12 @@ timeout, so a slow or hung script never freezes the bar. Widgets redraw only
 when their output changes. The command can be any executable — a shell one-liner,
 a Python script, a compiled binary.
 
+A command that exits **non-zero** (or times out) is retried sooner than its
+`Interval`: 15s after the first failure, doubling per consecutive failure up
+to the interval. Scripts that fetch external data should exit non-zero when
+the fetch fails, so a fetch that failed only because e.g. the network wasn't
+up yet at boot recovers in seconds instead of a full interval.
+
 > ⚠️ **Security / permissions.** Widgets execute **arbitrary commands as your
 > user**. Only use scripts you trust — a malicious config or script can do
 > anything you can. The systemd unit sandboxes the daemon: your home directory
@@ -229,8 +235,10 @@ Scripts shipped with the app are installed to
   { Command = "sh /usr/share/not-quite-tiny-dfr/widgets/weather.sh -e -H Seoul", Interval = 900, Stretch = 3 }
   ```
 
-  If the network or wttr.in is unavailable it shows `weather n/a` and retries
-  on the next interval.
+  If the network or wttr.in is unavailable it falls back to the last cached
+  reading (or `weather n/a` if there has never been one) and exits non-zero,
+  so the daemon retries with a short backoff instead of waiting a full
+  interval.
 
   Text is rendered with pango, which falls back across system fonts per
   glyph — color emoji (and `-w`'s wind arrows) render as long as an emoji

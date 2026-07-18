@@ -40,7 +40,9 @@ if [ -z "$out" ]; then
     else
         echo "weather n/a"
     fi
-    exit 0
+    # Non-zero exit = no fresh data this run; the daemon retries with a short
+    # backoff instead of sitting on this output for a full interval.
+    exit 1
 fi
 
 # wttr.in writes positive temperatures as "+11°C" and pads some fields;
