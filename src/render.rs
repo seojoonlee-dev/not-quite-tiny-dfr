@@ -525,19 +525,23 @@ pub(crate) fn draw_media_lyrics(
         let (natural_w, _) = layout.pixel_size();
         let mut px = max_px;
         if natural_w as f64 > width {
-            // Shrink to fit the width. Glyph advance isn't perfectly linear in
-            // font size (hinting/rounding), so a single linear estimate can
-            // still overflow and ellipsize -- refine by re-measuring until it
-            // fits (or bottoms out at the floor, after which it ellipsizes).
-            px = (max_px * width / natural_w as f64).max(min_px);
+            // Shrink to fit the width, undershooting slightly: pixel_size()
+            // rounds and the ellipsizer triggers right at the boundary, so a
+            // size that measures as an exact fit can still get clipped.
+            let fit = width * 0.985;
+            // Glyph advance isn't perfectly linear in font size
+            // (hinting/rounding), so a single linear estimate can still
+            // overflow and ellipsize -- refine by re-measuring until it fits
+            // (or bottoms out at the floor, after which it ellipsizes).
+            px = (max_px * fit / natural_w as f64).max(min_px);
             for _ in 0..3 {
                 font.set_absolute_size(px * pango::SCALE as f64);
                 layout.set_font_description(Some(&font));
                 let (w, _) = layout.pixel_size();
-                if w as f64 <= width || px <= min_px {
+                if w as f64 <= fit || px <= min_px {
                     break;
                 }
-                px = (px * width / w as f64).max(min_px);
+                px = (px * fit / w as f64).max(min_px);
             }
         }
         font.set_absolute_size(px * pango::SCALE as f64);
