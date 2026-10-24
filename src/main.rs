@@ -1114,6 +1114,11 @@ impl FunctionLayer {
                     if let Some(OnClick::Command(c)) = cfg.on_click.take() {
                         button.tap_command = Some(c);
                     }
+                    // Per-button colors, as Button::with_config applies them; the
+                    // script's JSON `color` still overrides TextColor per update.
+                    button.bg_color = cfg.color;
+                    button.bg_color_active = cfg.color_active;
+                    button.text_color = cfg.text_color;
                     button
                 } else {
                     Button::with_config(cfg, default_icon_size)
@@ -3970,6 +3975,39 @@ mod tests {
         assert_eq!(layer.buttons[0].1.fill_color(&style, false), None);
         assert!(layer.buttons[1].1.fill_color(&style, false).is_some());
         assert_eq!(layer.buttons[2].1.fill_color(&style, false), None);
+    }
+
+    #[test]
+    fn command_widget_takes_per_button_colors() {
+        use crate::style::Color;
+        let fill = Color::parse_hex("#efe4e2").unwrap();
+        let pressed = Color::parse_hex("#946460").unwrap();
+        let text = Color::parse_hex("#6f5552").unwrap();
+        let keys = vec![ButtonConfig {
+            command: Some("echo hi".into()),
+            on_click: Some(OnClick::Action),
+            color: Some(fill),
+            color_active: Some(pressed),
+            text_color: Some(text),
+            ..Default::default()
+        }];
+        let mut layer = FunctionLayer::with_config(
+            keys,
+            &mut Widgets::default(),
+            &mut 0,
+            48,
+            0,
+            true,
+            true,
+            true,
+            true,
+        );
+        let style = Style::default();
+        let b = &mut layer.buttons[0].1;
+        assert_eq!(b.fill_color(&style, false), Some(fill));
+        assert_eq!(b.effective_text_color(&style), text);
+        b.active = true;
+        assert_eq!(b.fill_color(&style, false), Some(pressed));
     }
 
     /// Like `text_layer`, but with an explicit stretch per button.
