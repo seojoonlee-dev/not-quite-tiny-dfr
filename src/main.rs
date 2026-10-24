@@ -53,7 +53,7 @@ use uinput::{create_uinput, toggle_keys, Interface};
 use sensors::{
     find_battery_device, find_cpu_temp_zone, get_battery_state, open_cpu_power_source,
     read_cpu_temp, read_energy_uj, BATTERY_STATE, CPU_POWER_STATE, CPU_TEMP_STATE,
-    GPU_LABEL, GPU_POWER_STATE, GPU_TEMP_STATE,
+    GPU_LABEL, GPU_STATE,
 };
 
 use crate::config::ConfigManager;
@@ -1877,9 +1877,8 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
     let mut last_cpu_temp_drawn = *CPU_TEMP_STATE.lock().unwrap();
     // Same, for the Cpu widget's watts mode.
     let mut last_cpu_power_drawn = *CPU_POWER_STATE.lock().unwrap();
-    // Same, for Gpu buttons (temperature and watts).
-    let mut last_gpu_temp_drawn = *GPU_TEMP_STATE.lock().unwrap();
-    let mut last_gpu_power_drawn = *GPU_POWER_STATE.lock().unwrap();
+    // Same, for Gpu buttons (temperature and watts, or the iGPU text).
+    let mut last_gpu_drawn = *GPU_STATE.lock().unwrap();
     // The media generation currently on screen; the Media widget redraws when
     // the poller publishes a new status / track / album art.
     let mut last_media_gen = MEDIA_STATE.lock().unwrap().generation;
@@ -2001,30 +2000,46 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
     // GPU temperature + power poller: mirrors the CPU pollers, but one thread
     // reads both sensors from whichever source the detected GPU exposes
     // (amdgpu/i915 hwmon, or nvidia-smi). All are readable unprivileged, so --
-    // unlike RAPL -- nothing needs opening while root.
-    if let Some(gpu) = gpu::Gpu::detect() {
-        *GPU_LABEL.lock().unwrap() = gpu.vendor.label();
-        let seed = gpu.read();
-        *GPU_TEMP_STATE.lock().unwrap() = seed.temp;
-        *GPU_POWER_STATE.lock().unwrap() = seed.watts;
+    // unlike RAPL -- nothing needs opening while root. Detection retries until
+    // a card turns up (its driver may load after the daemon starts). While the
+    // card is runtime-suspended the state is `None` (the widget's iGPU text);
+    // reads are spaced past its autosuspend delay so polling alone never keeps
+    // it awake, except the first read after it wakes, which is immediate.
+    {
         let wake = wake_write.clone();
-        thread::spawn(move || loop {
-            let reading = gpu.read();
-            let changed = {
-                let mut temp = GPU_TEMP_STATE.lock().unwrap();
-                let mut power = GPU_POWER_STATE.lock().unwrap();
-                let changed = *temp != reading.temp || *power != reading.watts;
-                *temp = reading.temp;
-                *power = reading.watts;
-                changed
-            };
-            if changed {
-                let byte = [1u8];
-                unsafe {
-                    libc::write(wake.as_raw_fd(), byte.as_ptr() as *const libc::c_void, 1);
+        thread::spawn(move || {
+            let mut gpu: Option<gpu::Gpu> = None;
+            let mut last_read: Option<Instant> = None;
+            loop {
+                if gpu.is_none() {
+                    gpu = gpu::Gpu::detect();
+                    if let Some(g) = &gpu {
+                        *GPU_LABEL.lock().unwrap() = g.vendor.label();
+                    }
                 }
+                let current = *GPU_STATE.lock().unwrap();
+                let next = match &gpu {
+                    Some(g) if g.awake() => {
+                        let due = current.is_none()
+                            || last_read.is_none_or(|t| t.elapsed() >= g.read_interval);
+                        if due {
+                            last_read = Some(Instant::now());
+                            g.read()
+                        } else {
+                            current
+                        }
+                    }
+                    _ => None,
+                };
+                if next != current {
+                    *GPU_STATE.lock().unwrap() = next;
+                    let byte = [1u8];
+                    unsafe {
+                        libc::write(wake.as_raw_fd(), byte.as_ptr() as *const libc::c_void, 1);
+                    }
+                }
+                thread::sleep(CPU_TEMP_POLL);
             }
-            thread::sleep(CPU_TEMP_POLL);
         });
     }
     // Now-playing media polling (playerctl / MPRIS): same wake-pipe pattern as
@@ -2612,11 +2627,9 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
             }
         }
         if layers[active_layer].displays_gpu {
-            let reading = *GPU_TEMP_STATE.lock().unwrap();
-            let power = *GPU_POWER_STATE.lock().unwrap();
-            if reading != last_gpu_temp_drawn || power != last_gpu_power_drawn {
-                last_gpu_temp_drawn = reading;
-                last_gpu_power_drawn = power;
+            let reading = *GPU_STATE.lock().unwrap();
+            if reading != last_gpu_drawn {
+                last_gpu_drawn = reading;
                 for button in &mut layers[active_layer].buttons {
                     if let ButtonImage::Gpu(_) = button.1.image {
                         button.1.changed = true;

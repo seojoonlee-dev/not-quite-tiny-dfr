@@ -5,11 +5,17 @@
 //!
 //! All of these are readable unprivileged, so -- unlike the CPU's root-only RAPL
 //! counter -- the poller needs no pre-drop file handle.
+//!
+//! On hybrid laptops the discrete card runtime-suspends while the integrated GPU
+//! does the work, and its sensors can't be read until something wakes it. The
+//! poller checks [`Gpu::awake`] first and only then reads, so the widget can
+//! show the iGPU text instead of `n/a` -- and never wakes the card itself.
 
 use std::{
     fs,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    time::Duration,
 };
 
 /// Which vendor made the detected GPU. Doubles as the widget's default label.
@@ -52,6 +58,12 @@ pub struct GpuReading {
 pub struct Gpu {
     pub vendor: GpuVendor,
     source: GpuSource,
+    /// The card's PCI device dir, for its runtime-PM status.
+    dev: PathBuf,
+    /// Minimum spacing between sensor reads while the card is awake. Each
+    /// successful read restarts the driver's autosuspend timer, so reading more
+    /// often than its delay would keep the card awake forever.
+    pub read_interval: Duration,
 }
 
 enum GpuSource {
@@ -91,7 +103,14 @@ impl Gpu {
                 }
             };
             if let Some(source) = source {
-                candidates.push(Gpu { vendor, source });
+                let read_interval = autosuspend_delay(&dev)
+                    .map_or(Duration::ZERO, |d| d + Duration::from_secs(1));
+                candidates.push(Gpu {
+                    vendor,
+                    source,
+                    dev,
+                    read_interval,
+                });
             }
         }
         // Discrete GPUs (which actually have interesting sensors) sort first.
@@ -103,21 +122,35 @@ impl Gpu {
         candidates.into_iter().next()
     }
 
+    /// Whether the card is powered up. Reads only the PCI runtime-PM status,
+    /// which never wakes the device. A card without runtime PM is always awake.
+    pub fn awake(&self) -> bool {
+        match fs::read_to_string(self.dev.join("power/runtime_status")) {
+            Ok(status) => status.trim() == "active",
+            Err(_) => true,
+        }
+    }
+
     /// Read the current temperature and power draw. Cheap for hwmon (two sysfs
     /// reads); an `nvidia-smi` invocation otherwise, so it stays off the render
-    /// path like the CPU pollers.
-    pub fn read(&self) -> GpuReading {
+    /// path like the CPU pollers. `None` when the card refused every read (it
+    /// suspended between [`Gpu::awake`] and here), so the caller treats it as
+    /// asleep. Only call this after [`Gpu::awake`]: `nvidia-smi` wakes the card.
+    pub fn read(&self) -> Option<GpuReading> {
         match &self.source {
-            GpuSource::Hwmon { temp, power } => GpuReading {
-                temp: temp
-                    .as_deref()
-                    .and_then(read_i64)
-                    .map(|m| (m / 1000) as i32),
-                watts: power
-                    .as_deref()
-                    .and_then(read_i64)
-                    .map(|u| (u as f64 / 1_000_000.0).round() as i32),
-            },
+            GpuSource::Hwmon { temp, power } => {
+                let reading = GpuReading {
+                    temp: temp
+                        .as_deref()
+                        .and_then(read_i64)
+                        .map(|m| (m / 1000) as i32),
+                    watts: power
+                        .as_deref()
+                        .and_then(read_i64)
+                        .map(|u| (u as f64 / 1_000_000.0).round() as i32),
+                };
+                (reading != GpuReading::default()).then_some(reading)
+            }
             GpuSource::NvidiaSmi => read_nvidia_smi(),
         }
     }
@@ -127,6 +160,17 @@ impl Gpu {
 /// microwatts).
 fn read_i64(path: &Path) -> Option<i64> {
     fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// The card's runtime-PM autosuspend delay, or `None` when it has none (no
+/// runtime PM, or autosuspend disabled with a negative delay).
+fn autosuspend_delay(dev: &Path) -> Option<Duration> {
+    let ms: i64 = fs::read_to_string(dev.join("power/autosuspend_delay_ms"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    u64::try_from(ms).ok().map(Duration::from_millis)
 }
 
 /// Find the card's hwmon directory and the temp/power files within it. Returns
@@ -158,7 +202,7 @@ fn nvidia_smi_available() -> bool {
 }
 
 /// Query temperature and power from `nvidia-smi` in a single CSV line.
-fn read_nvidia_smi() -> GpuReading {
+fn read_nvidia_smi() -> Option<GpuReading> {
     let output = Command::new("nvidia-smi")
         .args([
             "--query-gpu=temperature.gpu,power.draw",
@@ -167,9 +211,7 @@ fn read_nvidia_smi() -> GpuReading {
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output();
-    let Ok(output) = output else {
-        return GpuReading::default();
-    };
+    let output = output.ok().filter(|o| o.status.success())?;
     let text = String::from_utf8_lossy(&output.stdout);
     // Only the first GPU is shown; multi-GPU rigs are out of scope.
     let mut fields = text.lines().next().unwrap_or("").split(',');
@@ -181,5 +223,5 @@ fn read_nvidia_smi() -> GpuReading {
         .next()
         .and_then(|s| s.trim().parse::<f64>().ok())
         .map(|v| v.round() as i32);
-    GpuReading { temp, watts }
+    Some(GpuReading { temp, watts })
 }

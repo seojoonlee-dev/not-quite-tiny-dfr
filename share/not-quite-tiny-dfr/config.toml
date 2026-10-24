@@ -87,6 +87,8 @@
 # Cpu/Gpu widgets take a space-separated list of "celsius", "fahrenheit",
 # "watts" (e.g. "celsius watts"). CpuLabel/GpuLabel = false drops the label
 # prefix. The GPU vendor (AMD/NVIDIA/Intel) is detected automatically.
+# IgpuText sets what a Gpu widget shows while the dGPU isn't in use
+# (default "iGPU").
 
 # A slider widget (SliderGet prints 0-100, optionally "NN muted"; SliderSet
 # runs with {} = new value; SliderMute runs with {} = "0" when a drag unmutes;

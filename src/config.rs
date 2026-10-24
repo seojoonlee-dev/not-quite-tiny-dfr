@@ -290,6 +290,8 @@ pub struct ButtonConfig {
     pub gpu: Option<String>,
     // Whether the GPU widget shows the vendor label prefix (default true).
     pub gpu_label: Option<bool>,
+    // What the GPU widget shows while the dGPU isn't in use (default "iGPU").
+    pub igpu_text: Option<String>,
     pub locale: Option<String>,
     #[serde(deserialize_with = "array_or_single", default)]
     pub action: Vec<ButtonAction>,
@@ -424,6 +426,7 @@ fn esc_button() -> ButtonConfig {
         cpu_label: None,
         gpu: None,
         gpu_label: None,
+        igpu_text: None,
         icon_width: None,
         icon_height: None,
         color: None,
@@ -474,6 +477,7 @@ fn error_layer(message: &str) -> FunctionLayer {
             cpu_label: None,
             gpu: None,
             gpu_label: None,
+            igpu_text: None,
             icon_width: None,
             icon_height: None,
             color: None,
@@ -1047,9 +1051,11 @@ mod tests {
     #[test]
     fn gpu_button_parses() {
         let cfg: ButtonConfig =
-            toml::from_str("Gpu = \"celsius watts\"\nGpuLabel = false\nStretch = 2\n").unwrap();
+            toml::from_str("Gpu = \"celsius watts\"\nGpuLabel = false\nIgpuText = \"idle\"\nStretch = 2\n")
+                .unwrap();
         assert_eq!(cfg.gpu.as_deref(), Some("celsius watts"));
         assert_eq!(cfg.gpu_label, Some(false));
+        assert_eq!(cfg.igpu_text.as_deref(), Some("idle"));
         assert_eq!(cfg.stretch, Some(2));
     }
 

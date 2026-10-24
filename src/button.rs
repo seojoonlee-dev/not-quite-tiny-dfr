@@ -7,7 +7,7 @@ use crate::config::{ButtonAction, ButtonConfig, OnClick};
 use crate::render::{capsule, show_layout_centered, text_layout, MediaState};
 use crate::sensors::{
     find_battery_device, BatteryState, BATTERY_STATE, CPU_POWER_STATE, CPU_TEMP_STATE, GPU_LABEL,
-    GPU_POWER_STATE, GPU_TEMP_STATE,
+    GPU_STATE,
 };
 use crate::style::{self, Color};
 use crate::uinput::toggle_keys;
@@ -49,11 +49,13 @@ pub(crate) struct CpuDisplay {
 /// power draw, with an optional vendor label prefix ("AMD"/"NVIDIA"/...).
 /// Selected by the `Gpu` config value (e.g. "celsius watts") and `GpuLabel`.
 /// Reuses [`CpuTempUnit`] for the unit -- celsius/fahrenheit are the same here.
-#[derive(Copy, Clone, Eq, PartialEq)]
+/// `igpu_text` (`IgpuText`) replaces all of it while the dGPU isn't in use.
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) struct GpuDisplay {
     temp: Option<CpuTempUnit>,
     watts: bool,
     label: bool,
+    igpu_text: String,
 }
 
 /// An SVG icon together with a cache of its rasterization. librsvg's
@@ -436,13 +438,16 @@ pub(crate) fn cpu_text(d: &CpuDisplay) -> String {
 /// The GPU widget's label for the current cached readings. Mirrors `cpu_text`,
 /// but the label is the detected vendor name rather than a fixed "CPU".
 pub(crate) fn gpu_text(d: &GpuDisplay) -> String {
+    let Some(reading) = *GPU_STATE.lock().unwrap() else {
+        return d.igpu_text.clone();
+    };
     let label = *GPU_LABEL.lock().unwrap();
     let mut parts: Vec<String> = Vec::new();
     if d.label {
         parts.push(label.to_string());
     }
     if let Some(unit) = d.temp {
-        parts.push(match *GPU_TEMP_STATE.lock().unwrap() {
+        parts.push(match reading.temp {
             Some(c) => match unit {
                 CpuTempUnit::Celsius => format!("{c}\u{00b0}C"),
                 CpuTempUnit::Fahrenheit => format!("{}\u{00b0}F", c * 9 / 5 + 32),
@@ -451,7 +456,7 @@ pub(crate) fn gpu_text(d: &GpuDisplay) -> String {
         });
     }
     if d.watts {
-        parts.push(match *GPU_POWER_STATE.lock().unwrap() {
+        parts.push(match reading.watts {
             Some(w) => format!("{w}W"),
             None => "n/a".to_string(),
         });
@@ -487,7 +492,12 @@ impl Button {
         } else if let Some(spec) = cfg.cpu {
             Button::new_cpu(cfg.action, &spec, cfg.cpu_label.unwrap_or(true))
         } else if let Some(spec) = cfg.gpu {
-            Button::new_gpu(cfg.action, &spec, cfg.gpu_label.unwrap_or(true))
+            Button::new_gpu(
+                cfg.action,
+                &spec,
+                cfg.gpu_label.unwrap_or(true),
+                cfg.igpu_text.unwrap_or_else(|| "iGPU".to_string()),
+            )
         } else {
             Button::new_spacer()
         };
@@ -756,7 +766,12 @@ impl Button {
         }
     }
 
-    pub(crate) fn new_gpu(action: Vec<ButtonAction>, spec: &str, label: bool) -> Button {
+    pub(crate) fn new_gpu(
+        action: Vec<ButtonAction>,
+        spec: &str,
+        label: bool,
+        igpu_text: String,
+    ) -> Button {
         // Same space-separated component list as the Cpu widget; unknown tokens
         // are a journal line, not a daemon abort (this runs on live reloads too).
         let mut temp = None;
@@ -780,7 +795,12 @@ impl Button {
             action,
             active: false,
             changed: false,
-            image: ButtonImage::Gpu(GpuDisplay { temp, watts, label }),
+            image: ButtonImage::Gpu(GpuDisplay {
+                temp,
+                watts,
+                label,
+                igpu_text,
+            }),
             icon_width: 0.0,
             icon_height: 0.0,
             bg_color: None,

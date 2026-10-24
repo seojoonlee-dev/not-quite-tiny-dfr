@@ -11,6 +11,8 @@ use std::{
     sync::Mutex,
 };
 
+use crate::gpu::GpuReading;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BatteryState {
     NotCharging,
@@ -33,11 +35,11 @@ pub(crate) static CPU_TEMP_STATE: Mutex<Option<i32>> = Mutex::new(None);
 /// counter by a poller thread. `None` means no readable RAPL counter.
 pub(crate) static CPU_POWER_STATE: Mutex<Option<i32>> = Mutex::new(None);
 
-/// Latest GPU temperature and package power (whole °C / whole W), updated by a
-/// poller thread (same never-read-sysfs-on-the-render-path rule as the CPU
-/// states). `None` means the detected GPU doesn't expose that sensor.
-pub(crate) static GPU_TEMP_STATE: Mutex<Option<i32>> = Mutex::new(None);
-pub(crate) static GPU_POWER_STATE: Mutex<Option<i32>> = Mutex::new(None);
+/// Latest GPU reading, updated by a poller thread (same never-read-sysfs-on-
+/// the-render-path rule as the CPU states). `None` means no GPU is being
+/// read -- the detected card is runtime-suspended (the iGPU is doing the work)
+/// or there's no readable card at all -- and the widget shows its iGPU text.
+pub(crate) static GPU_STATE: Mutex<Option<GpuReading>> = Mutex::new(None);
 /// The detected GPU's vendor label ("AMD"/"NVIDIA"/"Intel"), or a bare "GPU"
 /// until detection resolves it. Shown as the widget's label prefix.
 pub(crate) static GPU_LABEL: Mutex<&'static str> = Mutex::new("GPU");
