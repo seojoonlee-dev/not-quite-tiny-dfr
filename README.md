@@ -123,7 +123,7 @@ cp /usr/share/not-quite-tiny-dfr/config.toml ~/.config/not-quite-tiny-dfr/
 
 See [Configuration](#configuration) for every option.
 
-#### Updating
+## Updating
 
 From your clone of the repository, run:
 
@@ -159,6 +159,29 @@ Disable stock tiny-dfr first if it's installed, then reboot.
 start.
 
 </details>
+
+## Uninstallation
+
+From your clone of the repository, run:
+
+```sh
+cd not-quite-tiny-dfr
+./uninstall.sh
+```
+
+The script stops and disables the service and removes everything
+`install.sh` installed. It then hands the Touch Bar back to stock tiny-dfr:
+
+- tiny-dfr is unmasked, and its own udev rules apply again.
+- If tiny-dfr is installed, it is enabled and started, so the Touch Bar comes
+  back without a reboot. Otherwise the script tells you how to install it; the
+  Touch Bar stays blank until a daemon is running.
+
+Your config files in `~/.config/not-quite-tiny-dfr/` and
+`/etc/not-quite-tiny-dfr/`, and the cache in `/var/cache/not-quite-tiny-dfr/`,
+are kept in case you reinstall. Delete them by hand to remove every trace.
+
+On NixOS, remove the module from your configuration and rebuild instead.
 
 ### NixOS
 
@@ -197,29 +220,6 @@ comment for details.
 If a command widget or slider needs a program on `PATH` beyond a shell (for
 example, a package referenced by name rather than by store path), add it with
 `hardware.apple.touchBar.extraPath`.
-
-## Uninstallation
-
-From your clone of the repository, run:
-
-```sh
-cd not-quite-tiny-dfr
-./uninstall.sh
-```
-
-The script stops and disables the service and removes everything
-`install.sh` installed. It then hands the Touch Bar back to stock tiny-dfr:
-
-- tiny-dfr is unmasked, and its own udev rules apply again.
-- If tiny-dfr is installed, it is enabled and started, so the Touch Bar comes
-  back without a reboot. Otherwise the script tells you how to install it; the
-  Touch Bar stays blank until a daemon is running.
-
-Your config files in `~/.config/not-quite-tiny-dfr/` and
-`/etc/not-quite-tiny-dfr/`, and the cache in `/var/cache/not-quite-tiny-dfr/`,
-are kept in case you reinstall. Delete them by hand to remove every trace.
-
-On NixOS, remove the module from your configuration and rebuild instead.
 
 ## Configuration
 
