@@ -34,6 +34,14 @@
               substituteInPlace src/*.rs --replace-quiet /usr/share $out/share
             '';
 
+            # postConfigure points the icon lookups at $out/share, which is
+            # only populated in postInstall; stage it before the tests run
+            # so tests that load icons from disk can find them.
+            preCheck = ''
+              mkdir -p $out
+              cp -R share $out
+            '';
+
             postInstall = ''
               cp -R etc $out/lib
               cp -R share $out
