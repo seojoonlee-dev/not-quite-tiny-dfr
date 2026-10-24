@@ -125,16 +125,18 @@ See [Configuration](#configuration) for every option.
 
 #### Updating
 
-Pull the latest changes and run the script again:
+From your clone of the repository, run:
 
 ```sh
 cd not-quite-tiny-dfr
-git pull
-./install.sh
+./update.sh
 ```
 
-`./install.sh --no-build` installs an existing build without rebuilding. Your
-config files are never modified.
+The script pulls the latest changes and reruns `install.sh`. It stops without
+changing anything if you've edited files in the clone or your branch has
+diverged from upstream. Your config files are never modified.
+
+`./install.sh --no-build` installs an existing build without rebuilding.
 
 <details>
 <summary>Installing manually</summary>
