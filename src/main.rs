@@ -51,9 +51,9 @@ use button::*;
 use render::*;
 use uinput::{create_uinput, toggle_keys, Interface};
 use sensors::{
-    find_battery_device, find_cpu_temp_zone, get_battery_state, open_cpu_power_source,
-    read_cpu_temp, read_energy_uj, BATTERY_STATE, CPU_POWER_STATE, CPU_TEMP_STATE,
-    GPU_LABEL, GPU_STATE,
+    battery_wanted, find_battery_device, find_cpu_temp_zone, get_battery_state,
+    open_cpu_power_source, read_cpu_temp, read_energy_uj, set_battery_wanted, BATTERY_STATE,
+    CPU_POWER_STATE, CPU_TEMP_STATE, GPU_LABEL, GPU_STATE,
 };
 
 use crate::config::ConfigManager;
@@ -1846,6 +1846,7 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
     media::set_cover_blur(cfg.media_cover_blur);
     media::set_art_cache(cfg.media_art_cache);
     media::set_lyrics_cache(cfg.media_lyrics_cache);
+    set_battery_wanted(layers.iter().any(|l| l.displays_battery));
     let mut pixel_shift = PixelShiftManager::new();
     let mut last = Instant::now();
     // Last time fling momentum was integrated (see the top of the main loop).
@@ -1912,6 +1913,10 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
         *BATTERY_STATE.lock().unwrap() = get_battery_state(&battery);
         let wake = wake_write.clone();
         thread::spawn(move || loop {
+            if !battery_wanted() {
+                thread::sleep(BATTERY_POLL);
+                continue;
+            }
             let reading = get_battery_state(&battery);
             let changed = {
                 let mut shared = BATTERY_STATE.lock().unwrap();
@@ -2130,6 +2135,7 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
                 media::set_cover_blur(cfg.media_cover_blur);
                 media::set_art_cache(cfg.media_art_cache);
                 media::set_lyrics_cache(cfg.media_lyrics_cache);
+                set_battery_wanted(layers.iter().any(|l| l.displays_battery));
                 active_layer = 0;
                 needs_complete_redraw = true;
                 widget_rt = WidgetRuntime::new(new_widgets, wake_write.clone());
@@ -2140,6 +2146,7 @@ fn real_main(drm: &mut DrmBackend, uinput: &mut UInputHandle<File>) {
             media::set_cover_blur(cfg.media_cover_blur);
             media::set_art_cache(cfg.media_art_cache);
             media::set_lyrics_cache(cfg.media_lyrics_cache);
+            set_battery_wanted(layers.iter().any(|l| l.displays_battery));
             active_layer = 0;
             needs_complete_redraw = true;
             // Replacing the runtime drops the old one, stopping its threads.

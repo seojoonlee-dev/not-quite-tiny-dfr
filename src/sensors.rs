@@ -8,7 +8,10 @@
 use std::{
     fs::{self, File},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Mutex,
+    },
 };
 
 use crate::gpu::GpuReading;
@@ -26,6 +29,20 @@ pub(crate) enum BatteryState {
 /// -- that was a visible frame hitch on every battery refresh.
 pub(crate) static BATTERY_STATE: Mutex<(u32, BatteryState)> =
     Mutex::new((100, BatteryState::NotCharging));
+
+/// Whether any layer shows a built-in Battery button. The poller only reads
+/// sysfs while one does: on T2 Macs each refresh past the ACPI battery driver's
+/// 1 s cache is ~60 embedded-controller interrupts, so an unneeded 1 Hz poll
+/// kept the EC (GPE 0x6E) busy for nothing.
+static BATTERY_WANTED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn set_battery_wanted(wanted: bool) {
+    BATTERY_WANTED.store(wanted, Ordering::Relaxed);
+}
+
+pub(crate) fn battery_wanted() -> bool {
+    BATTERY_WANTED.load(Ordering::Relaxed)
+}
 
 /// Latest CPU temperature in whole °C, updated by a poller thread (same
 /// never-read-sysfs-on-the-render-path rule as BATTERY_STATE). `None` means no
