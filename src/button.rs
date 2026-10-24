@@ -75,10 +75,10 @@ impl CachedSvg {
         }
     }
 
-    /// Blit the icon at `(x, y)` sized `w`x`h`, rasterizing (and caching) it the
-    /// first time each size is requested. Positions are already rounded by
-    /// callers, so blits stay crisp.
-    pub(crate) fn render(&self, c: &Context, x: f64, y: f64, w: f64, h: f64) {
+    /// Paint the icon at `(x, y)` sized `w`x`h` in `color`, rasterizing (and
+    /// caching) it the first time each size is requested. Positions are already
+    /// rounded by callers, so blits stay crisp.
+    pub(crate) fn render(&self, c: &Context, x: f64, y: f64, w: f64, h: f64, color: Color) {
         let (kw, kh) = (w.round() as i32, h.round() as i32);
         if kw <= 0 || kh <= 0 {
             return;
@@ -94,16 +94,19 @@ impl CachedSvg {
             }
             *raster = Some((kw, kh, surf));
         }
-        let surf = &raster.as_ref().unwrap().2;
-        // save/restore so the blit does not leave the icon bitmap as the cairo
-        // source: callers (e.g. the battery widget) draw text right after the
-        // icon relying on the text color still being set.
-        c.save().unwrap();
-        c.set_source_surface(surf, x, y).unwrap();
-        c.rectangle(x, y, kw as f64, kh as f64);
-        c.fill().unwrap();
-        c.restore().unwrap();
+        paint_tinted(c, &raster.as_ref().unwrap().2, x, y, color);
     }
+}
+
+/// Paint `surf` at `(x, y)` as a mask filled with `color`, so an icon takes the
+/// button's text color whatever color its file was drawn in. save/restore keeps
+/// the caller's source: callers (e.g. the battery widget) draw text right after
+/// the icon relying on the text color still being set.
+fn paint_tinted(c: &Context, surf: &ImageSurface, x: f64, y: f64, color: Color) {
+    c.save().unwrap();
+    color.set_source(c);
+    c.mask_surface(surf, x, y).unwrap();
+    c.restore().unwrap();
 }
 
 pub(crate) struct BatteryImages {
@@ -842,6 +845,7 @@ impl Button {
         button_width: u64,
         y_shift: f64,
     ) {
+        let icon_color = self.effective_text_color(style);
         match &self.image {
             ButtonImage::Text(text) => {
                 let layout = text_layout(c, style, text);
@@ -852,15 +856,13 @@ impl Button {
                     button_left_edge + (button_width as f64 / 2.0 - self.icon_width / 2.0).round();
                 let y = y_shift + ((height as f64 - self.icon_height) / 2.0).round();
 
-                svg.render(c, x, y, self.icon_width, self.icon_height);
+                svg.render(c, x, y, self.icon_width, self.icon_height, icon_color);
             }
             ButtonImage::Bitmap(surf) => {
                 let x =
                     button_left_edge + (button_width as f64 / 2.0 - self.icon_width / 2.0).round();
                 let y = y_shift + ((height as f64 - self.icon_height) / 2.0).round();
-                c.set_source_surface(surf, x, y).unwrap();
-                c.rectangle(x, y, self.icon_width, self.icon_height);
-                c.fill().unwrap();
+                paint_tinted(c, surf, x, y, icon_color);
             }
             ButtonImage::Time(format, locale) => {
                 let current_time = Local::now();
@@ -915,7 +917,14 @@ impl Button {
                     let x = button_left_edge + (button_width as f64 / 2.0 - width / 2.0).round();
                     let y = y_shift + ((height as f64 - DEFAULT_ICON_SIZE as f64) / 2.0).round();
 
-                    svg.render(c, x, y, DEFAULT_ICON_SIZE as f64, DEFAULT_ICON_SIZE as f64);
+                    svg.render(
+                        c,
+                        x,
+                        y,
+                        DEFAULT_ICON_SIZE as f64,
+                        DEFAULT_ICON_SIZE as f64,
+                        icon_color,
+                    );
                 }
                 if battery_mode.should_draw_text() {
                     c.move_to(
@@ -956,7 +965,7 @@ impl Button {
                 let icon_y = y_shift + ((height as f64 - self.icon_height) / 2.0).round();
                 let draw_icon = |c: &Context| {
                     if let Some(svg) = icon {
-                        svg.render(c, icon_x, icon_y, self.icon_width, self.icon_height);
+                        svg.render(c, icon_x, icon_y, self.icon_width, self.icon_height, color);
                     }
                 };
                 // The expanded look also plays through the collapse animation,
@@ -1028,7 +1037,7 @@ impl Button {
                             let x = button_left_edge
                                 + (button_width as f64 / 2.0 - group / 2.0).round();
                             let y = y_shift + ((height as f64 - icon_sz) / 2.0).round();
-                            svg.render(c, x, y, icon_sz, icon_sz);
+                            svg.render(c, x, y, icon_sz, icon_sz, icon_color);
                             if !text.is_empty() {
                                 c.move_to(
                                     x + icon_sz + gap,

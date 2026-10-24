@@ -461,7 +461,7 @@ pub(crate) fn paint_media(
             if text_width > 8.0 {
                 draw_media_text(c, style, text_color, &info.title, &info.artist, text_left, text_width, bot, top);
             }
-            draw_media_icons(c, m, &info, icon_w, first, zone_w, pitch, height, y_shift);
+            draw_media_icons(c, m, &info, text_color, icon_w, first, zone_w, pitch, height, y_shift);
             c.pop_group_to_source().unwrap();
             c.paint_with_alpha(controls_alpha).unwrap();
             c.restore().unwrap();
@@ -482,7 +482,7 @@ pub(crate) fn paint_media(
             rounded_rect_path(c, zleft, zone_w, radius, bot, top);
             c.fill().unwrap();
         }
-        draw_media_icons(c, m, &info, icon_w, first, zone_w, pitch, height, y_shift);
+        draw_media_icons(c, m, &info, text_color, icon_w, first, zone_w, pitch, height, y_shift);
     }
 }
 
@@ -493,6 +493,7 @@ pub(crate) fn draw_media_icons(
     c: &Context,
     m: &MediaState,
     info: &media::MediaInfo,
+    color: Color,
     icon_w: f64,
     first_zone_left: f64,
     zone_w: f64,
@@ -511,7 +512,7 @@ pub(crate) fn draw_media_icons(
         let center = first_zone_left + zone_pitch * k as f64 + zone_w / 2.0;
         let x = (center - icon_w / 2.0).round();
         let y = (y_shift + (height as f64 - icon_w) / 2.0).round();
-        svg.render(c, x, y, icon_w, icon_w);
+        svg.render(c, x, y, icon_w, icon_w, color);
     }
 }
 
