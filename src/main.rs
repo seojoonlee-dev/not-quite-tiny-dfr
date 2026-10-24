@@ -93,9 +93,9 @@ const MEDIA_CONTROLS_IDLE: Duration = Duration::from_secs(3);
 /// text never touches the panel's top/bottom edges. The title and artist are
 /// then sized to fill the remaining band height.
 pub(crate) const MEDIA_TEXT_VPAD: f64 = 3.0;
-/// Extra space between the title and artist lines (added to their natural line
-/// boxes; negative tightens them).
-pub(crate) const MEDIA_TEXT_GAP: f64 = -1.0;
+/// Space between the title's baseline and the artist's capitals, as a fraction
+/// of the title size. Leaves room for the title's descenders in any font.
+pub(crate) const MEDIA_TEXT_GAP: f64 = 0.35;
 pub(crate) const SLIDER_TRACK_HEIGHT: f64 = 6.0;
 /// Radius of the slider's drag handle.
 pub(crate) const SLIDER_KNOB_RADIUS: f64 = 10.0;

@@ -183,12 +183,31 @@ pub(crate) fn show_layout_centered(
     button_width: u64,
     y_shift: f64,
 ) {
-    let (tw, th) = layout.pixel_size();
+    let (tw, _) = layout.pixel_size();
     c.move_to(
         button_left_edge + (button_width as f64 / 2.0 - tw as f64 / 2.0).round(),
-        y_shift + ((height as f64 - th as f64) / 2.0).round(),
+        y_shift + cap_centered_y(layout, height as f64 / 2.0).round(),
     );
     pangocairo::functions::show_layout(c, layout);
+}
+
+/// Offsets from the top of `layout` to the top of its capital letters and to
+/// its baseline, measured on an "H" in the layout's font.
+pub(crate) fn cap_extents(layout: &pango::Layout) -> (f64, f64) {
+    let probe = layout.copy();
+    probe.set_text("H");
+    let (ink, _) = probe.extents();
+    let scale = pango::SCALE as f64;
+    (ink.y() as f64 / scale, layout.baseline() as f64 / scale)
+}
+
+/// The top y at which to draw `layout` so its capital letters are vertically
+/// centered on `center_y`. Fonts pad their line boxes by different amounts
+/// above and below the glyphs, so centering the line box would shift text
+/// whenever the font changes; the capitals sit in the same place in any font.
+pub(crate) fn cap_centered_y(layout: &pango::Layout, center_y: f64) -> f64 {
+    let (cap_top, baseline) = cap_extents(layout);
+    center_y - (cap_top + baseline) / 2.0
 }
 
 /// Append a rounded-rectangle sub-path spanning `[left_edge, left_edge+width]`
@@ -532,15 +551,12 @@ pub(crate) fn draw_media_text(
     top: f64,
 ) {
     let avail = (top - bot - MEDIA_TEXT_VPAD * 2.0).max(1.0);
-    let make = |text: &str, px: f64, bold: bool| {
+    // Both lines use the global font (family, weight, variations, letter
+    // spacing); only the size differs.
+    let make = |text: &str, px: f64| {
         let layout = new_layout(c);
         let mut font = style.font.clone();
         font.set_absolute_size(px * pango::SCALE as f64);
-        // The title is emboldened; the artist line keeps the configured
-        // label weight (FontWeight / FontBold) rather than forcing normal.
-        if bold {
-            font.set_weight(pango::Weight::Bold);
-        }
         layout.set_font_description(Some(&font));
         layout.set_text(text);
         apply_letter_spacing(&layout, style);
@@ -548,19 +564,24 @@ pub(crate) fn draw_media_text(
         layout.set_width((width * pango::SCALE as f64) as i32);
         layout
     };
-    let title_layout = make(title, avail * 0.50, true);
-    let artist_layout = make(artist, avail * 0.38, false);
-    let (_, th) = title_layout.pixel_size();
-    let (_, ah) = artist_layout.pixel_size();
-    let total = th as f64 + MEDIA_TEXT_GAP + ah as f64;
-    // Center the block in the band, but never above the top padding.
-    let mut y = ((bot + top) / 2.0 - total / 2.0).max(bot + MEDIA_TEXT_VPAD);
+    let title_px = avail * 0.50;
+    let title_layout = make(title, title_px);
+    let artist_layout = make(artist, avail * 0.38);
+    // Stack the lines by their capitals rather than their line boxes, whose
+    // padding varies by font: the block runs from the title's cap top to the
+    // artist's baseline and is centered in the band.
+    let (title_cap, title_base) = cap_extents(&title_layout);
+    let (artist_cap, artist_base) = cap_extents(&artist_layout);
+    let gap = title_px * MEDIA_TEXT_GAP;
+    let block = (title_base - title_cap) + gap + (artist_base - artist_cap);
+    let block_top = ((bot + top) / 2.0 - block / 2.0).max(bot + MEDIA_TEXT_VPAD);
+    let title_y = block_top - title_cap;
+    let artist_y = title_y + title_base + gap - artist_cap;
     color.set_source(c);
-    c.move_to(left, y);
+    c.move_to(left, title_y);
     pangocairo::functions::show_layout(c, &title_layout);
-    y += th as f64 + MEDIA_TEXT_GAP;
     Color { a: color.a * 0.8, ..color }.set_source(c);
-    c.move_to(left, y);
+    c.move_to(left, artist_y);
     pangocairo::functions::show_layout(c, &artist_layout);
 }
 
@@ -630,13 +651,12 @@ pub(crate) fn draw_media_lyrics(
         layout.set_ellipsize(pango::EllipsizeMode::End);
         layout.set_width((width * pango::SCALE as f64) as i32);
         layout.set_alignment(pango::Alignment::Center);
-        let (_, h) = layout.pixel_size();
         Color {
             a: color.a * alpha,
             ..color
         }
         .set_source(c);
-        c.move_to(left, center_y - h as f64 / 2.0);
+        c.move_to(left, cap_centered_y(&layout, center_y));
         pangocairo::functions::show_layout(c, &layout);
     };
 

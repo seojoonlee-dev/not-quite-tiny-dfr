@@ -4,7 +4,7 @@
 //! out and drives their draw; the media panel itself lives in `render`.
 
 use crate::config::{ButtonAction, ButtonConfig, OnClick};
-use crate::render::{capsule, show_layout_centered, text_layout, MediaState};
+use crate::render::{cap_centered_y, capsule, show_layout_centered, text_layout, MediaState};
 use crate::sensors::{
     find_battery_device, BatteryState, BATTERY_STATE, CPU_POWER_STATE, CPU_TEMP_STATE, GPU_LABEL,
     GPU_STATE,
@@ -923,7 +923,7 @@ impl Button {
                 };
                 let percent_str = format!("{:.0}%", capacity);
                 let layout = text_layout(c, style, &percent_str);
-                let (text_width, text_height) = layout.pixel_size();
+                let (text_width, _) = layout.pixel_size();
                 let mut width = text_width as f64;
                 let mut text_offset = 0.0;
                 if let Some(svg) = icon {
@@ -950,7 +950,7 @@ impl Button {
                     c.move_to(
                         button_left_edge
                             + (button_width as f64 / 2.0 - width / 2.0 + text_offset).round(),
-                        y_shift + ((height as f64 - text_height as f64) / 2.0).round(),
+                        y_shift + cap_centered_y(&layout, height as f64 / 2.0).round(),
                     );
                     pangocairo::functions::show_layout(c, &layout);
                 }
@@ -1050,7 +1050,7 @@ impl Button {
                     let layout = text_layout(c, style, text);
                     match icon {
                         Some(svg) => {
-                            let (text_width, text_height) = layout.pixel_size();
+                            let (text_width, _) = layout.pixel_size();
                             let icon_sz = DEFAULT_ICON_SIZE as f64;
                             let gap = if text.is_empty() { 0.0 } else { BATTERY_ICON_TEXT_GAP };
                             let group = icon_sz + gap + text_width as f64;
@@ -1061,7 +1061,7 @@ impl Button {
                             if !text.is_empty() {
                                 c.move_to(
                                     x + icon_sz + gap,
-                                    y_shift + ((height as f64 - text_height as f64) / 2.0).round(),
+                                    y_shift + cap_centered_y(&layout, height as f64 / 2.0).round(),
                                 );
                                 pangocairo::functions::show_layout(c, &layout);
                             }
