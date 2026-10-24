@@ -2,7 +2,7 @@
 
 <p align="center">
   <img src="docs/touchbar.png" alt="not-quite-tiny-dfr running on a MacBook Pro Touch Bar: Esc, weather, a now-playing media panel, volume, battery, CPU and GPU widgets" width="100%">
-  <img src="docs/touchbar-crimson.png" alt="A red and black theme with sharp corners: clock, date, the Hyprland workspace in roman numerals, CPU and memory meters, volume, battery, and Firefox, terminal and file manager launchers" width="100%">
+  <img src="docs/touchbar-sakura.png" alt="A soft dusty-pink theme: Esc, the date and a week strip in a serif font, dusty-pink app tiles for browser, notes, music, terminal, files and settings, the time and battery" width="100%">
   <img src="docs/touchbar-phosphor.png" alt="A green terminal-style theme over falling code: Esc, a shell prompt, Hyprland workspaces, the focused window, load, memory, CPU temperature, a text battery bar and a clock" width="100%">
 </p>
 
