@@ -1,4 +1,8 @@
-# not-quite-tiny-dfr
+<h1 align="center">not-quite-tiny-dfr</h1>
+
+<p align="center">
+  <img src="docs/touchbar.png" alt="not-quite-tiny-dfr running on a MacBook Pro Touch Bar: Esc, weather, a now-playing media panel, volume, battery, CPU and GPU widgets" width="100%">
+</p>
 
 A customizable Touch Bar daemon for Apple T2 and Apple Silicon Macs on Linux.
 
@@ -16,22 +20,39 @@ small footprint and adds:
 - **Scrollable layers** with momentum, pinned buttons, and swipe gestures to
   switch between any number of layers.
 
-> [!NOTE]
-> Development and testing happen on a 2019 15" MacBook Pro running Arch Linux.
-> Other distributions and models may behave differently. If you run it
-> successfully on other hardware, please let me know at
-> developer.seojoonlee@gmail.com. Bug reports, issues, and pull requests are
-> welcome. A list of supported distributions and devices is planned.
-
 ## Contents
 
+- [Hardware support](#hardware-support)
 - [Installation](#installation)
+- [Uninstallation](#uninstallation)
 - [Configuration](#configuration)
 - [Built-in widgets](#built-in-widgets)
 - [Custom widgets](#custom-widgets)
 - [Scrollable layers](#scrollable-layers)
 - [Performance and T2 reliability](#performance-and-t2-reliability)
 - [License](#license)
+
+## Hardware support
+
+not-quite-tiny-dfr talks to the Touch Bar through the same kernel drivers and
+udev setup as tiny-dfr, so it should run on any Mac where tiny-dfr works. That
+covers the T2 MacBook Pros from 2018 to 2020 running a
+[t2linux](https://t2linux.org) kernel, and the 13-inch M1 and M2 MacBook Pros
+running [Asahi Linux](https://asahilinux.org).
+
+These models have been tested directly:
+
+| Model | Identifier |
+| --- | --- |
+| MacBook Pro (15-inch, 2019) | `MacBookPro15,1` |
+| MacBook Pro (16-inch, 2019) | `MacBookPro16,1` |
+
+Development happens on the 15-inch model running Arch Linux, so other
+distributions may need small adjustments. If you run it on a model that isn't
+listed, please open an issue or email developer.seojoonlee@gmail.com with your
+model identifier, whether it worked or not. On a T2 Mac,
+`cat /sys/class/dmi/id/product_name` prints the identifier; on Apple Silicon,
+use `cat /proc/device-tree/model`. Bug reports and pull requests are welcome.
 
 ## Installation
 
@@ -54,22 +75,88 @@ Optional runtime tools:
 
 ### Building and installing
 
+Make sure the [requirements](#requirements) are installed, then follow these
+steps as your normal user. The install script asks for sudo when it needs it.
+
+**1. Clone the repository.**
+
 ```sh
+git clone https://github.com/seojoonlee-dev/not-quite-tiny-dfr.git
+cd not-quite-tiny-dfr
+```
+
+**2. Run the install script.**
+
+```sh
+./install.sh
+```
+
+The script checks the build dependencies, builds a release binary, and
+installs:
+
+| What | Where |
+| --- | --- |
+| The daemon | `/usr/bin/not-quite-tiny-dfr` |
+| Icons, widget scripts, and the base config | `/usr/share/not-quite-tiny-dfr/` |
+| The systemd unit | `/etc/systemd/system/not-quite-tiny-dfr.service` |
+| The udev rules | `/etc/udev/rules.d/` |
+
+If stock tiny-dfr is installed, the script offers to stop and mask it, since
+both daemons drive the same display. Masking keeps tiny-dfr's own udev rule
+from starting it, and `./uninstall.sh` undoes it. It then enables the service, and starts it
+right away if the Touch Bar is already available.
+
+**3. Reboot.**
+
+On a first install, reboot so the udev rules can bring up the Touch Bar. The
+daemon starts on its own from then on.
+
+**4. Customize.**
+
+Copy the base config to your config directory and edit it. Changes apply as
+soon as you save.
+
+```sh
+mkdir -p ~/.config/not-quite-tiny-dfr
+cp /usr/share/not-quite-tiny-dfr/config.toml ~/.config/not-quite-tiny-dfr/
+```
+
+See [Configuration](#configuration) for every option.
+
+#### Updating
+
+Pull the latest changes and run the script again:
+
+```sh
+cd not-quite-tiny-dfr
+git pull
+./install.sh
+```
+
+`./install.sh --no-build` installs an existing build without rebuilding. Your
+config files are never modified.
+
+<details>
+<summary>Installing manually</summary>
+
+```sh
+git clone https://github.com/seojoonlee-dev/not-quite-tiny-dfr.git
+cd not-quite-tiny-dfr
 cargo build --release
 sudo install -Dm755 target/release/not-quite-tiny-dfr /usr/bin/not-quite-tiny-dfr
-sudo mkdir -p /usr/share/not-quite-tiny-dfr
-sudo cp -r share/not-quite-tiny-dfr/. /usr/share/not-quite-tiny-dfr/
+sudo install -d /usr/share/not-quite-tiny-dfr
+sudo cp -rT share/not-quite-tiny-dfr /usr/share/not-quite-tiny-dfr
 sudo install -Dm644 etc/systemd/system/not-quite-tiny-dfr.service /etc/systemd/system/not-quite-tiny-dfr.service
 sudo install -Dm644 -t /etc/udev/rules.d etc/udev/rules.d/*.rules
 sudo systemctl daemon-reload
+sudo systemctl enable not-quite-tiny-dfr.service
 ```
 
-The udev rules start the service automatically when the Touch Bar appears, so
-reboot (or replug the device) after the first install. If stock tiny-dfr is
-installed, disable it first: both daemons drive the same display.
+Disable stock tiny-dfr first if it's installed, then reboot.
+`/usr/share/not-quite-tiny-dfr/config.toml` must be present for the daemon to
+start.
 
-`/usr/share/not-quite-tiny-dfr/config.toml` is the base configuration and must
-be present for the daemon to start.
+</details>
 
 ### NixOS
 
@@ -108,6 +195,29 @@ comment for details.
 If a command widget or slider needs a program on `PATH` beyond a shell (for
 example, a package referenced by name rather than by store path), add it with
 `hardware.apple.touchBar.extraPath`.
+
+## Uninstallation
+
+From your clone of the repository, run:
+
+```sh
+cd not-quite-tiny-dfr
+./uninstall.sh
+```
+
+The script stops and disables the service and removes everything
+`install.sh` installed. It then hands the Touch Bar back to stock tiny-dfr:
+
+- tiny-dfr is unmasked, and its own udev rules apply again.
+- If tiny-dfr is installed, it is enabled and started, so the Touch Bar comes
+  back without a reboot. Otherwise the script tells you how to install it; the
+  Touch Bar stays blank until a daemon is running.
+
+Your config files in `~/.config/not-quite-tiny-dfr/` and
+`/etc/not-quite-tiny-dfr/`, and the cache in `/var/cache/not-quite-tiny-dfr/`,
+are kept in case you reinstall. Delete them by hand to remove every trace.
+
+On NixOS, remove the module from your configuration and rebuild instead.
 
 ## Configuration
 
