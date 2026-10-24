@@ -52,7 +52,7 @@ distributions may need small adjustments. If you run it on a model that isn't
 listed, please open an issue or email developer.seojoonlee@gmail.com with your
 model identifier, whether it worked or not. On a T2 Mac,
 `cat /sys/class/dmi/id/product_name` prints the identifier; on Apple Silicon,
-use `cat /proc/device-tree/model`. Bug reports and pull requests are welcome.
+use `cat /proc/device-tree/model`. Bug reports and pull requests are always welcome.
 
 ## Installation
 
