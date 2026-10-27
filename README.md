@@ -42,6 +42,10 @@ covers the T2 MacBook Pros from 2018 to 2020 running a
 [t2linux](https://t2linux.org) kernel, and the 13-inch M1 and M2 MacBook Pros
 running [Asahi Linux](https://asahilinux.org).
 
+> [!note]
+> Apple Silicon macs should work in theory but isn't tested.
+
+
 These models have been tested directly:
 
 | Model | Identifier |
