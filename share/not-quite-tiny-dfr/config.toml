@@ -70,6 +70,8 @@
 #     { Icon = "search",          Action = "Search",         OnClick = "Action" },
 #     { Icon = "backlight_low",   Action = "IllumDown",      OnClick = "Action" },
 #     { Icon = "backlight_high",  Action = "IllumUp",        OnClick = "Action" },
+#     { Icon = "touchbar_brightness_low",  Action = "TouchBarBrightnessDown", OnClick = "Action" },
+#     { Icon = "touchbar_brightness_high", Action = "TouchBarBrightnessUp",   OnClick = "Action" },
 #     { Icon = "fast_rewind",     Action = "PreviousSong",   OnClick = "Action" },
 #     { Icon = "play_pause",      Action = "PlayPause",      OnClick = "Action" },
 #     { Icon = "fast_forward",    Action = "NextSong",       OnClick = "Action" },
