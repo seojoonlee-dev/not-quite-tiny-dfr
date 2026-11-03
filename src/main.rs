@@ -1020,10 +1020,15 @@ impl FunctionLayer {
                     stretch = 1;
                 }
                 **state += stretch;
-                // Only OnClick = "Action" lights up on tap. Expand widgets show
-                // their expand animation instead, and buttons with no OnClick
-                // stay flat. Captured before `cfg` is consumed below.
-                let highlight_on_tap = cfg.on_click == Some(OnClick::Action);
+                // OnClick = "Action" and command buttons light up on tap unless
+                // TapHighlight says otherwise. Expand widgets show their expand
+                // animation instead, the media panel draws its own controls, and
+                // buttons with no OnClick stay flat. Captured before `cfg` is
+                // consumed below.
+                let highlight_on_tap = cfg.tap_highlight.unwrap_or(
+                    cfg.media != Some(true)
+                        && matches!(cfg.on_click, Some(OnClick::Action | OnClick::Command(_))),
+                );
                 let mut button = if let (Some(get), Some(set)) =
                     (cfg.slider_get.take(), cfg.slider_set.take())
                 {
@@ -3933,7 +3938,7 @@ mod tests {
     }
 
     #[test]
-    fn only_on_click_action_highlights_on_tap() {
+    fn tap_highlight_defaults_and_overrides() {
         let keys = vec![
             ButtonConfig {
                 text: Some("plain".into()),
@@ -3950,6 +3955,22 @@ mod tests {
                 expand_command: Some("echo x".into()),
                 ..Default::default()
             },
+            ButtonConfig {
+                icon: Some("sleep".into()),
+                on_click: Some(OnClick::Command("true".into())),
+                ..Default::default()
+            },
+            ButtonConfig {
+                text: Some("act off".into()),
+                on_click: Some(OnClick::Action),
+                tap_highlight: Some(false),
+                ..Default::default()
+            },
+            ButtonConfig {
+                text: Some("plain on".into()),
+                tap_highlight: Some(true),
+                ..Default::default()
+            },
         ];
         let mut layer = FunctionLayer::with_config(
             keys,
@@ -3962,19 +3983,21 @@ mod tests {
             true,
             true,
         );
-        // Only OnClick = "Action" lights up; plain and Expand stay flat.
-        assert!(!layer.buttons[0].1.highlight_on_tap);
-        assert!(layer.buttons[1].1.highlight_on_tap);
-        assert!(!layer.buttons[2].1.highlight_on_tap);
-        // ... and that flag gates the pressed fill: a tapped plain/Expand button
-        // stays flat (no fill), the Action one takes the active color.
+        // Action and command buttons light up by default; plain and Expand stay
+        // flat; TapHighlight overrides either way.
+        let expected = [false, true, false, true, false, true];
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(layer.buttons[i].1.highlight_on_tap, *want, "button {i}");
+        }
+        // ... and that flag gates the pressed fill: a tapped flat button draws
+        // no fill, a highlighting one takes the active color.
         let style = Style::default();
         for (_, b) in layer.buttons.iter_mut() {
             b.active = true;
         }
-        assert_eq!(layer.buttons[0].1.fill_color(&style, false), None);
-        assert!(layer.buttons[1].1.fill_color(&style, false).is_some());
-        assert_eq!(layer.buttons[2].1.fill_color(&style, false), None);
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(layer.buttons[i].1.fill_color(&style, false).is_some(), *want, "button {i}");
+        }
     }
 
     #[test]

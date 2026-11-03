@@ -39,9 +39,10 @@
 # MediaLyricsCache = true
 
 # Pinned must mark the same leading slots on every layer; a mismatch is a
-# config error (red banner on the bar). OnClick = "Action" makes a key button
-# light up on tap (the pressed fill); widgets, sliders, and Expand buttons stay
-# flat, as does a button with no OnClick.
+# config error (red banner on the bar). OnClick = "Action" and command
+# buttons light up on tap (the pressed fill); display-only widgets, sliders,
+# and Expand buttons stay flat, as does a button with no OnClick.
+# TapHighlight = true/false overrides this per button.
 # PrimaryLayerKeys = [
 #     { Text = "esc", Action = "Esc", Pinned = true, OnClick = "Action" },
 #     { Text = "F1",  Action = "F1",  OnClick = "Action" },

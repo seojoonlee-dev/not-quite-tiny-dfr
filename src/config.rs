@@ -299,6 +299,10 @@ pub struct ButtonConfig {
     // "Expand" instead expands the button in place (the slider's animation)
     // and shows a separate ExpandCommand script's output until it idles.
     pub on_click: Option<OnClick>,
+    // Whether the button shows the pressed fill while touched. Defaults to on
+    // for OnClick = "Action" or a command; Expand widgets, sliders, the media
+    // panel, and buttons with no OnClick default to off.
+    pub tap_highlight: Option<bool>,
     // For OnClick = "Expand": the shell command whose stdout fills the expanded
     // view (same JSON `{"text","color","icon"}` or plain-text protocol as a
     // command widget). It polls in the background so a value is always ready the
@@ -441,6 +445,7 @@ fn esc_button() -> ButtonConfig {
         slider_low_icon: None,
         slider_stretch: None,
         on_click: Some(OnClick::Action),
+        tap_highlight: None,
         expand_command: None,
         expand_stretch: None,
         media: None,
@@ -492,6 +497,7 @@ fn error_layer(message: &str) -> FunctionLayer {
             slider_low_icon: None,
             slider_stretch: None,
             on_click: None,
+            tap_highlight: None,
             expand_command: None,
             expand_stretch: None,
             media: None,

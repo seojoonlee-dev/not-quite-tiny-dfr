@@ -309,6 +309,7 @@ the following keys.
 | --- | --- | --- | --- |
 | `Action` | string or array | none | Key or internal action sent on press. See [`Action` values](#action-values). |
 | `OnClick` | string | unset | What a tap does. See [`OnClick` values](#onclick-values). |
+| `TapHighlight` | bool | depends on `OnClick` | Show the pressed fill while the button is touched. On by default for `OnClick = "Action"` and command `OnClick`s (except on `Media`), off otherwise. |
 | `ExpandCommand` | string | unset | For `OnClick = "Expand"`: the command whose output fills the expanded view. Uses the same output format as `Command`. Required to expand. |
 | `ExpandStretch` | int | `2` | Slots the button expands to when tapped. |
 | `Pinned` | bool | `false` | Keep this button fixed at the left while the layer scrolls or swipes. Only leading buttons can be pinned, and every layer must pin the same number of slots or the config is rejected. |
@@ -362,7 +363,7 @@ neither a key nor an internal action is a config error.
 | unset | The button sends its `Action` and does not highlight when tapped. |
 | `"Action"` | The button sends its `Action` and shows the pressed fill while touched. |
 | `"Expand"` | The button expands in place to show `ExpandCommand`'s output. See [Expandable widgets](#expandable-widgets). |
-| any other string | A shell command, run when the button is pressed. On a `Media` widget it runs when the panel is tapped outside the transport controls. |
+| any other string | A shell command, run when the button is pressed; the button shows the pressed fill while touched. On a `Media` widget it runs when the panel is tapped outside the transport controls (no pressed fill). |
 
 Commands that need your login session, such as suspending or launching an app,
 should go through `systemd-run --user`, because the daemon runs outside it:
